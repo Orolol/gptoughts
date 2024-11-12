@@ -15,6 +15,14 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# Try to import flash attention, but don't fail if not available
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+    print("Flash Attention not available, falling back to standard attention")
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -41,10 +49,10 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        # Check if we can use flash attention
+        self.flash = FLASH_ATTN_AVAILABLE and torch.cuda.is_available()
         if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            print("WARNING: using slow attention. Flash Attention requires CUDA and flash-attn package")
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
@@ -59,11 +67,15 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        if self.flash and FLASH_ATTN_AVAILABLE:
+            # Use Flash Attention when available
+            # Reshape to flash attention expected shape
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+            y = flash_attn_func(q, k, v, causal=True, dropout_p=self.dropout if self.training else 0.0)
         else:
-            # manual implementation of attention
+            # Standard attention implementation
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
