@@ -16,13 +16,14 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# Try to import flash attention, but don't fail if not available
+# Try to import flash attention 2, but don't fail if not available
 try:
-    from flash_attn import flash_attn_func
+    from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func as flash_attn_func
+    from flash_attn.bert_padding import unpad_input, pad_input
     FLASH_ATTN_AVAILABLE = True
 except ImportError:
     FLASH_ATTN_AVAILABLE = False
-    print("Flash Attention not available, falling back to standard attention")
+    print("Flash Attention 2 not available, falling back to standard attention")
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -77,10 +78,11 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
-        # Check if we can use flash attention
+        # Check if we can use flash attention 2
         self.flash = FLASH_ATTN_AVAILABLE and torch.cuda.is_available()
         if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires CUDA and flash-attn package")
+            print("WARNING: using slow attention. Flash Attention 2 requires CUDA and flash-attn package")
+        self.max_batch_size = 32  # Can be adjusted based on your needs
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
@@ -106,12 +108,28 @@ class CausalSelfAttention(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash and FLASH_ATTN_AVAILABLE:
-            # Use Flash Attention when available
-            # Reshape to flash attention expected shape
-            q = q.contiguous()
-            k = k.contiguous()
-            v = v.contiguous()
-            y = flash_attn_func(q, k, v, causal=True, dropout_p=self.dropout if self.training else 0.0)
+            # Pack QKV for Flash Attention 2
+            qkv = torch.stack([q, k, v], dim=2)  # [B, nh, 3, T, hs]
+            qkv = qkv.transpose(1, 2).contiguous()  # [B, 3, nh, T, hs]
+            
+            # Handle padding if needed
+            seqlens = torch.full((B,), T, device=qkv.device, dtype=torch.long)
+            cu_seqlens = torch.zeros(B + 1, device=qkv.device, dtype=torch.long)
+            cu_seqlens[1:] = torch.cumsum(seqlens, dim=0)
+            
+            qkv_unpad, indices, cu_seqlens, max_seqlen = unpad_input(qkv, seqlens)
+            
+            # Apply Flash Attention 2
+            output_unpad = flash_attn_func(
+                qkv_unpad,
+                cu_seqlens,
+                max_seqlen,
+                dropout_p=self.dropout if self.training else 0.0,
+                causal=True
+            )
+            
+            # Pad output back
+            y = pad_input(output_unpad, indices, B, T)
         else:
             # Standard attention implementation
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
