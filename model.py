@@ -10,11 +10,11 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import torch.nn.functional as F
 
 # Try to import flash attention, but don't fail if not available
 try:
@@ -52,7 +52,7 @@ class RMSNorm(nn.Module):
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.weight * self._norm(x.float()).type_as(x)
 
 class CausalSelfAttention(nn.Module):
@@ -354,11 +354,21 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx: torch.LongTensor, max_new_tokens: int, temperature: float = 1.0, top_k: Optional[int] = None) -> torch.LongTensor:
         """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        Generate text tokens autoregressively.
+
+        Args:
+            idx: Conditioning sequence of indices (shape: batch_size × sequence_length)
+            max_new_tokens: Number of new tokens to generate
+            temperature: Sampling temperature (higher = more random, lower = more deterministic)
+            top_k: If set, only sample from the top k most likely tokens
+
+        Returns:
+            torch.LongTensor: Generated sequence including the conditioning tokens
+            
+        Note:
+            Make sure the model is in eval() mode before generation.
         """
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
