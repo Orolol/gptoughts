@@ -46,13 +46,6 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024 # context length 1024
-# model
-n_layer = 12 # number of layers 12   
-n_head = 12 # number of attention heads 12
-ratio_kv = 4 # ratio of key/value heads 4       
-n_embd = 768 # embedding dimensionality 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
@@ -70,7 +63,24 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+
+if torch.cuda.is_available():
+    device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+    batch_size = 32 # if gradient_accumulation_steps > 1, this is the micro-batch size
+    block_size = 1024 # context length 1024
+    n_layer = 12 # number of layers 12   
+    n_head = 12 # number of attention heads 12
+    ratio_kv = 4 # ratio of key/value heads 4       
+    n_embd = 768 # embedding dimensionality 768
+else:
+    device = 'cpu'
+    batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
+    block_size = 8 # context length 1024
+    n_layer = 1 # number of layers 12   
+    n_head = 1 # number of attention heads 12
+    ratio_kv = 1 # ratio of key/value heads 4       
+    n_embd = 8 # embedding dimensionality 768
+    
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
