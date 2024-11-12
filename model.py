@@ -14,6 +14,22 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import torch.nn.functional as F
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)  # type: ignore
+    freqs = torch.outer(t, freqs).float()  # type: ignore
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
+def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_cis = freqs_cis[:xq_.shape[-2], :]
+    xq_out = torch.view_as_real(xq_ * freqs_cis.unsqueeze(0)).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis.unsqueeze(0)).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
 
 # Try to import flash attention, but don't fail if not available
 try:
@@ -48,6 +64,7 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
         self.dropout = config.dropout
         # Check if we can use flash attention
         self.flash = FLASH_ATTN_AVAILABLE and torch.cuda.is_available()
@@ -56,6 +73,9 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+        
+        # RoPE embeddings
+        self.freqs_cis = precompute_freqs_cis(self.head_dim, config.block_size)
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -65,6 +85,10 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # Apply rotary embeddings
+        self.freqs_cis = self.freqs_cis.to(q.device)
+        q, k = apply_rotary_emb(q, k, self.freqs_cis)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash and FLASH_ATTN_AVAILABLE:
