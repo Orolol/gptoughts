@@ -16,6 +16,14 @@ import torch.nn as nn
 from torch.nn import functional as F
 import torch.nn.functional as F
 
+# Try to import flash attention, but don't fail if not available
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+    print("Flash Attention not available, falling back to standard attention")
+
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
@@ -31,13 +39,7 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
     xk_out = torch.view_as_real(xk_ * freqs_cis.unsqueeze(0)).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
-# Try to import flash attention, but don't fail if not available
-try:
-    from flash_attn import flash_attn_func
-    FLASH_ATTN_AVAILABLE = True
-except ImportError:
-    FLASH_ATTN_AVAILABLE = False
-    print("Flash Attention not available, falling back to standard attention")
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
