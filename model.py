@@ -57,8 +57,8 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # query projections for all heads, key/value for single head
+        self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2) * (config.n_embd // config.n_head), bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
@@ -82,11 +82,18 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # calculate query for all heads, single key/value
+        qkv = self.c_attn(x)
+        # split into q/k/v and reshape
+        n_head_dim = self.head_dim
+        q, k, v = qkv.split([self.n_head * n_head_dim, n_head_dim, n_head_dim], dim=2)
+        # reshape q into multiple heads, k/v stay as single head
+        q = q.view(B, T, self.n_head, n_head_dim).transpose(1, 2)  # (B, nh, T, hs)
+        k = k.view(B, T, 1, n_head_dim).transpose(1, 2)  # (B, 1, T, hs)
+        v = v.view(B, T, 1, n_head_dim).transpose(1, 2)  # (B, 1, T, hs)
+        # expand k,v to all heads
+        k = k.expand(B, self.n_head, T, n_head_dim)  # (B, nh, T, hs) 
+        v = v.expand(B, self.n_head, T, n_head_dim)  # (B, nh, T, hs)
 
         # Apply rotary embeddings
         self.freqs_cis = self.freqs_cis.to(q.device)
