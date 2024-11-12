@@ -41,16 +41,19 @@ def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor
 
 
 
-class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
-
-    def __init__(self, ndim, bias):
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization"""
+    
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        return self.weight * self._norm(x.float()).type_as(x)
 
 class CausalSelfAttention(nn.Module):
 
@@ -124,15 +127,18 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        hidden_dim = 4 * config.n_embd
+        self.w1 = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
+        self.w2 = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
+        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
+        # SwiGLU activation function
+        x1 = self.w1(x)
+        x2 = self.w2(x)
+        hidden = F.silu(x1) * x2
+        x = self.c_proj(hidden)
         x = self.dropout(x)
         return x
 
@@ -140,9 +146,9 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_2 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
