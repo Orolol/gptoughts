@@ -95,7 +95,7 @@ class CausalSelfAttention(nn.Module):
         
         # Grouped-Query Attention (GQA)
         self.n_head = config.n_head
-        self.n_head_kv = config.n_head // 4  # Reduce key/value heads like LLaMA-2
+        self.n_head_kv = config.n_head // config.ratio_kv  # Reduce key/value heads like LLaMA-2
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
         
@@ -218,6 +218,7 @@ class GPTConfig:
     n_embd: int = 768      # Embedding dimension
     dropout: float = 0.0    # Dropout probability
     bias: bool = True       # Whether to use bias in Linear and LayerNorm layers
+    ratio_kv: int = 4      # Ratio of key/value heads
 
 class GPT(nn.Module):
 
