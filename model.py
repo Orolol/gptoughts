@@ -7,14 +7,19 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
-import math
+"""
+GPT Language Model implementation with Flash Attention 2 support.
+"""
+
 import inspect
+import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple, Dict, Any, Union
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.optim import AdamW
 
 # Try to import flash attention 2, but don't fail if not available
 try:
@@ -25,14 +30,40 @@ except ImportError:
     FLASH_ATTN_AVAILABLE = False
     print("Flash Attention 2 not available, falling back to standard attention")
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+    """
+    Precompute the frequency tensor for rotary embeddings.
+    
+    Args:
+        dim: Dimension of the embeddings
+        end: Maximum sequence length
+        theta: Base for the frequency computation
+        
+    Returns:
+        Frequency tensor in complex form
+    """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
     freqs = torch.outer(t, freqs).float()  # type: ignore
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
-def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def apply_rotary_emb(
+    xq: torch.Tensor, 
+    xk: torch.Tensor, 
+    freqs_cis: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply rotary embeddings to the query and key tensors.
+    
+    Args:
+        xq: Query tensor
+        xk: Key tensor
+        freqs_cis: Precomputed frequency tensor
+        
+    Returns:
+        Tuple of transformed query and key tensors
+    """
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_cis = freqs_cis[:xq_.shape[-2], :]
@@ -178,13 +209,15 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    """Configuration class for GPT model hyperparameters."""
+    
+    block_size: int = 1024  # Maximum sequence length
+    vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64
+    n_layer: int = 12       # Number of transformer layers
+    n_head: int = 12        # Number of attention heads
+    n_embd: int = 768      # Embedding dimension
+    dropout: float = 0.0    # Dropout probability
+    bias: bool = True       # Whether to use bias in Linear and LayerNorm layers
 
 class GPT(nn.Module):
 
@@ -329,7 +362,25 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(
+        self, 
+        weight_decay: float,
+        learning_rate: float,
+        betas: Tuple[float, float],
+        device_type: str
+    ) -> AdamW:
+        """
+        Configure the AdamW optimizer with weight decay.
+        
+        Args:
+            weight_decay: Weight decay coefficient
+            learning_rate: Learning rate
+            betas: Adam betas parameters
+            device_type: Device type ('cuda' or 'cpu')
+            
+        Returns:
+            Configured AdamW optimizer
+        """
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -355,7 +406,17 @@ class GPT(nn.Module):
 
         return optimizer
 
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
+    def estimate_mfu(self, fwdbwd_per_iter: int, dt: float) -> float:
+        """
+        Estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS.
+        
+        Args:
+            fwdbwd_per_iter: Number of forward/backward passes per iteration
+            dt: Time delta for the iteration
+            
+        Returns:
+            Estimated MFU as a fraction of theoretical peak FLOPS
+        """
         """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
         # first estimate the number of flops we do per iteration.
         # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
