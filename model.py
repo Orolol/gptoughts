@@ -60,16 +60,22 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # query projections for all heads, key/value for single head
-        self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2) * (config.n_embd // config.n_head), bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
+        
+        # Grouped-Query Attention (GQA)
         self.n_head = config.n_head
+        self.n_head_kv = config.n_head // 4  # Reduce key/value heads like LLaMA-2
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
+        
+        # Separate projections for Q, K, V
+        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.k_proj = nn.Linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias)
+        self.v_proj = nn.Linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias)
+        self.o_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        
+        # Regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
         # Check if we can use flash attention
         self.flash = FLASH_ATTN_AVAILABLE and torch.cuda.is_available()
@@ -83,20 +89,16 @@ class CausalSelfAttention(nn.Module):
         self.freqs_cis = precompute_freqs_cis(self.head_dim, config.block_size)
 
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size()
 
-        # calculate query for all heads, single key/value
-        qkv = self.c_attn(x)
-        # split into q/k/v and reshape
-        n_head_dim = self.head_dim
-        q, k, v = qkv.split([self.n_head * n_head_dim, n_head_dim, n_head_dim], dim=2)
-        # reshape q into multiple heads, k/v stay as single head
-        q = q.view(B, T, self.n_head, n_head_dim).transpose(1, 2)  # (B, nh, T, hs)
-        k = k.view(B, T, 1, n_head_dim).transpose(1, 2)  # (B, 1, T, hs)
-        v = v.view(B, T, 1, n_head_dim).transpose(1, 2)  # (B, 1, T, hs)
-        # expand k,v to all heads
-        k = k.expand(B, self.n_head, T, n_head_dim)  # (B, nh, T, hs) 
-        v = v.expand(B, self.n_head, T, n_head_dim)  # (B, nh, T, hs)
+        # Calculate Q, K, V with grouped-query attention
+        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
+        
+        # Repeat K,V for each query head group
+        k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+        v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
 
         # Apply rotary embeddings
         self.freqs_cis = self.freqs_cis.to(q.device)
@@ -176,7 +178,6 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = RMSNorm(config.n_embd),
@@ -225,9 +226,8 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        x = self.transformer.drop(x)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
