@@ -144,20 +144,36 @@ class CausalSelfAttention(nn.Module):
         v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
 
         if self.flash and not self.training:
-            # Utiliser Flash Attention en inference
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                output = self.flash_fn(q, k, v, causal=True)
+            try:
+                # Utiliser Flash Attention en inference
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    # Reshape pour Flash Attention
+                    q = q.transpose(1, 2).reshape(B * T, self.n_head, self.head_dim)
+                    k = k.transpose(1, 2).reshape(B * T, self.n_head, self.head_dim)
+                    v = v.transpose(1, 2).reshape(B * T, self.n_head, self.head_dim)
+                    
+                    # Pack into [total_q, 3, num_heads, head_dim]
+                    qkv = torch.stack([q, k, v], dim=1)
+                    
+                    output = self.flash_fn(qkv, causal=True)
+                    y = output.reshape(B, T, C)
+            except Exception as e:
+                print(f"Flash Attention failed, falling back to standard attention: {e}")
+                # Fall back to standard attention
+                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                att = att + self.alibi.to(att.device)[:self.n_head, :T, :T]
+                mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+                att.masked_fill_(mask, float('-inf'))
+                att = F.softmax(att, dim=-1)
+                att = self.attn_dropout(att)
+                y = att @ v
+                y = y.transpose(1, 2).contiguous().view(B, T, C)
         else:
             # Standard attention avec ALiBi
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            
-            # Ajouter le biais ALiBi
             att = att + self.alibi.to(att.device)[:self.n_head, :T, :T]
-            
-            # Masque causal
             mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
             att.masked_fill_(mask, float('-inf'))
-            
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v
