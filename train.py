@@ -65,13 +65,13 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 
 if torch.cuda.is_available():
-    device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-    batch_size = 128 # if gradient_accumulation_steps > 1, this is the micro-batch size
-    block_size = 2048 # context length 1024
-    n_layer = 24 # number of layers 12   
-    n_head = 16 # number of attention heads 12
-    ratio_kv = 4 # ratio of key/value heads 4       
-    n_embd = 1024 # embedding dimensionality 768
+    device = 'cuda:0' # Spécifier l'index du device explicitement
+    batch_size = 128
+    block_size = 2048
+    n_layer = 24
+    n_head = 16
+    ratio_kv = 4
+    n_embd = 1024
 else:
     device = 'cpu'
     batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
@@ -221,7 +221,10 @@ if device_type == 'cuda':
         )
     
     # Activer la mémoire partagée CUDA
-    torch.cuda.set_device(device)
+    device_index = 0 if isinstance(device, str) else device
+    if isinstance(device, str) and ':' in device:
+        device_index = int(device.split(':')[1])
+    torch.cuda.set_device(device_index)
     torch.cuda.empty_cache()
     torch.cuda.memory.empty_cache()
     
