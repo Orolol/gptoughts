@@ -30,49 +30,6 @@ except ImportError:
     FLASH_ATTN_AVAILABLE = False
     print("Flash Attention 2 not available, falling back to standard attention")
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
-    """
-    Precompute the frequency tensor for rotary embeddings.
-    
-    Args:
-        dim: Dimension of the embeddings
-        end: Maximum sequence length
-        theta: Base for the frequency computation
-        
-    Returns:
-        Frequency tensor in complex form
-    """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
-
-def apply_rotary_emb(
-    xq: torch.Tensor, 
-    xk: torch.Tensor, 
-    freqs_cis: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply rotary embeddings to the query and key tensors.
-    
-    Args:
-        xq: Query tensor
-        xk: Key tensor
-        freqs_cis: Precomputed frequency tensor
-        
-    Returns:
-        Tuple of transformed query and key tensors
-    """
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis[:xq_.shape[-2], :]
-    xq_out = torch.view_as_real(xq_ * freqs_cis.unsqueeze(0)).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis.unsqueeze(0)).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
-
-
-
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization"""
     
@@ -87,6 +44,48 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.weight * self._norm(x.float()).type_as(x)
 
+class AlibiPositionalBias(nn.Module):
+    """
+    ALiBi (Attention with Linear Biases) implementation.
+    Paper: https://arxiv.org/abs/2108.12409
+    """
+    def __init__(self, num_heads: int, max_seq_len: int):
+        super().__init__()
+        
+        # Calculate ALiBi slopes
+        def get_slopes(n_heads: int) -> torch.Tensor:
+            def get_slopes_power_of_2(n_heads: int) -> list:
+                start = 2 ** (-(2 ** -(math.log2(n_heads) - 3)))
+                ratio = start
+                return [start * (ratio ** i) for i in range(n_heads)]
+
+            if math.log2(n_heads).is_integer():
+                return torch.tensor(get_slopes_power_of_2(n_heads))
+            
+            closest_power_of_2 = 2 ** math.floor(math.log2(n_heads))
+            base_slopes = torch.tensor(get_slopes_power_of_2(closest_power_of_2))
+            
+            if n_heads <= 2 * closest_power_of_2:
+                slopes = torch.concat([base_slopes, base_slopes[0::2]])[:n_heads]
+            else:
+                slopes = torch.concat([base_slopes, base_slopes[0::2], base_slopes[1::2]])[:n_heads]
+            
+            return slopes
+
+        slopes = get_slopes(num_heads)
+        # Create position bias matrix
+        pos = torch.arange(max_seq_len)
+        rel_pos = pos.unsqueeze(0) - pos.unsqueeze(1)  # [seq_len, seq_len]
+        
+        # [num_heads, seq_len, seq_len]
+        alibi = slopes.unsqueeze(1).unsqueeze(1) * rel_pos.unsqueeze(0)
+        
+        # Register as buffer since it's position-dependent but not trainable
+        self.register_buffer('alibi', alibi)
+        
+    def forward(self, T: int) -> torch.Tensor:
+        return self.alibi[..., :T, :T]
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -95,11 +94,11 @@ class CausalSelfAttention(nn.Module):
         
         # Grouped-Query Attention (GQA)
         self.n_head = config.n_head
-        self.n_head_kv = config.n_head // config.ratio_kv  # Reduce key/value heads like LLaMA-2
+        self.n_head_kv = config.n_head // config.ratio_kv
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
         
-        # Separate projections for Q, K, V
+        # Projections
         self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.k_proj = nn.Linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias)
         self.v_proj = nn.Linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias)
@@ -109,17 +108,15 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
-        # Check if we can use flash attention 2
+
+        # Flash Attention 2 setup
         self.flash = FLASH_ATTN_AVAILABLE and torch.cuda.is_available()
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention 2 requires CUDA and flash-attn package")
-        self.max_batch_size = 32  # Can be adjusted based on your needs
-        # causal mask to ensure that attention is only applied to the left in the input sequence
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                    .view(1, 1, config.block_size, config.block_size))
+        self.max_batch_size = 32
         
-        # RoPE embeddings
-        self.freqs_cis = precompute_freqs_cis(self.head_dim, config.block_size)
+        # ALiBi positional bias
+        self.alibi = AlibiPositionalBias(config.n_head, config.block_size)
 
     def forward(self, x):
         B, T, C = x.size()
@@ -133,44 +130,46 @@ class CausalSelfAttention(nn.Module):
         k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
 
-        # Apply rotary embeddings
-        self.freqs_cis = self.freqs_cis.to(q.device)
-        q, k = apply_rotary_emb(q, k, self.freqs_cis)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash and FLASH_ATTN_AVAILABLE:
             # Pack QKV for Flash Attention 2
             qkv = torch.stack([q, k, v], dim=2)  # [B, nh, 3, T, hs]
             qkv = qkv.transpose(1, 2).contiguous()  # [B, 3, nh, T, hs]
             
-            # Handle padding if needed
-            seqlens = torch.full((B,), T, device=qkv.device, dtype=torch.long)
-            cu_seqlens = torch.zeros(B + 1, device=qkv.device, dtype=torch.long)
+            # Calculate sequence lengths and cumulative sequence lengths
+            seqlens = torch.full((B,), T, device=x.device, dtype=torch.int32)
+            cu_seqlens = torch.zeros(B + 1, device=x.device, dtype=torch.int32)
             cu_seqlens[1:] = torch.cumsum(seqlens, dim=0)
             
-            qkv_unpad, indices, cu_seqlens, max_seqlen = unpad_input(qkv, seqlens)
+            # Reshape qkv for Flash Attention
+            qkv = qkv.reshape(B, 3, self.n_head, T, self.head_dim)
             
             # Apply Flash Attention 2
-            output_unpad = flash_attn_func(
-                qkv_unpad,
+            output = flash_attn_func(
+                qkv,
                 cu_seqlens,
-                max_seqlen,
+                seqlens.max().item(),
                 dropout_p=self.dropout if self.training else 0.0,
                 causal=True
             )
             
-            # Pad output back
-            y = pad_input(output_unpad, indices, B, T)
+            y = output.view(B, T, C)
+            
         else:
-            # Standard attention implementation
+            # Standard attention avec ALiBi
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            
+            # Ajouter le biais ALiBi
+            att = att + self.alibi.to(att.device)[:self.n_head, :T, :T]
+            
+            # Masque causal
+            mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+            att.masked_fill_(mask, float('-inf'))
+            
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+            y = att @ v
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # output projection
         y = self.resid_dropout(self.o_proj(y))
         return y
 
