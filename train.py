@@ -211,18 +211,30 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
-# Optimisations pour H100
+# Après l'initialisation du modèle et avant la boucle d'entraînement
 if device_type == 'cuda':
+    # Optimisations CUDA
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    
+    # Configuration des streams CUDA
+    default_stream = torch.cuda.current_stream()
+    copy_stream = torch.cuda.Stream()
+    
+    # Prefetching des données
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    
     # Activer la mémoire partagée CUDA
     device_index = 0 if isinstance(device, str) else device
     if isinstance(device, str) and ':' in device:
         device_index = int(device.split(':')[1])
     torch.cuda.set_device(device_index)
     torch.cuda.empty_cache()
-    torch.cuda.memory.empty_cache()
     
-    # Optimiser le chargement des données
-    torch.multiprocessing.set_sharing_strategy('file_system')
+    # Allouer de la mémoire pinned pour le transfert
+    pin_memory = True
 
 # Configurer le gradient scaler pour mixed precision
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'bfloat16'))
