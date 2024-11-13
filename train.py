@@ -65,13 +65,27 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 
 if torch.cuda.is_available():
-    device = 'cuda:0' # Spécifier l'index du device explicitement
-    batch_size = 64
-    block_size = 1024
+    device = 'cuda:0'
+    batch_size = 128
+    block_size = 2048
     n_layer = 12
     n_head = 12
-    ratio_kv = 4
+    ratio_kv = 8
     n_embd = 768
+    
+    # Optimisations mémoire
+    gradient_accumulation_steps = 1
+    dtype = 'bfloat16'
+    
+    # Activer la gestion de mémoire optimisée
+    torch.cuda.empty_cache()
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # Activer la mémoire partagée
+    if hasattr(torch.cuda, 'memory_stats'):
+        torch.cuda.memory_stats()
+    torch.cuda.set_device(device)
 else:
     device = 'cpu'
     batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
@@ -128,24 +142,30 @@ def get_batch(split):
     data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
     
-    # Créer de nouveaux tenseurs à chaque fois au lieu d'utiliser des buffers
-    x = torch.stack([
-        torch.from_numpy((data[i:i+block_size]).astype(np.int64))
-        for i in ix
-    ])
-    y = torch.stack([
-        torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64))
-        for i in ix
-    ])
+    # Allouer directement sur GPU pour éviter les copies
+    x = torch.empty((batch_size, block_size), dtype=torch.long, device=device)
+    y = torch.empty((batch_size, block_size), dtype=torch.long, device=device)
     
-    # Déplacer sur le device de manière sûre
-    if device_type == 'cuda':
-        # pin_memory() pour un transfert asynchrone efficace
-        x = x.pin_memory().to(device, non_blocking=True)
-        y = y.pin_memory().to(device, non_blocking=True)
-    else:
-        x = x.to(device)
-        y = y.to(device)
+    # Remplir par morceaux pour économiser la mémoire
+    chunk_size = 32
+    for i in range(0, batch_size, chunk_size):
+        end = min(i + chunk_size, batch_size)
+        chunk_ix = ix[i:end]
+        
+        # Charger et convertir par morceaux
+        x_chunk = torch.tensor(
+            np.stack([data[i:i+block_size] for i in chunk_ix]),
+            dtype=torch.long, device=device
+        )
+        y_chunk = torch.tensor(
+            np.stack([data[i+1:i+1+block_size] for i in chunk_ix]),
+            dtype=torch.long, device=device
+        )
+        
+        x[i:end] = x_chunk
+        y[i:end] = y_chunk
+        
+        del x_chunk, y_chunk  # Libérer la mémoire immédiatement
     
     return x, y
 

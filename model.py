@@ -130,17 +130,25 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size()
 
-        # Calculate Q, K, V with grouped-query attention
-        q = self.q_proj(x).reshape(B, T, self.n_head, self.head_dim)
-        k = self.k_proj(x).reshape(B, T, self.n_head_kv, self.head_dim)
-        v = self.v_proj(x).reshape(B, T, self.n_head_kv, self.head_dim)
+        # Calculer Q, K, V de manière plus efficace en mémoire
+        qkv = torch.cat([
+            self.q_proj(x),
+            self.k_proj(x),
+            self.v_proj(x)
+        ], dim=-1)
         
-        # Reshape and transpose
-        q = q.permute(0, 2, 1, 3)  # [B, H, T, D]
-        k = k.permute(0, 2, 1, 3)  # [B, H_kv, T, D]
-        v = v.permute(0, 2, 1, 3)  # [B, H_kv, T, D]
+        # Split et reshape en une seule opération
+        q, k, v = qkv.split([self.n_embd, self.n_head_kv * self.head_dim, self.n_head_kv * self.head_dim], dim=-1)
         
-        # Repeat K,V for each query head group
+        # Reshape efficace
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
+        
+        # Libérer la mémoire du tenseur qkv
+        del qkv
+        
+        # Repeat K,V de manière efficace
         k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
 
@@ -153,28 +161,27 @@ class CausalSelfAttention(nn.Module):
                 self.flash = False
         
         if not self.flash:
-            # Standard attention optimisée
+            # Attention standard optimisée pour la mémoire
             scale = 1.0 / math.sqrt(self.head_dim)
-            
-            # Calcul d'attention optimisé
             att = torch.matmul(q, k.transpose(-2, -1)) * scale
             
-            # Ajouter ALiBi et masque causal
-            alibi_bias = self.alibi.get_bias(T, x.device)
-            # S'assurer que alibi_bias a la bonne forme pour GQA
-            alibi_bias = alibi_bias.repeat_interleave(self.n_head // self.n_head_kv, dim=0)[:self.n_head]
-            att = att + alibi_bias
+            # Appliquer le masque et le bias de manière efficace
+            att = att + self.alibi.get_bias(T, x.device).repeat_interleave(
+                self.n_head // self.n_head_kv, dim=0
+            )[:self.n_head]
             att = att + self.mask[:T, :T]
             
             # Softmax et dropout
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
+            att = F.softmax(att, dim=-1, dtype=torch.float32)  # float32 pour stabilité
+            att = self.attn_dropout(att.to(q.dtype))
+            
+            # Calcul final
             y = torch.matmul(att, v)
-
-        # Reshape final
-        y = y.permute(0, 2, 1, 3).reshape(B, T, C)
+            del att  # Libérer la mémoire
         
-        # Output projection
+        # Reshape final
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        
         return self.resid_dropout(self.o_proj(y))
 
 class MLP(nn.Module):
