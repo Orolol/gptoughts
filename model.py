@@ -112,25 +112,15 @@ class CausalSelfAttention(nn.Module):
         self.flash = False
         if FLASH_ATTN_AVAILABLE and torch.cuda.is_available():
             try:
-                from flash_attn import flash_attn_func, flash_attn_varlen_qkvpacked_func
+                from flash_attn import flash_attn_func
                 self.flash = True
                 self.flash_fn = flash_attn_func
-                print("Using Flash Attention with optimized settings")
-                
-                # Précharger les CUDA kernels
-                if hasattr(torch.backends.cuda, 'preferred_linalg_library'):
-                    torch.backends.cuda.preferred_linalg_library = 'cusolver'
-                
-                # Activer les optimisations mémoire
-                if hasattr(torch.cuda, 'memory_stats'):
-                    torch.cuda.memory_stats()
-                torch.cuda.empty_cache()
-                
+                print("Using Flash Attention")
             except ImportError:
                 print("Flash Attention not available")
         
-        # ALiBi positional bias
-        self.alibi = AlibiPositionalBias(config.n_head, config.block_size)
+        # ALiBi positional bias - ajusté pour GQA
+        self.alibi = AlibiPositionalBias(self.n_head, config.block_size)
         
         # Préallouer le masque causal
         mask = torch.full((config.block_size, config.block_size), float('-inf'))
@@ -140,27 +130,24 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size()
 
-        # Optimiser les calculs QKV
-        qkv = torch.cat([
-            self.q_proj(x),
-            self.k_proj(x),
-            self.v_proj(x)
-        ], dim=-1)
+        # Calculate Q, K, V with grouped-query attention
+        q = self.q_proj(x).reshape(B, T, self.n_head, self.head_dim)
+        k = self.k_proj(x).reshape(B, T, self.n_head_kv, self.head_dim)
+        v = self.v_proj(x).reshape(B, T, self.n_head_kv, self.head_dim)
         
-        # Reshape optimisé
-        chunks = qkv.chunk(3, dim=-1)
-        q, k, v = [chunk.view(B, T, -1, self.head_dim).transpose(1, 2) for chunk in chunks]
+        # Reshape and transpose
+        q = q.permute(0, 2, 1, 3)  # [B, H, T, D]
+        k = k.permute(0, 2, 1, 3)  # [B, H_kv, T, D]
+        v = v.permute(0, 2, 1, 3)  # [B, H_kv, T, D]
         
+        # Repeat K,V for each query head group
+        k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+        v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+
         if self.flash:
             try:
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    # Utiliser la version packed de Flash Attention
-                    qkv_packed = torch.stack([q, k, v], dim=1)
-                    y = self.flash_fn(
-                        qkv_packed,
-                        causal=True,
-                        softmax_scale=1.0 / math.sqrt(self.head_dim)
-                    )
+                    y = self.flash_fn(q, k, v, causal=True)
             except Exception as e:
                 print(f"Flash Attention failed: {e}")
                 self.flash = False
@@ -173,7 +160,10 @@ class CausalSelfAttention(nn.Module):
             att = torch.matmul(q, k.transpose(-2, -1)) * scale
             
             # Ajouter ALiBi et masque causal
-            att = att + self.alibi.get_bias(T, x.device)
+            alibi_bias = self.alibi.get_bias(T, x.device)
+            # S'assurer que alibi_bias a la bonne forme pour GQA
+            alibi_bias = alibi_bias.repeat_interleave(self.n_head // self.n_head_kv, dim=0)[:self.n_head]
+            att = att + alibi_bias
             att = att + self.mask[:T, :T]
             
             # Softmax et dropout
