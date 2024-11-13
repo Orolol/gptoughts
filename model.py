@@ -130,15 +130,19 @@ class CausalSelfAttention(nn.Module):
         k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
 
-        # On n'utilise Flash Attention que si la dimension des têtes est ≤ 256
-        use_flash = self.flash and FLASH_ATTN_AVAILABLE and self.head_dim <= 256
+        # Debug prints
+        print(f"Shapes before flash: q={q.shape}, k={k.shape}, v={v.shape}")
+        print(f"head_dim={self.head_dim}, n_head={self.n_head}, n_head_kv={self.n_head_kv}")
         
-        print(f"use_flash: {use_flash}, head_dim: {self.head_dim}")
+        use_flash = self.flash and FLASH_ATTN_AVAILABLE and self.head_dim <= 256
         
         if use_flash:
             # Pack QKV for Flash Attention 2
             qkv = torch.stack([q, k, v], dim=2)  # [B, nh, 3, T, hs]
+            print(f"qkv shape after stack: {qkv.shape}")
+            
             qkv = qkv.transpose(1, 2).contiguous()  # [B, 3, nh, T, hs]
+            print(f"qkv shape after transpose: {qkv.shape}")
             
             # Calculate sequence lengths and cumulative sequence lengths
             seqlens = torch.full((B,), T, device=x.device, dtype=torch.int32)
@@ -147,6 +151,10 @@ class CausalSelfAttention(nn.Module):
             
             # Reshape qkv for Flash Attention
             qkv = qkv.reshape(B, 3, self.n_head, T, self.head_dim)
+            print(f"qkv final shape: {qkv.shape}")
+            print(f"qkv dtype: {qkv.dtype}")
+            print(f"cu_seqlens: {cu_seqlens}")
+            print(f"max seqlen: {seqlens.max().item()}")
             
             # Apply Flash Attention 2
             output = flash_attn_func(
