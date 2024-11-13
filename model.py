@@ -441,8 +441,6 @@ class GPT(nn.Module):
             if hasattr(torch, 'compile'):
                 self = torch.compile(
                     self,
-                    mode='max-autotune',
-                    fullgraph=True,
                     options={
                         "triton.cudagraphs": True,
                         "layout_optimization": True,
