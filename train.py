@@ -49,7 +49,7 @@ gradient_accumulation_steps = 1 # used to simulate larger batch sizes
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 3e-4 # max learning rate
+learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
 weight_decay = 0.1
 beta1 = 0.9
@@ -65,13 +65,13 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 
 if torch.cuda.is_available():
-    device = 'cuda:0' # Spécifier l'index du device explicitement
-    batch_size = 64
-    block_size = 1024
-    n_layer = 12
-    n_head = 12
-    ratio_kv = 4
-    n_embd = 768
+    device = 'cuda:0'
+    batch_size = 256
+    block_size = 2048
+    n_layer = 24
+    n_head = 16
+    ratio_kv = 8
+    n_embd = 1024
 else:
     device = 'cpu'
     batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
@@ -125,21 +125,20 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+    data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint16, mode='r')
+    
+    # Préallouer les tenseurs sur GPU
+    if not hasattr(get_batch, 'x_buffer'):
+        get_batch.x_buffer = torch.zeros((batch_size, block_size), dtype=torch.long, device=device)
+        get_batch.y_buffer = torch.zeros((batch_size, block_size), dtype=torch.long, device=device)
+    
+    # Remplir les buffers de manière asynchrone
+    for i in range(batch_size):
+        idx = torch.randint(len(data) - block_size, (1,))
+        get_batch.x_buffer[i] = torch.from_numpy(data[idx:idx+block_size].astype(np.int64))
+        get_batch.y_buffer[i] = torch.from_numpy(data[idx+1:idx+1+block_size].astype(np.int64))
+    
+    return get_batch.x_buffer, get_batch.y_buffer
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -354,3 +353,10 @@ while True:
 
 if ddp:
     destroy_process_group()
+
+# Activer le prefetching CUDA
+torch.cuda.set_device(device_index)
+torch.cuda.empty_cache()
+if hasattr(torch.cuda, 'memory_stats'):
+    torch.cuda.memory_stats(device=device)
+torch.cuda.set_stream(torch.cuda.Stream())
