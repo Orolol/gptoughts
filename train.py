@@ -152,20 +152,19 @@ def get_batch(split):
         end = min(i + chunk_size, batch_size)
         chunk_ix = ix[i:end]
         
-        # Charger et convertir par morceaux
-        x_chunk = torch.tensor(
-            np.stack([data[i:i+block_size] for i in chunk_ix]),
-            dtype=torch.long, device=device
-        )
-        y_chunk = torch.tensor(
-            np.stack([data[i+1:i+1+block_size] for i in chunk_ix]),
-            dtype=torch.long, device=device
-        )
+        # Convertir en numpy array puis en tenseur
+        x_data = np.stack([data[i:i+block_size] for i in chunk_ix])
+        y_data = np.stack([data[i+1:i+1+block_size] for i in chunk_ix])
+        
+        # Convertir en tenseur avec le bon type
+        x_chunk = torch.from_numpy(x_data).long().to(device)
+        y_chunk = torch.from_numpy(y_data).long().to(device)
         
         x[i:end] = x_chunk
         y[i:end] = y_chunk
         
-        del x_chunk, y_chunk  # Libérer la mémoire immédiatement
+        # Libérer la mémoire
+        del x_chunk, y_chunk, x_data, y_data
     
     return x, y
 
