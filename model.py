@@ -130,7 +130,12 @@ class CausalSelfAttention(nn.Module):
         k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
 
-        if self.flash and FLASH_ATTN_AVAILABLE:
+        # On n'utilise Flash Attention que si la dimension des têtes est ≤ 256
+        use_flash = self.flash and FLASH_ATTN_AVAILABLE and self.head_dim <= 256
+        
+        print(f"use_flash: {use_flash}, head_dim: {self.head_dim}")
+        
+        if use_flash:
             # Pack QKV for Flash Attention 2
             qkv = torch.stack([q, k, v], dim=2)  # [B, nh, 3, T, hs]
             qkv = qkv.transpose(1, 2).contiguous()  # [B, 3, nh, T, hs]
