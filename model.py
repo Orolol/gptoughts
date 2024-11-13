@@ -130,31 +130,22 @@ class CausalSelfAttention(nn.Module):
         k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
 
-        # Debug prints
-        print(f"Shapes before flash: q={q.shape}, k={k.shape}, v={v.shape}")
-        print(f"head_dim={self.head_dim}, n_head={self.n_head}, n_head_kv={self.n_head_kv}")
-        
         use_flash = self.flash and FLASH_ATTN_AVAILABLE and self.head_dim <= 256
         
         if use_flash:
-            # Pack QKV for Flash Attention 2
-            qkv = torch.stack([q, k, v], dim=2)  # [B, nh, 3, T, hs]
-            print(f"qkv shape after stack: {qkv.shape}")
+            # Reshape tensors for Flash Attention
+            # Flash Attention s'attend à [batch_size, seqlen, num_heads, head_dim]
+            q = q.transpose(1, 2)  # [B, T, nh, hd]
+            k = k.transpose(1, 2)  # [B, T, nh, hd]
+            v = v.transpose(1, 2)  # [B, T, nh, hd]
             
-            qkv = qkv.transpose(1, 2).contiguous()  # [B, 3, nh, T, hs]
-            print(f"qkv shape after transpose: {qkv.shape}")
+            # Pack into [batch_size, seqlen, 3, num_heads, head_dim]
+            qkv = torch.stack([q, k, v], dim=2)
             
-            # Calculate sequence lengths and cumulative sequence lengths
+            # Calculate sequence lengths
             seqlens = torch.full((B,), T, device=x.device, dtype=torch.int32)
             cu_seqlens = torch.zeros(B + 1, device=x.device, dtype=torch.int32)
             cu_seqlens[1:] = torch.cumsum(seqlens, dim=0)
-            
-            # Reshape qkv for Flash Attention
-            qkv = qkv.reshape(B, 3, self.n_head, T, self.head_dim)
-            print(f"qkv final shape: {qkv.shape}")
-            print(f"qkv dtype: {qkv.dtype}")
-            print(f"cu_seqlens: {cu_seqlens}")
-            print(f"max seqlen: {seqlens.max().item()}")
             
             # Apply Flash Attention 2
             output = flash_attn_func(
@@ -165,6 +156,7 @@ class CausalSelfAttention(nn.Module):
                 causal=True
             )
             
+            # Reshape output back to [B, T, C]
             y = output.view(B, T, C)
             
         else:
