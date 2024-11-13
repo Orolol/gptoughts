@@ -126,19 +126,28 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 data_dir = os.path.join('data', dataset)
 def get_batch(split):
     data = np.memmap(os.path.join(data_dir, f'{split}.bin'), dtype=np.uint16, mode='r')
+    ix = torch.randint(len(data) - block_size, (batch_size,))
     
-    # Préallouer les tenseurs sur GPU
-    if not hasattr(get_batch, 'x_buffer'):
-        get_batch.x_buffer = torch.zeros((batch_size, block_size), dtype=torch.long, device=device)
-        get_batch.y_buffer = torch.zeros((batch_size, block_size), dtype=torch.long, device=device)
+    # Créer de nouveaux tenseurs à chaque fois au lieu d'utiliser des buffers
+    x = torch.stack([
+        torch.from_numpy((data[i:i+block_size]).astype(np.int64))
+        for i in ix
+    ])
+    y = torch.stack([
+        torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64))
+        for i in ix
+    ])
     
-    # Remplir les buffers de manière asynchrone
-    for i in range(batch_size):
-        idx = torch.randint(len(data) - block_size, (1,))
-        get_batch.x_buffer[i] = torch.from_numpy(data[idx:idx+block_size].astype(np.int64))
-        get_batch.y_buffer[i] = torch.from_numpy(data[idx+1:idx+1+block_size].astype(np.int64))
+    # Déplacer sur le device de manière sûre
+    if device_type == 'cuda':
+        # pin_memory() pour un transfert asynchrone efficace
+        x = x.pin_memory().to(device, non_blocking=True)
+        y = y.pin_memory().to(device, non_blocking=True)
+    else:
+        x = x.to(device)
+        y = y.to(device)
     
-    return get_batch.x_buffer, get_batch.y_buffer
+    return x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
