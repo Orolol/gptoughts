@@ -133,14 +133,15 @@ class CausalSelfAttention(nn.Module):
         use_flash = self.flash and FLASH_ATTN_AVAILABLE and self.head_dim <= 256
         
         if use_flash:
-            # Reshape tensors for Flash Attention
-            # Flash Attention s'attend à [batch_size, seqlen, num_heads, head_dim]
-            q = q.transpose(1, 2)  # [B, T, nh, hd]
-            k = k.transpose(1, 2)  # [B, T, nh, hd]
-            v = v.transpose(1, 2)  # [B, T, nh, hd]
+            # Reshape pour Flash Attention
+            # Flash Attention attend (total_q, num_heads, head_size)
+            # où total_q = batch_size * seqlen
+            q = q.transpose(1, 2).reshape(B * T, self.n_head, self.head_dim)
+            k = k.transpose(1, 2).reshape(B * T, self.n_head, self.head_dim)
+            v = v.transpose(1, 2).reshape(B * T, self.n_head, self.head_dim)
             
-            # Pack into [batch_size, seqlen, 3, num_heads, head_dim]
-            qkv = torch.stack([q, k, v], dim=2)
+            # Pack into [total_q, 3, num_heads, head_dim]
+            qkv = torch.stack([q, k, v], dim=1)
             
             # Calculate sequence lengths
             seqlens = torch.full((B,), T, device=x.device, dtype=torch.int32)
@@ -157,7 +158,7 @@ class CausalSelfAttention(nn.Module):
             )
             
             # Reshape output back to [B, T, C]
-            y = output.view(B, T, C)
+            y = output.reshape(B, T, C)
             
         else:
             # Standard attention avec ALiBi
