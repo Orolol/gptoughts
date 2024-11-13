@@ -441,18 +441,10 @@ class GPT(nn.Module):
             if hasattr(torch, 'compile'):
                 self = torch.compile(
                     self,
-                    options={
-                        "triton.cudagraphs": True,
-                        "layout_optimization": True,
-                        "max_autotune": True,
-                        "triton.autotune_pointwise": True,
-                        "triton.autotune_cublasLt": True,
-                        "triton.persistent_reductions": True,
-                        "triton.max_tiles": 1024,
-                        "triton.max_block": 1024
-                    }
+                    mode='max-autotune',  # Utiliser le mode max-autotune au lieu des options détaillées
+                    fullgraph=True
                 )
-                print("Model compiled with optimized settings for H100")
+                print("Model compiled with max-autotune mode for H100")
 
         # Utiliser AdaFactor au lieu de AdamW pour une meilleure efficacité mémoire
         try:
