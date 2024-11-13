@@ -66,7 +66,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 
 if torch.cuda.is_available():
     device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-    batch_size = 32 # if gradient_accumulation_steps > 1, this is the micro-batch size
+    batch_size = 64 # if gradient_accumulation_steps > 1, this is the micro-batch size
     block_size = 1024 # context length 1024
     n_layer = 12 # number of layers 12   
     n_head = 12 # number of attention heads 12
