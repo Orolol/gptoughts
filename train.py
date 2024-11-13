@@ -65,13 +65,13 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 
 if torch.cuda.is_available():
-    device = 'cuda:0'
-    batch_size = 256
-    block_size = 2048
-    n_layer = 24
-    n_head = 16
-    ratio_kv = 8
-    n_embd = 1024
+    device = 'cuda:0' # Spécifier l'index du device explicitement
+    batch_size = 64
+    block_size = 1024
+    n_layer = 12
+    n_head = 12
+    ratio_kv = 4
+    n_embd = 768
 else:
     device = 'cpu'
     batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
