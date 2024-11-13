@@ -49,7 +49,7 @@ gradient_accumulation_steps = 1 # used to simulate larger batch sizes
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
+learning_rate = 3e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
 weight_decay = 0.1
 beta1 = 0.9
@@ -315,31 +315,31 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    for micro_step in range(gradient_accumulation_steps):
-        if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
-    # clip the gradient
+    # Prefetch le prochain batch
+    with torch.cuda.stream(copy_stream):
+        X_next, Y_next = get_batch('train')
+    
+    # S'assurer que le batch précédent est terminé
+    default_stream.wait_stream(copy_stream)
+    
+    # Forward pass avec mixed precision
+    with ctx:
+        logits, loss = model(X, Y)
+        loss = loss / gradient_accumulation_steps
+    
+    # Backward pass optimisé
+    scaler.scale(loss).backward()
+    
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
+    
     scaler.step(optimizer)
     scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
+    
+    # Swap les batches
+    X, Y = X_next, Y_next
 
     # timing and logging
     t1 = time.time()
@@ -375,12 +375,18 @@ if device_type == 'cuda':
     # Activer la détection d'anomalies en mode debug
     torch.autograd.set_detect_anomaly(True)
     
-    # Optimisations CUDA existantes...
-    device_index = 0 if isinstance(device, str) else device
-    if isinstance(device, str) and ':' in device:
-        device_index = int(device.split(':')[1])
-    torch.cuda.set_device(device_index)
-    torch.cuda.empty_cache()
+    # Optimisations CUDA
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
     
-    # Optimiser le chargement des données
+    # Prefetching des données
     torch.multiprocessing.set_sharing_strategy('file_system')
+    
+    # Configuration des streams CUDA
+    default_stream = torch.cuda.current_stream()
+    copy_stream = torch.cuda.Stream()
+    
+    # Allouer de la mémoire pinned pour le transfert
+    pin_memory = True
