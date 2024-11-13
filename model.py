@@ -107,105 +107,75 @@ class CausalSelfAttention(nn.Module):
         # Regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.dropout = config.dropout
-
-        # Flash Attention 2 setup
-        self.flash = FLASH_ATTN_AVAILABLE and torch.cuda.is_available()
-        if self.flash:
+        
+        # Flash Attention setup
+        self.flash = False
+        if FLASH_ATTN_AVAILABLE and torch.cuda.is_available():
             try:
                 from flash_attn import flash_attn_func
+                self.flash = True
                 self.flash_fn = flash_attn_func
+                print("Using Flash Attention")
             except ImportError:
-                self.flash = False
-                print("Flash Attention non disponible, utilisation de l'attention standard")
+                print("Flash Attention not available, using standard attention")
         
         # ALiBi positional bias
         self.alibi = AlibiPositionalBias(config.n_head, config.block_size)
         
-        # Augmenter la taille max du batch pour H100
-        self.max_batch_size = 128
+        # Préallouer le masque causal
+        mask = torch.full((config.block_size, config.block_size), float('-inf'))
+        mask = torch.triu(mask, diagonal=1)
+        self.register_buffer('mask', mask)
 
     def forward(self, x):
         B, T, C = x.size()
 
-        # Calculate Q, K, V with grouped-query attention
-        # Éviter les vues qui peuvent causer des problèmes de gradient
-        q = self.q_proj(x).reshape(B, T, self.n_head, self.head_dim).permute(0, 2, 1, 3)
-        k = self.k_proj(x).reshape(B, T, self.n_head_kv, self.head_dim).permute(0, 2, 1, 3)
-        v = self.v_proj(x).reshape(B, T, self.n_head_kv, self.head_dim).permute(0, 2, 1, 3)
-        
-        # Repeat K,V for each query head group (sans opération inplace)
+        # Projections QKV avec reshape optimisé
+        q = self.q_proj(x).reshape(B, T, self.n_head, self.head_dim)
+        k = self.k_proj(x).reshape(B, T, self.n_head_kv, self.head_dim)
+        v = self.v_proj(x).reshape(B, T, self.n_head_kv, self.head_dim)
+
+        # Optimiser les permutations
+        q = q.permute(0, 2, 1, 3).contiguous()  # [B, H, T, D]
+        k = k.permute(0, 2, 1, 3).contiguous()  # [B, H_kv, T, D]
+        v = v.permute(0, 2, 1, 3).contiguous()  # [B, H_kv, T, D]
+
+        # Repeat K,V for GQA
         k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
 
         if self.flash:
             try:
-                # Utiliser Flash Attention pour training et inference
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    # Reshape pour Flash Attention
-                    q = q.contiguous()
-                    k = k.contiguous()
-                    v = v.contiguous()
-                    output = self.flash_fn(q, k, v, causal=True)
-                    y = output.permute(0, 2, 1, 3).reshape(B, T, C)
+                # Flash Attention
+                with torch.cuda.amp.autocast():
+                    y = self.flash_fn(
+                        q, k, v,
+                        causal=True,
+                        softmax_scale=1.0 / math.sqrt(self.head_dim)
+                    )
             except Exception as e:
                 print(f"Flash Attention failed, falling back to standard attention: {e}")
-                # Fall back to standard attention
-                scale = 1.0 / math.sqrt(self.head_dim)
-                
-                # Calcul d'attention sans opérations inplace
-                qk = torch.matmul(q, k.transpose(-2, -1)) * scale
-                
-                # Créer le masque causal
-                causal_mask = torch.triu(
-                    torch.ones((T, T), device=x.device, dtype=torch.bool),
-                    diagonal=1
-                )
-                
-                # Appliquer le masque et le bias sans opérations inplace
-                qk = torch.where(
-                    causal_mask,
-                    torch.tensor(-float('inf'), device=x.device, dtype=qk.dtype),
-                    qk
-                )
-                qk = qk + self.alibi.get_bias(T, x.device)
-                
-                # Softmax et dropout
-                att = F.softmax(qk, dim=-1)
-                att = self.attn_dropout(att)
-                
-                # Calcul final
-                y = torch.matmul(att, v)
-                y = y.permute(0, 2, 1, 3).reshape(B, T, C)
-        else:
-            # Standard attention avec ALiBi
+                self.flash = False  # Désactiver pour les prochains appels
+
+        if not self.flash:
+            # Standard attention optimisée
             scale = 1.0 / math.sqrt(self.head_dim)
             
-            # Calcul d'attention sans opérations inplace
-            qk = torch.matmul(q, k.transpose(-2, -1)) * scale
+            # Calcul d'attention optimisé
+            att = torch.matmul(q, k.transpose(-2, -1)) * scale
             
-            # Créer le masque causal
-            causal_mask = torch.triu(
-                torch.ones((T, T), device=x.device, dtype=torch.bool),
-                diagonal=1
-            )
-            
-            # Appliquer le masque et le bias sans opérations inplace
-            qk = torch.where(
-                causal_mask,
-                torch.tensor(-float('inf'), device=x.device, dtype=qk.dtype),
-                qk
-            )
-            qk = qk + self.alibi.get_bias(T, x.device)
+            # Ajouter ALiBi et masque causal
+            att = att + self.alibi.get_bias(T, x.device)
+            att = att + self.mask[:T, :T]
             
             # Softmax et dropout
-            att = F.softmax(qk, dim=-1)
+            att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            
-            # Calcul final
             y = torch.matmul(att, v)
-            y = y.permute(0, 2, 1, 3).reshape(B, T, C)
 
+        # Reshape final
+        y = y.permute(0, 2, 1, 3).reshape(B, T, C)
+        
         # Output projection
         return self.resid_dropout(self.o_proj(y))
 
