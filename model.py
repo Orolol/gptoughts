@@ -142,36 +142,56 @@ class CausalSelfAttention(nn.Module):
         k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
 
-        if self.flash and not self.training:
+        if self.flash:
             try:
-                # Utiliser Flash Attention en inference
+                # Utiliser Flash Attention pour training et inference
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                     output = self.flash_fn(q, k, v, causal=True)
                     y = output.reshape(B, T, C)
             except Exception as e:
                 print(f"Flash Attention failed, falling back to standard attention: {e}")
                 # Fall back to standard attention
-                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                scale = 1.0 / math.sqrt(self.head_dim)
+                att = torch.matmul(q, k.transpose(-2, -1)) * scale
+                
+                # Créer un nouveau tenseur pour le masque
+                causal_mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1)
+                mask_value = torch.tensor(-float('inf'), device=x.device)
+                att = torch.where(causal_mask.bool(), mask_value, att)
+                
+                # Ajouter ALiBi bias
                 att = att + self.alibi.get_bias(T, x.device)
-                mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-                att.masked_fill_(mask, float('-inf'))
+                
+                # Softmax et dropout
                 att = F.softmax(att, dim=-1)
                 att = self.attn_dropout(att)
-                y = att @ v
+                
+                # Calcul final de l'attention
+                y = torch.matmul(att, v)
                 y = y.transpose(1, 2).contiguous().view(B, T, C)
         else:
             # Standard attention avec ALiBi
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            scale = 1.0 / math.sqrt(self.head_dim)
+            # Éviter les opérations inplace
+            att = torch.matmul(q, k.transpose(-2, -1)) * scale
+            
+            # Créer un nouveau tenseur pour le masque au lieu de modifier att
+            causal_mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1)
+            mask_value = torch.tensor(-float('inf'), device=x.device)
+            att = torch.where(causal_mask.bool(), mask_value, att)
+            
+            # Ajouter ALiBi bias sans opération inplace
             att = att + self.alibi.get_bias(T, x.device)
-            mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
-            att.masked_fill_(mask, float('-inf'))
+            
+            # Softmax et dropout
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v
+            
+            # Calcul final de l'attention
+            y = torch.matmul(att, v)
             y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        y = self.resid_dropout(self.o_proj(y))
-        return y
+        return self.resid_dropout(self.o_proj(y))
 
 class MLP(nn.Module):
 
