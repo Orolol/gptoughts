@@ -444,10 +444,15 @@ class GPT(nn.Module):
                     options={
                         "triton.cudagraphs": True,
                         "layout_optimization": True,
-                        "num_stages": 3,
-                        "max_autotune": True
+                        "max_autotune": True,
+                        "triton.autotune_pointwise": True,
+                        "triton.autotune_cublasLt": True,
+                        "triton.persistent_reductions": True,
+                        "triton.max_tiles": 1024,
+                        "triton.max_block": 1024
                     }
                 )
+                print("Model compiled with optimized settings for H100")
 
         # Utiliser AdaFactor au lieu de AdamW pour une meilleure efficacité mémoire
         try:

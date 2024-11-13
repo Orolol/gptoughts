@@ -205,21 +205,6 @@ model.to(device)
 
 # Optimisations pour H100
 if device_type == 'cuda':
-    # Utiliser torch.compile avec des options optimisées
-    if compile:
-        print("Compilation du modèle avec des options optimisées pour H100...")
-        model = torch.compile(
-            model,
-            mode='max-autotune',
-            fullgraph=True,
-            options={
-                "triton.cudagraphs": True,
-                "layout_optimization": True,
-                "num_stages": 3,
-                "max_autotune": True
-            }
-        )
-    
     # Activer la mémoire partagée CUDA
     device_index = 0 if isinstance(device, str) else device
     if isinstance(device, str) and ':' in device:
@@ -240,11 +225,7 @@ if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
-# compile the model
-if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
+# Note: Nous retirons la compilation ici car elle est déjà faite dans configure_optimizers
 
 # wrap model into DDP container
 if ddp:
