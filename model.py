@@ -236,42 +236,11 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
-        self.use_checkpoint = True
-
-    def _attention_block(self, x):
-        # Créer une copie du tenseur pour éviter les modifications inplace
-        x_norm = self.ln_1(x.clone())
-        return self.attn(x_norm)
-
-    def _mlp_block(self, x):
-        # Créer une copie du tenseur pour éviter les modifications inplace
-        x_norm = self.ln_2(x.clone())
-        return self.mlp(x_norm)
 
     def forward(self, x):
-        if self.use_checkpoint and self.training:
-            # Utiliser des fonctions lambda pour passer des copies
-            attn_out = torch.utils.checkpoint.checkpoint(
-                lambda x: self._attention_block(x),
-                x,
-                use_reentrant=False,
-                preserve_rng_state=False
-            )
-            x = x + attn_out  # Addition au lieu de modification inplace
-            
-            mlp_out = torch.utils.checkpoint.checkpoint(
-                lambda x: self._mlp_block(x),
-                x,
-                use_reentrant=False,
-                preserve_rng_state=False
-            )
-            x = x + mlp_out  # Addition au lieu de modification inplace
-        else:
-            # Mode non-checkpoint
-            attn_out = self.attn(self.ln_1(x))
-            x = x + attn_out
-            mlp_out = self.mlp(self.ln_2(x))
-            x = x + mlp_out
+        # Simple residual connections sans checkpoint
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
 
 @dataclass
