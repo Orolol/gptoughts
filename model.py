@@ -129,9 +129,14 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size()
 
         # Calculate Q, K, V with grouped-query attention
-        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
+        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim)
+        k = self.k_proj(x).view(B, T, self.n_head_kv, self.head_dim)
+        v = self.v_proj(x).view(B, T, self.n_head_kv, self.head_dim)
+        
+        # Reshape and transpose
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
         
         # Repeat K,V for each query head group
         k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
@@ -195,18 +200,27 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
-        # Activer le gradient checkpointing
         self.use_checkpoint = True
+
+    def _attention_block(self, x):
+        return self.attn(self.ln_1(x))
+
+    def _mlp_block(self, x):
+        return self.mlp(self.ln_2(x))
 
     def forward(self, x):
         if self.use_checkpoint and self.training:
             x = x + torch.utils.checkpoint.checkpoint(
-                lambda x: self.attn(self.ln_1(x)), 
-                x
+                self._attention_block,
+                x,
+                use_reentrant=False,
+                preserve_rng_state=False
             )
             x = x + torch.utils.checkpoint.checkpoint(
-                lambda x: self.mlp(self.ln_2(x)), 
-                x
+                self._mlp_block,
+                x,
+                use_reentrant=False,
+                preserve_rng_state=False
             )
         else:
             x = x + self.attn(self.ln_1(x))

@@ -360,3 +360,18 @@ torch.cuda.empty_cache()
 if hasattr(torch.cuda, 'memory_stats'):
     torch.cuda.memory_stats(device=device)
 torch.cuda.set_stream(torch.cuda.Stream())
+
+# Après l'initialisation du modèle
+if device_type == 'cuda':
+    # Activer la détection d'anomalies en mode debug
+    torch.autograd.set_detect_anomaly(True)
+    
+    # Optimisations CUDA existantes...
+    device_index = 0 if isinstance(device, str) else device
+    if isinstance(device, str) and ':' in device:
+        device_index = int(device.split(':')[1])
+    torch.cuda.set_device(device_index)
+    torch.cuda.empty_cache()
+    
+    # Optimiser le chargement des données
+    torch.multiprocessing.set_sharing_strategy('file_system')
