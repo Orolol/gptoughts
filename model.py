@@ -118,6 +118,19 @@ class CausalSelfAttention(nn.Module):
         # ALiBi positional bias
         self.alibi = AlibiPositionalBias(config.n_head, config.block_size)
 
+        # Optimiser pour H100
+        self.flash = FLASH_ATTN_AVAILABLE and torch.cuda.is_available()
+        if self.flash:
+            try:
+                from flash_attn import flash_attn_func
+                self.flash_fn = flash_attn_func
+            except ImportError:
+                self.flash = False
+                print("Flash Attention non disponible, utilisation de l'attention standard")
+        
+        # Augmenter la taille max du batch pour H100
+        self.max_batch_size = 128
+
     def forward(self, x):
         B, T, C = x.size()
 
@@ -130,36 +143,10 @@ class CausalSelfAttention(nn.Module):
         k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
 
-        use_flash = self.flash and FLASH_ATTN_AVAILABLE and self.head_dim <= 256
-        
-        if use_flash:
-            # Reshape pour Flash Attention
-            # Flash Attention attend (total_q, num_heads, head_size)
-            # où total_q = batch_size * seqlen
-            q = q.transpose(1, 2).reshape(B * T, self.n_head, self.head_dim)
-            k = k.transpose(1, 2).reshape(B * T, self.n_head, self.head_dim)
-            v = v.transpose(1, 2).reshape(B * T, self.n_head, self.head_dim)
-            
-            # Pack into [total_q, 3, num_heads, head_dim]
-            qkv = torch.stack([q, k, v], dim=1)
-            
-            # Calculate sequence lengths
-            seqlens = torch.full((B,), T, device=x.device, dtype=torch.int32)
-            cu_seqlens = torch.zeros(B + 1, device=x.device, dtype=torch.int32)
-            cu_seqlens[1:] = torch.cumsum(seqlens, dim=0)
-            
-            # Apply Flash Attention 2
-            output = flash_attn_func(
-                qkv,
-                cu_seqlens,
-                seqlens.max().item(),
-                dropout_p=self.dropout if self.training else 0.0,
-                causal=True
-            )
-            
-            # Reshape output back to [B, T, C]
-            y = output.reshape(B, T, C)
-            
+        if self.flash and not self.training:
+            # Utiliser Flash Attention en inference
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                output = self.flash_fn(q, k, v, causal=True)
         else:
             # Standard attention avec ALiBi
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -268,6 +255,25 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+        self.gradient_accumulation_steps = 1
+        
+    def configure_training(self, batch_size, device_memory_gb):
+        """Configure optimal batch size and gradient accumulation"""
+        # Estimation grossière basée sur la mémoire GPU disponible
+        params_size = self.get_num_params() * 4  # 4 bytes par paramètre
+        activation_size = batch_size * self.config.block_size * self.config.n_embd * 4
+        
+        # Ajuster le batch size et gradient accumulation en fonction de la mémoire
+        total_memory = device_memory_gb * 1e9
+        optimal_batch_size = min(
+            batch_size,
+            int((total_memory * 0.7 - params_size) / activation_size)
+        )
+        
+        self.gradient_accumulation_steps = max(1, batch_size // optimal_batch_size)
+        
+        return optimal_batch_size, self.gradient_accumulation_steps
 
     def get_num_params(self, non_embedding=True):
         """
@@ -385,13 +391,7 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(
-        self, 
-        weight_decay: float,
-        learning_rate: float,
-        betas: Tuple[float, float],
-        device_type: str
-    ) -> AdamW:
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """
         Configure the AdamW optimizer with weight decay.
         
@@ -427,21 +427,48 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
 
-        # Utiliser torch.compile pour optimiser les performances
-        if hasattr(torch, 'compile') and device_type == 'cuda':
-            self = torch.compile(self, mode='max-autotune')
-            print("Model compiled with torch.compile")
-        
-        # Activer TF32 sur les GPU Ampere et supérieurs
+        # Optimiser pour H100
         if device_type == 'cuda':
+            # Activer TF32
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            print("TF32 enabled")
-        
-        # Activer les optimisations cuDNN
-        torch.backends.cudnn.benchmark = True
-        print("cuDNN benchmark enabled")
-        
+            
+            # Optimisations CUDA
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+            
+            # Compiler avec des options optimisées pour H100
+            if hasattr(torch, 'compile'):
+                self = torch.compile(
+                    self,
+                    mode='max-autotune',
+                    fullgraph=True,
+                    options={
+                        "triton.cudagraphs": True,
+                        "layout_optimization": True,
+                        "num_stages": 3,
+                        "max_autotune": True
+                    }
+                )
+
+        # Utiliser AdaFactor au lieu de AdamW pour une meilleure efficacité mémoire
+        try:
+            from transformers.optimization import Adafactor
+            optimizer = Adafactor(
+                self.parameters(),
+                lr=learning_rate,
+                scale_parameter=True,
+                relative_step=False,
+                warmup_init=False,
+                clip_threshold=1.0
+            )
+        except ImportError:
+            # Fallback sur AdamW optimisé
+            fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+            use_fused = fused_available and device_type == 'cuda'
+            extra_args = dict(fused=True) if use_fused else dict()
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter: int, dt: float) -> float:

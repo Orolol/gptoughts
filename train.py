@@ -45,13 +45,13 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
+gradient_accumulation_steps = 1 # used to simulate larger batch sizes
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
+learning_rate = 3e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
-weight_decay = 1e-1
+weight_decay = 0.1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
@@ -66,12 +66,12 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 
 if torch.cuda.is_available():
     device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-    batch_size = 64 # if gradient_accumulation_steps > 1, this is the micro-batch size
-    block_size = 1024 # context length 1024
-    n_layer = 12 # number of layers 12   
-    n_head = 12 # number of attention heads 12
+    batch_size = 128 # if gradient_accumulation_steps > 1, this is the micro-batch size
+    block_size = 2048 # context length 1024
+    n_layer = 24 # number of layers 12   
+    n_head = 16 # number of attention heads 12
     ratio_kv = 4 # ratio of key/value heads 4       
-    n_embd = 768 # embedding dimensionality 768
+    n_embd = 1024 # embedding dimensionality 768
 else:
     device = 'cpu'
     batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
@@ -203,8 +203,33 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
-# initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+# Optimisations pour H100
+if device_type == 'cuda':
+    # Utiliser torch.compile avec des options optimisées
+    if compile:
+        print("Compilation du modèle avec des options optimisées pour H100...")
+        model = torch.compile(
+            model,
+            mode='max-autotune',
+            fullgraph=True,
+            options={
+                "triton.cudagraphs": True,
+                "layout_optimization": True,
+                "num_stages": 3,
+                "max_autotune": True
+            }
+        )
+    
+    # Activer la mémoire partagée CUDA
+    torch.cuda.set_device(device)
+    torch.cuda.empty_cache()
+    torch.cuda.memory.empty_cache()
+    
+    # Optimiser le chargement des données
+    torch.multiprocessing.set_sharing_strategy('file_system')
+
+# Configurer le gradient scaler pour mixed precision
+scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'bfloat16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
