@@ -83,8 +83,8 @@ class AlibiPositionalBias(nn.Module):
         # Register as buffer since it's position-dependent but not trainable
         self.register_buffer('alibi', alibi)
         
-    def forward(self, T: int) -> torch.Tensor:
-        return self.alibi[..., :T, :T]
+    def get_bias(self, T: int, device: torch.device) -> torch.Tensor:
+        return self.alibi.to(device)[:, :T, :T]
 
 class CausalSelfAttention(nn.Module):
 
@@ -111,15 +111,6 @@ class CausalSelfAttention(nn.Module):
 
         # Flash Attention 2 setup
         self.flash = FLASH_ATTN_AVAILABLE and torch.cuda.is_available()
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention 2 requires CUDA and flash-attn package")
-        self.max_batch_size = 32
-        
-        # ALiBi positional bias
-        self.alibi = AlibiPositionalBias(config.n_head, config.block_size)
-
-        # Optimiser pour H100
-        self.flash = FLASH_ATTN_AVAILABLE and torch.cuda.is_available()
         if self.flash:
             try:
                 from flash_attn import flash_attn_func
@@ -127,6 +118,9 @@ class CausalSelfAttention(nn.Module):
             except ImportError:
                 self.flash = False
                 print("Flash Attention non disponible, utilisation de l'attention standard")
+        
+        # ALiBi positional bias
+        self.alibi = AlibiPositionalBias(config.n_head, config.block_size)
         
         # Augmenter la taille max du batch pour H100
         self.max_batch_size = 128
@@ -147,21 +141,13 @@ class CausalSelfAttention(nn.Module):
             try:
                 # Utiliser Flash Attention en inference
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    # Reshape pour Flash Attention
-                    q = q.transpose(1, 2).reshape(B * T, self.n_head, self.head_dim)
-                    k = k.transpose(1, 2).reshape(B * T, self.n_head, self.head_dim)
-                    v = v.transpose(1, 2).reshape(B * T, self.n_head, self.head_dim)
-                    
-                    # Pack into [total_q, 3, num_heads, head_dim]
-                    qkv = torch.stack([q, k, v], dim=1)
-                    
-                    output = self.flash_fn(qkv, causal=True)
+                    output = self.flash_fn(q, k, v, causal=True)
                     y = output.reshape(B, T, C)
             except Exception as e:
                 print(f"Flash Attention failed, falling back to standard attention: {e}")
                 # Fall back to standard attention
                 att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                att = att + self.alibi.to(att.device)[:self.n_head, :T, :T]
+                att = att + self.alibi.get_bias(T, x.device)
                 mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
                 att.masked_fill_(mask, float('-inf'))
                 att = F.softmax(att, dim=-1)
@@ -171,7 +157,7 @@ class CausalSelfAttention(nn.Module):
         else:
             # Standard attention avec ALiBi
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att + self.alibi.to(att.device)[:self.n_head, :T, :T]
+            att = att + self.alibi.get_bias(T, x.device)
             mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
             att.masked_fill_(mask, float('-inf'))
             att = F.softmax(att, dim=-1)
