@@ -66,7 +66,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 
 if torch.cuda.is_available():
     device = 'cuda:0' # Spécifier l'index du device explicitement
-    batch_size = 64
+    batch_size = 32
     block_size = 1024
     n_layer = 12
     n_head = 12
