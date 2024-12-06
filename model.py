@@ -127,35 +127,52 @@ class CausalSelfAttention(nn.Module):
         mask = torch.triu(mask, diagonal=1)
         self.register_buffer('mask', mask)
 
-    def forward(self, x):
+    def forward(self, x, key_value=None):
         B, T, C = x.size()
-
-        # Calculer Q, K, V de manière plus efficace en mémoire
-        qkv = torch.cat([
-            self.q_proj(x),
-            self.k_proj(x),
-            self.v_proj(x)
-        ], dim=-1)
         
-        # Split et reshape en une seule opération
-        q, k, v = qkv.split([self.n_embd, self.n_head_kv * self.head_dim, self.n_head_kv * self.head_dim], dim=-1)
-        
-        # Reshape efficace
-        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
-        
-        # Libérer la mémoire du tenseur qkv
-        del qkv
-        
-        # Repeat K,V de manière efficace
-        k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-        v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+        # Si key_value est fourni, on fait de la cross-attention
+        if key_value is not None:
+            # Projeter la query depuis x
+            q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+            
+            # Projeter key et value depuis key_value
+            k = self.k_proj(key_value)
+            v = self.v_proj(key_value)
+            
+            # Reshape pour l'attention
+            k = k.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
+            v = v.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
+            
+            # Repeat K,V pour GQA
+            k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+            v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+            
+            # Pas de masque causal en cross-attention
+            mask = None
+            
+        else:
+            # Self-attention standard
+            qkv = torch.cat([
+                self.q_proj(x),
+                self.k_proj(x),
+                self.v_proj(x)
+            ], dim=-1)
+            
+            q, k, v = qkv.split([self.n_embd, self.n_head_kv * self.head_dim, self.n_head_kv * self.head_dim], dim=-1)
+            
+            q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+            k = k.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
+            v = v.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
+            
+            k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+            v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+            
+            mask = self.mask[:T, :T]
 
         if self.flash:
             try:
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    y = self.flash_fn(q, k, v, causal=True)
+                    y = self.flash_fn(q, k, v, causal=mask is not None)
             except Exception as e:
                 print(f"Flash Attention failed: {e}")
                 self.flash = False
@@ -165,19 +182,19 @@ class CausalSelfAttention(nn.Module):
             scale = 1.0 / math.sqrt(self.head_dim)
             att = torch.matmul(q, k.transpose(-2, -1)) * scale
             
-            # Appliquer le masque et le bias de manière efficace
-            att = att + self.alibi.get_bias(T, x.device).repeat_interleave(
-                self.n_head // self.n_head_kv, dim=0
-            )[:self.n_head]
-            att = att + self.mask[:T, :T]
+            # Appliquer le masque et le bias si nécessaire
+            if mask is not None:
+                att = att + self.alibi.get_bias(T, x.device).repeat_interleave(
+                    self.n_head // self.n_head_kv, dim=0
+                )[:self.n_head]
+                att = att + mask
             
             # Softmax et dropout
-            att = F.softmax(att, dim=-1, dtype=torch.float32)  # float32 pour stabilité
+            att = F.softmax(att, dim=-1, dtype=torch.float32)
             att = self.attn_dropout(att.to(q.dtype))
             
             # Calcul final
             y = torch.matmul(att, v)
-            del att  # Libérer la mémoire
         
         # Reshape final
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -550,3 +567,174 @@ class GPT(nn.Module):
             prefetch_factor=2,
             persistent_workers=True
         )
+
+class EncoderDecoderGPT(nn.Module):
+    def __init__(self, encoder_config, decoder_config):
+        super().__init__()
+        self.encoder = GPT(encoder_config)  # Utilise notre GPT existant comme encodeur
+        self.decoder = GPT(decoder_config)  # Utilise notre GPT existant comme décodeur
+        
+        # Projection pour la cross-attention
+        self.cross_attention = nn.ModuleList([
+            CausalSelfAttention(decoder_config) 
+            for _ in range(decoder_config.n_layer)
+        ])
+        
+        # Layer norm pour la cross-attention
+        self.cross_ln = nn.ModuleList([
+            RMSNorm(decoder_config.n_embd)
+            for _ in range(decoder_config.n_layer)
+        ])
+
+    def forward(self, encoder_idx, decoder_idx, targets=None):
+        # Encoder forward pass pour générer les "thoughts"
+        # On récupère les hidden states avant la projection finale
+        with torch.no_grad():  # On ne propage pas les gradients dans l'encodeur pour l'instant
+            # Forward pass de l'encodeur jusqu'aux hidden states
+            tok_emb = self.encoder.transformer.wte(encoder_idx)
+            pos = torch.arange(0, encoder_idx.size(1), dtype=torch.long, device=encoder_idx.device)
+            pos_emb = self.encoder.transformer.wpe(pos)
+            x = self.encoder.transformer.drop(tok_emb + pos_emb)
+            
+            for block in self.encoder.transformer.h:
+                x = block(x)
+            
+            encoder_hidden = self.encoder.transformer.ln_f(x)  # [batch, seq_len, n_embd]
+        
+        # Decoder forward pass avec cross-attention
+        device = decoder_idx.device
+        b, t = decoder_idx.size()
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        
+        # Forward pass du décodeur
+        tok_emb = self.decoder.transformer.wte(decoder_idx)
+        pos_emb = self.decoder.transformer.wpe(pos)
+        x = self.decoder.transformer.drop(tok_emb + pos_emb)
+        
+        # Appliquer les blocs de décodeur avec cross-attention
+        for i, block in enumerate(self.decoder.transformer.h):
+            # Self-attention standard
+            x = x + block.attn(block.ln_1(x))
+            
+            # Cross-attention avec les "thoughts" de l'encodeur
+            cross_x = self.cross_ln[i](x)
+            x = x + self.cross_attention[i](
+                cross_x, 
+                key_value=encoder_hidden
+            )
+            
+            # MLP
+            x = x + block.mlp(block.ln_2(x))
+        
+        x = self.decoder.transformer.ln_f(x)
+        
+        if targets is not None:
+            logits = self.decoder.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            logits = self.decoder.lm_head(x[:, [-1], :])
+            loss = None
+            
+        return logits, loss
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        """
+        Configure l'optimiseur pour l'ensemble du modèle encoder-decoder.
+        Utilise AdamW avec weight decay sur les paramètres appropriés.
+        """
+        # Collecter tous les paramètres
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        
+        # Séparer les paramètres qui doivent avoir du weight decay de ceux qui n'en ont pas
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        
+        # Utiliser fused Adam si disponible sur CUDA
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+        
+        return optimizer
+
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
+        """
+        Estimate model flops utilization (MFU) for both encoder and decoder.
+        """
+        # Calculer les FLOPS pour l'encodeur et le décodeur
+        N_encoder = self.encoder.get_num_params()
+        N_decoder = self.decoder.get_num_params()
+        N_cross = sum(p.numel() for p in self.cross_attention.parameters()) + \
+                 sum(p.numel() for p in self.cross_ln.parameters())
+        
+        cfg_enc = self.encoder.config
+        cfg_dec = self.decoder.config
+        
+        # FLOPS pour l'encodeur
+        L_enc, H_enc, Q_enc, T = cfg_enc.n_layer, cfg_enc.n_head, cfg_enc.n_embd//cfg_enc.n_head, cfg_enc.block_size
+        flops_per_token_enc = 6*N_encoder + 12*L_enc*H_enc*Q_enc*T
+        
+        # FLOPS pour le décodeur
+        L_dec, H_dec, Q_dec, T = cfg_dec.n_layer, cfg_dec.n_head, cfg_dec.n_embd//cfg_dec.n_head, cfg_dec.block_size
+        flops_per_token_dec = 6*N_decoder + 12*L_dec*H_dec*Q_dec*T
+        
+        # FLOPS pour la cross-attention
+        flops_cross = 12*L_dec*H_dec*Q_dec*T*T  # Approximation pour la cross-attention
+        
+        # Total FLOPS
+        flops_per_token = flops_per_token_enc + flops_per_token_dec + flops_cross
+        flops_per_fwdbwd = flops_per_token * T
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+        
+        # Express our flops throughput as ratio of A100 bfloat16 peak flops
+        flops_achieved = flops_per_iter * (1.0/dt)
+        flops_promised = 312e12  # A100 GPU bfloat16 peak flops
+        mfu = flops_achieved / flops_promised
+        
+        return mfu
+
+    @torch.no_grad()
+    def generate(self, encoder_idx, decoder_idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Génère du texte en utilisant l'architecture encoder-decoder.
+        
+        Args:
+            encoder_idx: Séquence d'entrée pour l'encodeur (prompt initial)
+            decoder_idx: Séquence de départ pour le décodeur
+            max_new_tokens: Nombre de nouveaux tokens à générer
+            temperature: Température pour l'échantillonnage
+            top_k: Limite le sampling aux top_k tokens les plus probables
+        """
+        for _ in range(max_new_tokens):
+            # Crop si nécessaire
+            if decoder_idx.size(1) > self.decoder.config.block_size:
+                decoder_idx = decoder_idx[:, -self.decoder.config.block_size:]
+                
+            # Forward pass
+            logits, _ = self(encoder_idx, decoder_idx)
+            
+            # Échantillonnage
+            logits = logits[:, -1, :] / temperature
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            
+            # Concaténer le nouveau token
+            decoder_idx = torch.cat((decoder_idx, idx_next), dim=1)
+            
+        return decoder_idx
