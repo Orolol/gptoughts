@@ -18,8 +18,9 @@ tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", us
 tokenizer.pad_token = tokenizer.eos_token
 
 if __name__ == '__main__':
-    # takes 54GB in huggingface .cache dir, about 8M documents
-    dataset = load_dataset("openwebtext", num_proc=num_proc_load_dataset)
+
+    # takes 54GB in huggingface .cache dir, about 8M documents (8,013,769)
+    dataset = load_dataset("openwebtext", num_proc=num_proc_load_dataset, cache_dir='../temp')
 
     # owt by default only contains the 'train' split, so create a test split
     split_dataset = dataset["train"].train_test_split(test_size=0.0005, seed=2357, shuffle=True)

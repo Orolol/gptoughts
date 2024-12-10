@@ -37,6 +37,7 @@ ENV/
 .ipynb_checkpoints
 
 # Project specific
+temp/
 out/
 wandb/
 *.pt
