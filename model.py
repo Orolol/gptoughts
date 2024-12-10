@@ -502,7 +502,6 @@ class EncoderDecoderGPT(nn.Module):
 
     def forward(self, encoder_idx, decoder_idx, targets=None):
         # Vérifier les dimensions des entrées
-        batch_size = encoder_idx.size(0)
         encoder_seq_len = encoder_idx.size(1)
         decoder_seq_len = decoder_idx.size(1)
         
