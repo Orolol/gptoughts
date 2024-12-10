@@ -30,7 +30,7 @@ out_dir = 'out'
 eval_interval = 200
 log_interval = 1
 generate_interval = 10
-eval_iters = 20
+eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
@@ -79,7 +79,7 @@ if torch.cuda.is_available():
 else:
     device = 'cpu'
     batch_size = 2
-    block_size = 8
+    block_size = 64
     
     # Encoder config (minimal)
     encoder_n_layer = 1

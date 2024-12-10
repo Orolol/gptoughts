@@ -38,7 +38,8 @@ class StreamingDataset(IterableDataset):
         os.makedirs(tracker_dir, exist_ok=True)
         self.token_tracker = TokenTracker()
         
-        # Buffer for storing tokens
+        # Modifions la façon dont nous gérons le dataset
+        self.dataset_iterator = iter(self.dataset)
         self.token_buffer = []
         
         # Save tokenizer metadata
@@ -63,43 +64,52 @@ class StreamingDataset(IterableDataset):
     
     def get_batch(self):
         """Get a batch of token sequences of length block_size."""
-        print(f"Getting batch of size {self.block_size * self.batch_size * 2 + 1}")
-        
-        while len(self.token_buffer) < (self.block_size * self.batch_size * 2 + 1):  # Double the buffer size for encoder+decoder
+        # On s'assure d'avoir assez de tokens dans le buffer
+        while len(self.token_buffer) < (self.block_size * self.batch_size * 2 + 1):
             try:
-                example = next(iter(self.dataset))
+                example = next(self.dataset_iterator)
                 new_tokens = self.process_example(example)
                 self.token_buffer.extend(new_tokens)
                 self.token_tracker.update(len(new_tokens))
             except StopIteration:
+                # Quand on arrive à la fin du dataset, on crée un nouvel itérateur
                 self.dataset = load_dataset("HuggingFaceFW/fineweb-2", 
-                                         name=self.dataset_config,  # Use the instance variable 
-                                         split=self.split,         # Use the instance variable
+                                         name=self.dataset_config,
+                                         split=self.split,
                                          streaming=True)
+                self.dataset_iterator = iter(self.dataset)
+                # Si le buffer est vide après avoir atteint la fin du dataset,
+                # on continue à charger des données
+                if len(self.token_buffer) == 0:
+                    continue
+                # Sinon, on peut utiliser ce qu'il reste dans le buffer
+                break
+
+        # Si après avoir essayé de remplir le buffer, on n'a toujours pas assez de tokens,
+        # on utilise ce qu'on a en ajustant la taille du batch
+        available_sequences = len(self.token_buffer) // self.block_size
+        if available_sequences == 0:
+            raise RuntimeError("Not enough tokens to create even one sequence")
         
-        # Split the sequence into encoder input and decoder input
-        total_length = self.block_size * self.batch_size
-        
-        # Prepare encoder input
-        encoder_input = torch.tensor(self.token_buffer[total_length:total_length*2], 
+        actual_batch_size = min(self.batch_size, available_sequences // 2)  # Divise par 2 car on a besoin d'input et target
+        total_length = self.block_size * actual_batch_size
+
+        # Prepare les tensors comme avant, mais avec la taille de batch ajustée
+        encoder_input = torch.tensor(self.token_buffer[:total_length], 
                                    dtype=torch.long, device=self.device)
-        
-        # Prepare decoder input (shifted by 1 relative to target)
         decoder_input = torch.tensor(self.token_buffer[total_length:total_length*2], 
                                    dtype=torch.long, device=self.device)
-        
-        # Prepare target (shifted by 1 relative to decoder input)
         target = torch.tensor(self.token_buffer[total_length+1:total_length*2+1], 
-                             dtype=torch.long, device=self.device)
-        
-        # Reshape into batch_size x block_size
-        encoder_input = encoder_input.view(self.batch_size, self.block_size)
-        decoder_input = decoder_input.view(self.batch_size, self.block_size)
-        target = target.view(self.batch_size, self.block_size)
-        
-        # Remove used tokens
+                            dtype=torch.long, device=self.device)
+
+        # Reshape avec la taille de batch ajustée
+        encoder_input = encoder_input.view(actual_batch_size, self.block_size)
+        decoder_input = decoder_input.view(actual_batch_size, self.block_size)
+        target = target.view(actual_batch_size, self.block_size)
+
+        # Nettoie le buffer
         self.token_buffer = self.token_buffer[total_length*2:]
-        
+
         return encoder_input, decoder_input, target
     
     def __iter__(self):
