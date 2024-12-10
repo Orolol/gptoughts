@@ -98,11 +98,11 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
         
-        # Projections
-        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.k_proj = nn.Linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias)
-        self.v_proj = nn.Linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias)
-        self.o_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # Projections - forcer bfloat16
+        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias).to(torch.bfloat16)
+        self.k_proj = nn.Linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias).to(torch.bfloat16)
+        self.v_proj = nn.Linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias).to(torch.bfloat16)
+        self.o_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias).to(torch.bfloat16)
         
         # Regularization
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -130,11 +130,10 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x, key_value=None):
         B, T, C = x.size()
         
-        # Convertir toutes les entrées en bfloat16 si nécessaire
-        if self.flash and x.dtype != torch.bfloat16:
-            x = x.to(torch.bfloat16)
-            if key_value is not None:
-                key_value = key_value.to(torch.bfloat16)
+        # Toujours convertir en bfloat16
+        x = x.to(torch.bfloat16)
+        if key_value is not None:
+            key_value = key_value.to(torch.bfloat16)
         
         # Si key_value est fourni, on fait de la cross-attention
         if key_value is not None:
@@ -158,7 +157,6 @@ class CausalSelfAttention(nn.Module):
             
         else:
             # Self-attention standard
-            # S'assurer que les projections sont dans le même dtype
             q = self.q_proj(x)
             k = self.k_proj(x)
             v = self.v_proj(x)
@@ -178,11 +176,6 @@ class CausalSelfAttention(nn.Module):
 
         if self.flash:
             try:
-                # S'assurer que q, k, v sont en bfloat16
-                q = q.to(torch.bfloat16)
-                k = k.to(torch.bfloat16)
-                v = v.to(torch.bfloat16)
-                
                 y = self.flash_fn(q, k, v, causal=mask is not None)
             except Exception as e:
                 print(f"Flash Attention failed: {e}")
@@ -201,13 +194,13 @@ class CausalSelfAttention(nn.Module):
                 att = att + mask
             
             # Softmax et dropout
-            att = F.softmax(att, dim=-1, dtype=torch.float32)
-            att = self.attn_dropout(att.to(q.dtype))
+            att = F.softmax(att, dim=-1, dtype=torch.bfloat16)
+            att = self.attn_dropout(att)
             
             # Calcul final
             y = torch.matmul(att, v)
         
-        # Reshape final et reconversion au dtype original
+        # Reshape final
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         
         return self.resid_dropout(self.o_proj(y))
