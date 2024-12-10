@@ -543,16 +543,12 @@ class EncoderDecoderGPT(nn.Module):
             encoder_pos = torch.arange(0, encoder_seq_len, dtype=torch.long, device=encoder_idx.device)
             
             # Forward pass de l'encodeur
-            tok_emb = self.shared_embedding(encoder_idx)  # Utiliser directement shared_embedding
-            pos_emb = self.shared_pos_embedding(encoder_pos)  # Utiliser directement shared_pos_embedding
+            tok_emb = self.shared_embedding(encoder_idx)  # [batch_size, seq_len, n_embd]
+            pos_emb = self.shared_pos_embedding(encoder_pos)  # [seq_len, n_embd]
             
-            print(tok_emb.shape, pos_emb.shape)
-            
-            # Étendre pos_emb pour correspondre à la forme de tok_emb
-            pos_emb = pos_emb.unsqueeze(0)
-            pos_emb = pos_emb.expand(tok_emb.size(0), -1, -1)
-            
-            print(pos_emb.shape, tok_emb.shape)
+            # Ajuster les dimensions de pos_emb pour le broadcasting
+            pos_emb = pos_emb.unsqueeze(0)  # [1, seq_len, n_embd]
+            pos_emb = pos_emb.expand(tok_emb.size(0), -1, -1)  # [batch_size, seq_len, n_embd]
             
             x = self.encoder.transformer.drop(tok_emb + pos_emb)
             
@@ -566,12 +562,12 @@ class EncoderDecoderGPT(nn.Module):
         decoder_pos = torch.arange(0, decoder_seq_len, dtype=torch.long, device=decoder_idx.device)
         
         # Forward pass du décodeur
-        tok_emb = self.shared_embedding(decoder_idx)  # Utiliser directement shared_embedding
-        pos_emb = self.shared_pos_embedding(decoder_pos)  # Utiliser directement shared_pos_embedding
+        tok_emb = self.shared_embedding(decoder_idx)  # [batch_size, seq_len, n_embd]
+        pos_emb = self.shared_pos_embedding(decoder_pos)  # [seq_len, n_embd]
         
-        # Étendre pos_emb pour le décodeur aussi
-        pos_emb = pos_emb.unsqueeze(0)
-        pos_emb = pos_emb.expand(tok_emb.size(0), -1, -1)
+        # Ajuster les dimensions de pos_emb pour le broadcasting
+        pos_emb = pos_emb.unsqueeze(0)  # [1, seq_len, n_embd]
+        pos_emb = pos_emb.expand(tok_emb.size(0), -1, -1)  # [batch_size, seq_len, n_embd]
         
         x = self.decoder.transformer.drop(tok_emb + pos_emb)
         
@@ -641,20 +637,46 @@ class EncoderDecoderGPT(nn.Module):
     def generate(self, encoder_idx, decoder_idx, max_new_tokens, temperature=1.0, top_k=None):
         """
         Génère du texte en utilisant l'architecture encoder-decoder.
-        """
-        # S'assurer que les dimensions sont correctes
-        encoder_seq_len = min(encoder_idx.size(1), self.encoder.config.block_size)
-        encoder_idx = encoder_idx[:, :encoder_seq_len]
         
+        Args:
+            encoder_idx: Tensor d'entrée pour l'encodeur [batch_size, encoder_seq_len]
+            decoder_idx: Tensor d'amorce pour le décodeur [batch_size, decoder_seq_len]
+            max_new_tokens: Nombre maximum de nouveaux tokens à générer
+            temperature: Facteur de température pour l'échantillonnage (default: 1.0)
+            top_k: Limite le nombre de tokens considérés pour l'échantillonnage (default: None)
+        
+        Returns:
+            torch.Tensor: Séquence générée incluant l'amorce [batch_size, decoder_seq_len + max_new_tokens]
+        """
+        # Encoder une seule fois la séquence d'entrée
+        with torch.no_grad():
+            # Préparer l'entrée de l'encodeur
+            encoder_seq_len = min(encoder_idx.size(1), self.encoder.config.block_size)
+            encoder_idx = encoder_idx[:, :encoder_seq_len]
+            
+            # Générer les positions pour l'encodeur
+            encoder_pos = torch.arange(0, encoder_seq_len, dtype=torch.long, device=encoder_idx.device)
+            
+            # Forward pass de l'encodeur
+            tok_emb = self.shared_embedding(encoder_idx)
+            pos_emb = self.shared_pos_embedding(encoder_pos)
+            pos_emb = pos_emb.unsqueeze(0).expand(tok_emb.size(0), -1, -1)
+            
+            x = self.encoder.transformer.drop(tok_emb + pos_emb)
+            for block in self.encoder.transformer.h:
+                x = block(x)
+            encoder_hidden = self.encoder.transformer.ln_f(x)
+        
+        # Génération auto-régressive
         for _ in range(max_new_tokens):
-            # Limiter la taille de la séquence du décodeur
+            # Limiter la taille de la séquence du décodeur si nécessaire
             if decoder_idx.size(1) > self.decoder.config.block_size:
                 decoder_idx = decoder_idx[:, -self.decoder.config.block_size:]
-                
-            # Forward pass
-            logits, _ = self(encoder_idx, decoder_idx)
             
-            # Échantillonnage
+            # Forward pass complet avec l'encodeur pré-calculé
+            logits, _ = self(encoder_hidden, decoder_idx)
+            
+            # Échantillonnage du prochain token
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -665,5 +687,5 @@ class EncoderDecoderGPT(nn.Module):
             
             # Concaténer le nouveau token
             decoder_idx = torch.cat((decoder_idx, idx_next), dim=1)
-            
+        
         return decoder_idx
