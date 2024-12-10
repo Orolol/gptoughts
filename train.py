@@ -48,8 +48,8 @@ if torch.cuda.is_available():
     block_size = 64
     
     # Encoder config (plus petit)
-    encoder_n_layer = 4
-    encoder_n_head = 4
+    encoder_n_layer = 1
+    encoder_n_head = 1
     encoder_n_embd = 768
     encoder_ratio_kv = 8
     
