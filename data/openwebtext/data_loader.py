@@ -37,8 +37,10 @@ class StreamingDataset(IterableDataset):
         self.dataset_config = dataset_config
         self.split = split
         
+        access_token = os.getenv('HF_TOKEN')
+        
         # Initialize tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True)
+        self.tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True, access_token=access_token)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         
         # Initialize dataset

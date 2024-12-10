@@ -18,6 +18,8 @@ from torch.distributed import init_process_group, destroy_process_group
 from model import GPTConfig, GPT, EncoderDecoderGPT
 from data.openwebtext.data_loader import StreamingDataset
 
+access_token=os.getenv('HF_TOKEN')
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -154,7 +156,7 @@ if os.path.exists(meta_path):
     tokenizer = meta['tokenizer']
 else:
     print("meta.pkl not found, loading default tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True, access_token=access_token)
     tokenizer.pad_token = tokenizer.eos_token
 
 decode = lambda tokens: tokenizer.decode(tokens, skip_special_tokens=True)
