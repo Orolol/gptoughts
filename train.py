@@ -286,7 +286,7 @@ if device_type == 'cuda':
     pin_memory = True
 
 # Configurer le gradient scaler
-scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16'))
+scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'bfloat16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -377,7 +377,7 @@ while True:
         param_group['lr'] = lr
     print(f"Learning rate set to: {lr}")
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process and iter_num > 0:
+    if iter_num % eval_interval == 0 and master_process andzzzzy:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         print(f"Total tokens processed: {train_dataset.get_total_tokens():,}")
