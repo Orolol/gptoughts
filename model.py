@@ -139,13 +139,19 @@ class CausalSelfAttention(nn.Module):
             k = self.k_proj(key_value)
             v = self.v_proj(key_value)
             
-            # Reshape pour l'attention
-            k = k.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
-            v = v.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
+            # Calculer les dimensions pour key_value
+            kv_seq_len = key_value.size(1)
             
-            # Repeat K,V pour GQA
-            k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-            v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+            # Reshape pour l'attention avec les bonnes dimensions
+            k = k.view(B, kv_seq_len, self.n_head_kv, self.head_dim).transpose(1, 2)
+            v = v.view(B, kv_seq_len, self.n_head_kv, self.head_dim).transpose(1, 2)
+            
+            # Repeat K,V pour GQA avec les bonnes dimensions
+            k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=0)
+            v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=0)
+            
+            # Ajuster la dimension du batch pour q pour correspondre à k et v
+            q = q.repeat_interleave(self.n_head // self.n_head_kv, dim=0)
             
             # Pas de masque causal en cross-attention
             mask = None
@@ -171,8 +177,16 @@ class CausalSelfAttention(nn.Module):
 
         if self.flash:
             try:
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                # Convertir en bf16/fp16 pour Flash Attention
+                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
+                
+                with torch.cuda.amp.autocast():
                     y = self.flash_fn(q, k, v, causal=mask is not None)
+                    
+                # Reconvertir au type d'origine si nécessaire
+                y = y.to(x.dtype)
+                
             except Exception as e:
                 print(f"Flash Attention failed: {e}")
                 self.flash = False
