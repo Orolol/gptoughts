@@ -286,8 +286,13 @@ if device_type == 'cuda':
     torch.cuda.memory.empty_cache()
     torch.cuda.set_per_process_memory_fraction(0.8)  # Utiliser 80% de la mémoire disponible
 
-# Configurer le gradient scaler
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'bfloat16'))
+# Modifier la configuration du scaler
+if dtype == 'float16':
+    scaler = torch.cuda.amp.GradScaler()
+    use_amp = True
+else:  # pour bfloat16 ou float32
+    scaler = None
+    use_amp = False
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -446,17 +451,26 @@ while True:
                 train_iterator = iter(train_dataset)
                 encoder_input_next, decoder_input_next, target_next = next(train_iterator)
             
-            # backward pass, with gradient scaling if training in fp16
-            scaler.scale(loss).backward()
+            # backward pass
+            if use_amp:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
         
     # clip the gradient
     if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
+        if use_amp:
+            scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
     # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
+    if use_amp:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+
+    # flush the gradients
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
