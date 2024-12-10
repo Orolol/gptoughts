@@ -521,8 +521,12 @@ class EncoderDecoderGPT(nn.Module):
             encoder_pos = torch.arange(0, encoder_seq_len, dtype=torch.long, device=encoder_idx.device)
             
             # Forward pass de l'encodeur
-            tok_emb = self.encoder.transformer.wte(encoder_idx)
-            pos_emb = self.encoder.transformer.wpe(encoder_pos)
+            tok_emb = self.encoder.transformer.wte(encoder_idx)  # [batch_size, seq_len, n_embd]
+            pos_emb = self.encoder.transformer.wpe(encoder_pos)  # [seq_len, n_embd]
+            
+            # Étendre pos_emb pour correspondre à la forme de tok_emb
+            pos_emb = pos_emb.unsqueeze(0).expand_as(tok_emb)  # [batch_size, seq_len, n_embd]
+            
             print(tok_emb.shape, pos_emb.shape)
             x = self.encoder.transformer.drop(tok_emb + pos_emb)
             
@@ -538,6 +542,10 @@ class EncoderDecoderGPT(nn.Module):
         # Forward pass du décodeur
         tok_emb = self.decoder.transformer.wte(decoder_idx)
         pos_emb = self.decoder.transformer.wpe(decoder_pos)
+        
+        # Étendre pos_emb pour le décodeur aussi
+        pos_emb = pos_emb.unsqueeze(0).expand_as(tok_emb)
+        
         x = self.decoder.transformer.drop(tok_emb + pos_emb)
         
         # Appliquer les blocs de décodeur avec cross-attention
