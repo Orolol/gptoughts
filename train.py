@@ -45,7 +45,7 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = 'cuda:0'
-    batch_size = 32
+    batch_size = 8
     block_size = 64
     
     # Encoder config (plus petit)
@@ -148,17 +148,8 @@ import random
 import pickle
 import os
 
-# Charger le tokenizer depuis meta.pkl
-meta_path = os.path.join(data_dir, 'meta.pkl')
-if os.path.exists(meta_path):
-    print("Loading tokenizer from meta.pkl...")
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    tokenizer = meta['tokenizer']
-else:
-    print("meta.pkl not found, loading default tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True, access_token=access_token)
-    tokenizer.pad_token = tokenizer.eos_token
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True, access_token=access_token)
+tokenizer.pad_token = tokenizer.eos_token
 
 decode = lambda tokens: tokenizer.decode(tokens, skip_special_tokens=True)
 
@@ -204,17 +195,9 @@ def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8):
 iter_num = 0
 best_val_loss = 1e9
 
-# attempt to derive vocab_size from the dataset
-meta_path = os.path.join(data_dir, 'meta.pkl')
-meta_vocab_size = None
-if os.path.exists(meta_path):
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-vocab_size = meta_vocab_size if meta_vocab_size is not None else 50304
+vocab_size = len(tokenizer)
 
 # Créer les configurations pour l'encodeur et le décodeur
 encoder_config = GPTConfig(
