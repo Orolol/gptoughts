@@ -428,41 +428,53 @@ class GPT(nn.Module):
 
 
     @torch.no_grad()
-    def generate(self, idx: torch.LongTensor, max_new_tokens: int, temperature: float = 1.0, top_k: Optional[int] = None) -> torch.LongTensor:
+    def generate(self, input_text, prompt_tokens, max_new_tokens, temperature=1.0, top_k=None):
         """
-        Generate text tokens autoregressively.
-
+        Génère du texte en utilisant l'architecture encoder-decoder.
+        
         Args:
-            idx: Conditioning sequence of indices (shape: batch_size × sequence_length)
-            max_new_tokens: Number of new tokens to generate
-            temperature: Sampling temperature (higher = more random, lower = more deterministic)
-            top_k: If set, only sample from the top k most likely tokens
-
-        Returns:
-            torch.LongTensor: Generated sequence including the conditioning tokens
-            
-        Note:
-            Make sure the model is in eval() mode before generation.
+            input_text: Tensor d'entrée pour l'encodeur [batch_size, seq_len]
+            prompt_tokens: Tokens de départ pour le décodeur [batch_size, prompt_len]
+            max_new_tokens: Nombre maximum de nouveaux tokens à générer
+            temperature: Facteur de température pour l'échantillonnage
+            top_k: Limite le nombre de tokens considérés pour l'échantillonnage
         """
+        # Encoder la séquence d'entrée une seule fois
+        x = self.shared_embedding(input_text)
+        pos = torch.arange(0, input_text.size(1), device=input_text.device)
+        x = x + self.shared_pos_embedding(pos)
+        x = self.encoder.transformer.drop(x)
+        
+        for block in self.encoder.transformer.h:
+            x = block(x)
+        encoder_output = self.encoder.transformer.ln_f(x)
+        
+        # Commencer avec le prompt pour le décodeur
+        decoder_tokens = prompt_tokens
+        
+        # Génération auto-régressive
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
+            # Forward pass avec l'encodeur et le décodeur
+            logits, _ = self(input_text, decoder_tokens)
             logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
+            
+            # Optionnel: top-k sampling
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
+                logits[logits < v[:, [-1]]] = float('-inf')
+            
+            # Échantillonner le prochain token
             probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
-        return idx
+            next_token = torch.multinomial(probs, num_samples=1)
+            
+            # Ajouter le nouveau token à la séquence
+            decoder_tokens = torch.cat([decoder_tokens, next_token], dim=1)
+            
+            # Option: arrêter si on génère un token de fin
+            if next_token[0].item() == tokenizer.eos_token_id:
+                break
+        
+        return decoder_tokens
 
     @staticmethod
     def configure_dataloader(dataset, batch_size, num_workers=None):
@@ -634,58 +646,51 @@ class EncoderDecoderGPT(nn.Module):
 
 
     @torch.no_grad()
-    def generate(self, encoder_idx, decoder_idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, encoder_input, decoder_start, max_new_tokens, temperature=1.0, top_k=None):
         """
         Génère du texte en utilisant l'architecture encoder-decoder.
         
         Args:
-            encoder_idx: Tensor d'entrée pour l'encodeur [batch_size, encoder_seq_len]
-            decoder_idx: Tensor d'amorce pour le décodeur [batch_size, decoder_seq_len]
+            encoder_input: Tensor d'entrée [batch_size, seq_len]
+            decoder_start: Tensor de départ pour le décodeur [batch_size, initial_seq_len]
             max_new_tokens: Nombre maximum de nouveaux tokens à générer
-            temperature: Facteur de température pour l'échantillonnage (default: 1.0)
-            top_k: Limite le nombre de tokens considérés pour l'échantillonnage (default: None)
-        
-        Returns:
-            torch.Tensor: Séquence générée incluant l'amorce [batch_size, decoder_seq_len + max_new_tokens]
+            temperature: Facteur de température pour l'échantillonnage
+            top_k: Limite le nombre de tokens considérés pour l'échantillonnage
         """
-        # Encoder une seule fois la séquence d'entrée
-        with torch.no_grad():
-            # Préparer l'entrée de l'encodeur
-            encoder_seq_len = min(encoder_idx.size(1), self.encoder.config.block_size)
-            encoder_idx = encoder_idx[:, :encoder_seq_len]
-            
-            # Générer les positions pour l'encodeur
-            encoder_pos = torch.arange(0, encoder_seq_len, dtype=torch.long, device=encoder_idx.device)
-            
-            # Forward pass de l'encodeur
-            tok_emb = self.shared_embedding(encoder_idx)
-            pos_emb = self.shared_pos_embedding(encoder_pos)
-            pos_emb = pos_emb.unsqueeze(0).expand(tok_emb.size(0), -1, -1)
-            
-            x = self.encoder.transformer.drop(tok_emb + pos_emb)
-            for block in self.encoder.transformer.h:
-                x = block(x)
-            encoder_hidden = self.encoder.transformer.ln_f(x)
+        # Encoder la séquence d'entrée une seule fois
+        encoder_hidden = None
+        for block in self.encoder.transformer.h:
+            if encoder_hidden is None:
+                encoder_hidden = self.encoder.transformer.drop(
+                    self.shared_embedding(encoder_input) + 
+                    self.shared_pos_embedding(torch.arange(0, encoder_input.size(1), device=encoder_input.device))
+                )
+            encoder_hidden = block(encoder_hidden)
+        encoder_hidden = self.encoder.transformer.ln_f(encoder_hidden)
+        
+        # Initialiser la séquence de décodage
+        decoder_tokens = decoder_start
         
         # Génération auto-régressive
         for _ in range(max_new_tokens):
-            # Limiter la taille de la séquence du décodeur si nécessaire
-            if decoder_idx.size(1) > self.decoder.config.block_size:
-                decoder_idx = decoder_idx[:, -self.decoder.config.block_size:]
-            
-            # Forward pass complet avec l'encodeur pré-calculé
-            logits, _ = self(encoder_hidden, decoder_idx)
-            
-            # Échantillonnage du prochain token
+            # Obtenir les logits pour le prochain token
+            logits, _ = self(encoder_input, decoder_tokens)
             logits = logits[:, -1, :] / temperature
+            
+            # Optionnel: top-k sampling
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
+                logits[logits < v[:, [-1]]] = float('-inf')
             
+            # Échantillonner le prochain token
             probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
+            next_token = torch.multinomial(probs, num_samples=1)
             
-            # Concaténer le nouveau token
-            decoder_idx = torch.cat((decoder_idx, idx_next), dim=1)
+            # Ajouter le nouveau token à la séquence
+            decoder_tokens = torch.cat([decoder_tokens, next_token], dim=1)
+            
+            # Option: arrêter si on génère un token de fin
+            if next_token[0].item() == self.config.eos_token_id:
+                break
         
-        return decoder_idx
+        return decoder_tokens

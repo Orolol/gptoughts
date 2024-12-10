@@ -168,7 +168,7 @@ PROMPT_TEMPLATES = [
 ]
 
 @torch.no_grad()
-def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8):
+def generate_text(model, input_tokens, max_new_tokens=50, temperature=0.8):
     model.eval()
     
     # Choisir un début de phrase aléatoire et l'encoder
@@ -176,20 +176,24 @@ def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8):
     prompt_tokens = torch.tensor(
         tokenizer.encode(prompt, add_special_tokens=False), 
         dtype=torch.long, 
-        device=encoder_input.device
+        device=input_tokens.device
+    ).unsqueeze(0)  # Ajouter dimension batch
+    
+    # Utiliser la même entrée pour l'encodeur et le décodeur
+    # L'encodeur utilisera input_tokens
+    # Le décodeur commencera avec le prompt
+    generated_tokens = model.generate(
+        input_tokens,
+        prompt_tokens,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature
     )
     
-    # Encoder l'entrée avec le prompt
-    encoder_output = encoder_input.unsqueeze(0)
-    
-    # Utiliser le prompt comme entrée du décodeur
-    decoder_input = prompt_tokens.unsqueeze(0)
-    
-    # Générer token par token
-    generated_tokens = model.generate(encoder_input, decoder_input, max_new_tokens=max_new_tokens, temperature=temperature)
+    # Décoder les tokens générés
+    decoded_text = decode(generated_tokens[0].tolist())
     
     model.train()
-    return generated_tokens[0].tolist()
+    return decoded_text
 
 # init these up here, can override if init_from='resume'
 iter_num = 0
