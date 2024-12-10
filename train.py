@@ -399,7 +399,7 @@ while True:
     if iter_num % eval_interval == 0 and master_process and iter_num > 0:
         losses = estimate_loss()
         # print the first token of the input
-        print(f"First token of the input: {tokenizer.decode(encoder_input[0].tolist())}")
+        # print(f"First token of the input: {tokenizer.decode(encoder_input[0].tolist())}")
         
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         print(f"Total tokens processed: {train_dataset.get_total_tokens():,}")
@@ -466,7 +466,7 @@ while True:
     if iter_num % log_interval == 0 and master_process:
         
         # Print the first token of the input
-        print(f"First token of the input: {tokenizer.decode(encoder_input[0].tolist())}")
+        #  print(f"First token of the input: {tokenizer.decode(encoder_input[0].tolist())}")
         
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
