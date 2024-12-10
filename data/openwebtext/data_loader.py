@@ -36,7 +36,7 @@ class StreamingDataset(IterableDataset):
         # Initialize token tracker
         tracker_dir = os.path.join('data', 'token_tracking')
         os.makedirs(tracker_dir, exist_ok=True)
-        self.token_tracker = TokenTracker(os.path.join(tracker_dir, f'{split}_token_count.json'))
+        self.token_tracker = TokenTracker()
         
         # Buffer for storing tokens
         self.token_buffer = []
