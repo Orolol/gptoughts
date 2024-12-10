@@ -27,9 +27,9 @@ access_token=os.getenv('HF_TOKEN')
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 200
+eval_interval = 2000
 log_interval = 1
-generate_interval = 10
+generate_interval = 100
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
@@ -48,7 +48,7 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = 'cuda:0'
-    batch_size = 16
+    batch_size = 32
     block_size = 64
     
     # Encoder config (plus petit)
@@ -473,6 +473,8 @@ while True:
         lossf = loss.item() * gradient_accumulation_steps
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
     if iter_num % generate_interval == 0 and master_process:
+        text = generate_text(model, encoder_input.detach().clone(), max_new_tokens=50, temperature=0.8)
+        print(f"\nGenerated text: {text}\n")
         if generation_queue.empty():  # Pour éviter d'accumuler des requêtes
             generation_queue.put(encoder_input.detach().clone())
     iter_num += 1
