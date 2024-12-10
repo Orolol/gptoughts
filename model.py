@@ -501,6 +501,14 @@ class EncoderDecoderGPT(nn.Module):
         ])
 
     def forward(self, encoder_idx, decoder_idx, targets=None):
+        """
+        Forward pass de l'architecture encoder-decoder.
+        
+        Args:
+            encoder_idx: Tensor d'indices pour l'encodeur [batch_size, encoder_seq_len]
+            decoder_idx: Tensor d'indices pour le décodeur [batch_size, decoder_seq_len]
+            targets: Tensor cible optionnel pour le calcul de la loss
+        """
         # Vérifier les dimensions des entrées
         if encoder_idx.dim() == 4:  # Si l'entrée vient de generate()
             encoder_idx = encoder_idx.squeeze(0)  # Enlever la dimension supplémentaire
@@ -525,9 +533,9 @@ class EncoderDecoderGPT(nn.Module):
             pos_emb = self.encoder.transformer.wpe(encoder_pos)  # [seq_len, n_embd]
             
             # Étendre pos_emb pour correspondre à la forme de tok_emb
-            pos_emb = pos_emb.unsqueeze(0).expand_as(tok_emb)  # [batch_size, seq_len, n_embd]
+            pos_emb = pos_emb.unsqueeze(0)  # [1, seq_len, n_embd]
+            pos_emb = pos_emb.expand(tok_emb.size(0), -1, -1)  # [batch_size, seq_len, n_embd]
             
-            print(tok_emb.shape, pos_emb.shape)
             x = self.encoder.transformer.drop(tok_emb + pos_emb)
             
             for block in self.encoder.transformer.h:
@@ -540,11 +548,12 @@ class EncoderDecoderGPT(nn.Module):
         decoder_pos = torch.arange(0, decoder_seq_len, dtype=torch.long, device=decoder_idx.device)
         
         # Forward pass du décodeur
-        tok_emb = self.decoder.transformer.wte(decoder_idx)
-        pos_emb = self.decoder.transformer.wpe(decoder_pos)
+        tok_emb = self.decoder.transformer.wte(decoder_idx)  # [batch_size, seq_len, n_embd]
+        pos_emb = self.decoder.transformer.wpe(decoder_pos)  # [seq_len, n_embd]
         
         # Étendre pos_emb pour le décodeur aussi
-        pos_emb = pos_emb.unsqueeze(0).expand_as(tok_emb)
+        pos_emb = pos_emb.unsqueeze(0)  # [1, seq_len, n_embd]
+        pos_emb = pos_emb.expand(tok_emb.size(0), -1, -1)  # [batch_size, seq_len, n_embd]
         
         x = self.decoder.transformer.drop(tok_emb + pos_emb)
         
