@@ -521,6 +521,7 @@ class EncoderDecoderGPT(nn.Module):
             # Forward pass de l'encodeur
             tok_emb = self.encoder.transformer.wte(encoder_idx)
             pos_emb = self.encoder.transformer.wpe(encoder_pos)
+            print(tok_emb.shape, pos_emb.shape)
             x = self.encoder.transformer.drop(tok_emb + pos_emb)
             
             for block in self.encoder.transformer.h:
