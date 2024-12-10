@@ -136,22 +136,31 @@ class CausalSelfAttention(nn.Module):
             q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
             
             # Projeter key et value depuis key_value
-            k = self.k_proj(key_value)
-            v = self.v_proj(key_value)
-            
-            # Calculer les dimensions pour key_value
             kv_seq_len = key_value.size(1)
             
-            # Reshape pour l'attention avec les bonnes dimensions
-            k = k.view(B, kv_seq_len, self.n_head_kv, self.head_dim).transpose(1, 2)
-            v = v.view(B, kv_seq_len, self.n_head_kv, self.head_dim).transpose(1, 2)
+            # Calculer les dimensions attendues pour k et v
+            k_proj_size = B * kv_seq_len * self.n_head_kv * self.head_dim
+            v_proj_size = k_proj_size
             
-            # Repeat K,V pour GQA avec les bonnes dimensions
+            # Vérifier et ajuster les projections si nécessaire
+            k = self.k_proj(key_value)
+            if k.numel() != k_proj_size:
+                k = k.view(B * self.n_head_kv, kv_seq_len, self.head_dim)
+            else:
+                k = k.view(B, kv_seq_len, self.n_head_kv, self.head_dim).transpose(1, 2)
+            
+            v = self.v_proj(key_value)
+            if v.numel() != v_proj_size:
+                v = v.view(B * self.n_head_kv, kv_seq_len, self.head_dim)
+            else:
+                v = v.view(B, kv_seq_len, self.n_head_kv, self.head_dim).transpose(1, 2)
+            
+            # Ajuster q pour correspondre aux dimensions de k et v
+            q = q.view(B * self.n_head, T, self.head_dim)
+            
+            # Répéter k et v pour correspondre au nombre de têtes d'attention
             k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=0)
             v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=0)
-            
-            # Ajuster la dimension du batch pour q pour correspondre à k et v
-            q = q.repeat_interleave(self.n_head // self.n_head_kv, dim=0)
             
             # Pas de masque causal en cross-attention
             mask = None
@@ -211,6 +220,8 @@ class CausalSelfAttention(nn.Module):
             y = torch.matmul(att, v)
         
         # Reshape final
+        if key_value is not None:
+            y = y.view(B, self.n_head, T, self.head_dim)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         
         return self.resid_dropout(self.o_proj(y))
@@ -628,7 +639,7 @@ class EncoderDecoderGPT(nn.Module):
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """
-        Configure l'optimiseur pour l'ensemble du modèle encoder-decoder.
+        Configure l'optimiseur pour l'ensemble du mod��le encoder-decoder.
         Utilise AdamW avec weight decay sur les paramètres appropriés.
         """
         # Collecter tous les paramètres
