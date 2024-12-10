@@ -587,28 +587,40 @@ class EncoderDecoderGPT(nn.Module):
         ])
 
     def forward(self, encoder_idx, decoder_idx, targets=None):
-        # Encoder forward pass pour générer les "thoughts"
-        # On récupère les hidden states avant la projection finale
-        with torch.no_grad():  # On ne propage pas les gradients dans l'encodeur pour l'instant
-            # Forward pass de l'encodeur jusqu'aux hidden states
+        # Vérifier les dimensions des entrées
+        batch_size = encoder_idx.size(0)
+        encoder_seq_len = encoder_idx.size(1)
+        decoder_seq_len = decoder_idx.size(1)
+        
+        # Vérifier que les séquences ne dépassent pas block_size
+        encoder_seq_len = min(encoder_seq_len, self.encoder.config.block_size)
+        decoder_seq_len = min(decoder_seq_len, self.decoder.config.block_size)
+        
+        encoder_idx = encoder_idx[:, :encoder_seq_len]
+        decoder_idx = decoder_idx[:, :decoder_seq_len]
+        
+        # Encoder forward pass
+        with torch.no_grad():
+            # Générer les positions pour l'encodeur
+            encoder_pos = torch.arange(0, encoder_seq_len, dtype=torch.long, device=encoder_idx.device)
+            
+            # Forward pass de l'encodeur
             tok_emb = self.encoder.transformer.wte(encoder_idx)
-            pos = torch.arange(0, encoder_idx.size(1), dtype=torch.long, device=encoder_idx.device)
-            pos_emb = self.encoder.transformer.wpe(pos)
+            pos_emb = self.encoder.transformer.wpe(encoder_pos)
             x = self.encoder.transformer.drop(tok_emb + pos_emb)
             
             for block in self.encoder.transformer.h:
                 x = block(x)
             
-            encoder_hidden = self.encoder.transformer.ln_f(x)  # [batch, seq_len, n_embd]
+            encoder_hidden = self.encoder.transformer.ln_f(x)
         
-        # Decoder forward pass avec cross-attention
-        device = decoder_idx.device
-        b, t = decoder_idx.size()
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        # Decoder forward pass
+        # Générer les positions pour le décodeur
+        decoder_pos = torch.arange(0, decoder_seq_len, dtype=torch.long, device=decoder_idx.device)
         
         # Forward pass du décodeur
         tok_emb = self.decoder.transformer.wte(decoder_idx)
-        pos_emb = self.decoder.transformer.wpe(pos)
+        pos_emb = self.decoder.transformer.wpe(decoder_pos)
         x = self.decoder.transformer.drop(tok_emb + pos_emb)
         
         # Appliquer les blocs de décodeur avec cross-attention
@@ -616,7 +628,7 @@ class EncoderDecoderGPT(nn.Module):
             # Self-attention standard
             x = x + block.attn(block.ln_1(x))
             
-            # Cross-attention avec les "thoughts" de l'encodeur
+            # Cross-attention avec les hidden states de l'encodeur
             cross_x = self.cross_ln[i](x)
             x = x + self.cross_attention[i](
                 cross_x, 
@@ -628,7 +640,10 @@ class EncoderDecoderGPT(nn.Module):
         
         x = self.decoder.transformer.ln_f(x)
         
+        # Calculer les logits et la loss si nécessaire
         if targets is not None:
+            # S'assurer que targets a la bonne taille
+            targets = targets[:, :decoder_seq_len]
             logits = self.decoder.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
@@ -709,16 +724,13 @@ class EncoderDecoderGPT(nn.Module):
     def generate(self, encoder_idx, decoder_idx, max_new_tokens, temperature=1.0, top_k=None):
         """
         Génère du texte en utilisant l'architecture encoder-decoder.
-        
-        Args:
-            encoder_idx: Séquence d'entrée pour l'encodeur (prompt initial)
-            decoder_idx: Séquence de départ pour le décodeur
-            max_new_tokens: Nombre de nouveaux tokens à générer
-            temperature: Température pour l'échantillonnage
-            top_k: Limite le sampling aux top_k tokens les plus probables
         """
+        # S'assurer que les dimensions sont correctes
+        encoder_seq_len = min(encoder_idx.size(1), self.encoder.config.block_size)
+        encoder_idx = encoder_idx[:, :encoder_seq_len]
+        
         for _ in range(max_new_tokens):
-            # Crop si nécessaire
+            # Limiter la taille de la séquence du décodeur
             if decoder_idx.size(1) > self.decoder.config.block_size:
                 decoder_idx = decoder_idx[:, -self.decoder.config.block_size:]
                 
