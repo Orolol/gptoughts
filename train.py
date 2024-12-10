@@ -8,6 +8,9 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import threading
+from queue import Queue
+import gc
 
 import numpy as np
 import torch
@@ -26,7 +29,7 @@ access_token=os.getenv('HF_TOKEN')
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
-generate_interval = 50
+generate_interval = 10
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
@@ -45,7 +48,7 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = 'cuda:0'
-    batch_size = 8
+    batch_size = 32
     block_size = 64
     
     # Encoder config (plus petit)
@@ -189,7 +192,7 @@ def generate_text(model, input, max_new_tokens=50, temperature=0.8):
     decoded_text = decode(generated_tokens[0].tolist())
     
     model.train()
-    return decoded_text  # Retourner directement le texte décodé
+    return prompt + " " + decoded_text  # Retourner directement le texte décodé
 
 # init these up here, can override if init_from='resume'
 iter_num = 0
@@ -268,6 +271,20 @@ if device_type == 'cuda':
     torch.cuda.empty_cache()
     
     pin_memory = True
+    
+    # Désactiver le garbage collector automatique
+    gc.disable()
+    
+    # Configurer la gestion de la mémoire CUDA
+    torch.cuda.empty_cache()
+    torch.cuda.memory.empty_cache()
+    torch.backends.cudnn.benchmark = True
+    
+    # Réserver de la mémoire CUDA
+    cache_size = 24 * 1024 * 1024 * 1024  # 24GB
+    torch.cuda.empty_cache()
+    torch.cuda.memory.empty_cache()
+    torch.cuda.set_per_process_memory_fraction(0.8)  # Utiliser 80% de la mémoire disponible
 
 # Configurer le gradient scaler
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'bfloat16'))
@@ -342,6 +359,26 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 print("Initializing training loop...")
+
+# Créer une queue pour la génération
+generation_queue = Queue()
+
+# Fonction de génération qui tourne dans un thread séparé
+def generation_worker(model, device):
+    while True:
+        if not generation_queue.empty():
+            encoder_input = generation_queue.get()
+            with torch.no_grad():
+                generated = generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8)
+                print(f"\nGenerated text: {generated}\n")
+
+# Démarrer le thread de génération avant la boucle d'entraînement
+generation_thread = threading.Thread(
+    target=generation_worker, 
+    args=(model, device),
+    daemon=True
+)
+generation_thread.start()
 
 # training loop
 train_iterator = iter(train_dataset)
@@ -429,7 +466,8 @@ while True:
         lossf = loss.item() * gradient_accumulation_steps
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
     if iter_num % generate_interval == 0 and master_process:
-        print(generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8))
+        if generation_queue.empty():  # Pour éviter d'accumuler des requêtes
+            generation_queue.put(encoder_input.detach().clone())
     iter_num += 1
     local_iter_num += 1
     encoder_input, decoder_input, target = encoder_input_next, decoder_input_next, target_next
@@ -437,6 +475,27 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
+
+    # Dans la boucle d'entraînement, après chaque N itérations
+    if iter_num % 100 == 0:  # Ajuster la fréquence selon vos besoins
+        if device_type == 'cuda':
+            # Forcer la synchronisation CUDA
+            torch.cuda.synchronize()
+            
+        # Collecter manuellement le garbage
+        if gc.isenabled():
+            gc.collect()
+
+    if iter_num % 100 == 0:  # Pour profiler périodiquement
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+
+    if iter_num % 100 == 0:
+        end_event.record()
+        torch.cuda.synchronize()
+        print(f"CUDA time: {start_event.elapsed_time(end_event)}ms")
 
 if ddp:
     destroy_process_group()
