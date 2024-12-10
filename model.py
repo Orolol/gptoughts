@@ -502,6 +502,9 @@ class EncoderDecoderGPT(nn.Module):
 
     def forward(self, encoder_idx, decoder_idx, targets=None):
         # Vérifier les dimensions des entrées
+        if encoder_idx.dim() == 4:  # Si l'entrée vient de generate()
+            encoder_idx = encoder_idx.squeeze(0)  # Enlever la dimension supplémentaire
+            
         encoder_seq_len = encoder_idx.size(1)
         decoder_seq_len = decoder_idx.size(1)
         
