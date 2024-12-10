@@ -286,7 +286,7 @@ if device_type == 'cuda':
     pin_memory = True
 
 # Configurer le gradient scaler
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'bfloat16'))
+scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -357,6 +357,8 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+print("Initializing training loop...")
+
 # training loop
 train_iterator = iter(train_dataset)
 encoder_input, decoder_input, target = next(train_iterator)
@@ -365,14 +367,17 @@ local_iter_num = 0
 raw_model = model.module if ddp else model
 running_mfu = -1.0
 
+print("Starting training...")
+
 while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
+    print(f"Learning rate: {lr}")
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-
+    print(f"Learning rate set to: {lr}")
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    if iter_num % eval_interval == 0 and master_process and iter_num > 0:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         print(f"Total tokens processed: {train_dataset.get_total_tokens():,}")
@@ -440,10 +445,7 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
     iter_num += 1
     local_iter_num += 1
     encoder_input, decoder_input, target = encoder_input_next, decoder_input_next, target_next
