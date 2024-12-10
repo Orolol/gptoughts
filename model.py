@@ -98,11 +98,11 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
         
-        # Projections - forcer bfloat16
-        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias).to(torch.bfloat16)
-        self.k_proj = nn.Linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias).to(torch.bfloat16)
-        self.v_proj = nn.Linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias).to(torch.bfloat16)
-        self.o_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias).to(torch.bfloat16)
+        # Projections
+        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.k_proj = nn.Linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias)
+        self.v_proj = nn.Linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias)
+        self.o_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         
         # Regularization
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -130,11 +130,6 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x, key_value=None):
         B, T, C = x.size()
         
-        # Toujours convertir en bfloat16
-        x = x.to(torch.bfloat16)
-        if key_value is not None:
-            key_value = key_value.to(torch.bfloat16)
-        
         # Si key_value est fourni, on fait de la cross-attention
         if key_value is not None:
             # Projeter la query depuis x
@@ -157,11 +152,11 @@ class CausalSelfAttention(nn.Module):
             
         else:
             # Self-attention standard
-            q = self.q_proj(x)
-            k = self.k_proj(x)
-            v = self.v_proj(x)
-            
-            qkv = torch.cat([q, k, v], dim=-1)
+            qkv = torch.cat([
+                self.q_proj(x),
+                self.k_proj(x),
+                self.v_proj(x)
+            ], dim=-1)
             
             q, k, v = qkv.split([self.n_embd, self.n_head_kv * self.head_dim, self.n_head_kv * self.head_dim], dim=-1)
             
@@ -176,7 +171,8 @@ class CausalSelfAttention(nn.Module):
 
         if self.flash:
             try:
-                y = self.flash_fn(q, k, v, causal=mask is not None)
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    y = self.flash_fn(q, k, v, causal=mask is not None)
             except Exception as e:
                 print(f"Flash Attention failed: {e}")
                 self.flash = False
@@ -194,8 +190,8 @@ class CausalSelfAttention(nn.Module):
                 att = att + mask
             
             # Softmax et dropout
-            att = F.softmax(att, dim=-1, dtype=torch.bfloat16)
-            att = self.attn_dropout(att)
+            att = F.softmax(att, dim=-1, dtype=torch.float32)
+            att = self.attn_dropout(att.to(q.dtype))
             
             # Calcul final
             y = torch.matmul(att, v)
@@ -655,6 +651,7 @@ class EncoderDecoderGPT(nn.Module):
                                device=idx.device)
         
         # Encoder une seule fois la séquence d'entrée
+
         with torch.no_grad():
             # Préparer l'entrée de l'encodeur
             encoder_seq_len = min(idx.size(1), self.encoder.config.block_size)
