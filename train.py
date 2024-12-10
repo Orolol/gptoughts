@@ -164,16 +164,16 @@ decode = lambda tokens: tokenizer.decode(tokens, skip_special_tokens=True)
 
 # Liste de débuts de phrases
 PROMPT_TEMPLATES = [
-    "Once upon a time",
-    "In a distant future",
-    "The king said",
-    "She looked at him and",
-    "Deep in the forest",
-    "As the sun rose",
-    "The old wizard",
-    "In the castle",
-    "The dragon",
-    "By the river"
+    "Il était une fois",
+    "Dans un futur lointain",
+    "Le roi dit",
+    "Elle le regarda et",
+    "Au fond de la forêt",
+    "Quand le soleil se leva",
+    "Le vieux sorcier",
+    "Dans le château",
+    "Le dragon",
+    "Au bord de la rivière"
 ]
 
 @torch.no_grad()
