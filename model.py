@@ -546,9 +546,13 @@ class EncoderDecoderGPT(nn.Module):
             tok_emb = self.shared_embedding(encoder_idx)  # Utiliser directement shared_embedding
             pos_emb = self.shared_pos_embedding(encoder_pos)  # Utiliser directement shared_pos_embedding
             
+            print(tok_emb.shape, pos_emb.shape)
+            
             # Étendre pos_emb pour correspondre à la forme de tok_emb
             pos_emb = pos_emb.unsqueeze(0)
             pos_emb = pos_emb.expand(tok_emb.size(0), -1, -1)
+            
+            print(pos_emb.shape, tok_emb.shape)
             
             x = self.encoder.transformer.drop(tok_emb + pos_emb)
             
