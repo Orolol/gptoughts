@@ -249,27 +249,24 @@ class GPTConfig:
     ratio_kv: int = 4      # Ratio of key/value heads
 
 class GPT(nn.Module):
-
-    def __init__(self, config, shared_embedding=None):
+    def __init__(self, config, embedding_layer):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            # Utiliser l'embedding partagé s'il est fourni, sinon en créer un nouveau
-            wte = shared_embedding if shared_embedding is not None else nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = RMSNorm(config.n_embd),
         ))
         
-        # Créer le lm_head et le lier à l'embedding si pas d'embedding partagé
+        # Stocker la référence à l'embedding partagé
+        self.wte = embedding_layer
+        
+        # Créer le lm_head
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        if shared_embedding is None:
-            # Weight tying seulement si on utilise notre propre embedding
-            self.transformer.wte.weight = self.lm_head.weight
 
         # init all weights
         self.apply(self._init_weights)
@@ -278,11 +275,9 @@ class GPT(nn.Module):
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
-        # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
-
         self.gradient_accumulation_steps = 1
-        
+
     def configure_training(self, batch_size, device_memory_gb):
         """Configure optimal batch size and gradient accumulation"""
         # Estimation grossière basée sur la mémoire GPU disponible
@@ -324,27 +319,25 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
 
-        # Utiliser autocast pour le mixed precision
-        with torch.cuda.amp.autocast():
-            # forward the GPT model itself
-            tok_emb = self.transformer.wte(idx)
-            pos_emb = self.transformer.wpe(pos)
-            x = self.transformer.drop(tok_emb + pos_emb)
-            
-            for block in self.transformer.h:
-                x = block(x)
-            x = self.transformer.ln_f(x)
+        # forward the GPT model itself
+        tok_emb = self.wte(idx)  # Utilise l'embedding partagé
+        pos_emb = self.transformer.wpe(pos)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
 
-            if targets is not None:
-                # if we are given some desired targets also calculate the loss
-                logits = self.lm_head(x)
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            else:
-                # inference-time mini-optimization: only forward the lm_head on the very last position
-                logits = self.lm_head(x[:, [-1], :])
-                loss = None
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # inference-time mini-optimization: only forward the lm_head on the very last position
+            logits = self.lm_head(x[:, [-1], :])
+            loss = None
 
         return logits, loss
 
@@ -495,14 +488,14 @@ class EncoderDecoderGPT(nn.Module):
         assert encoder_config.n_embd == decoder_config.n_embd, "Encoder and decoder must have same embedding dimension"
         assert encoder_config.vocab_size == decoder_config.vocab_size, "Encoder and decoder must have same vocabulary size"
         
-        # Créer un embedding partagé
+        # Créer l'embedding partagé
         self.shared_embedding = nn.Embedding(encoder_config.vocab_size, encoder_config.n_embd)
         
         # Créer l'encodeur et le décodeur avec l'embedding partagé
-        self.encoder = GPT(encoder_config, shared_embedding=self.shared_embedding)
-        self.decoder = GPT(decoder_config, shared_embedding=self.shared_embedding)
+        self.encoder = GPT(encoder_config, embedding_layer=self.shared_embedding)
+        self.decoder = GPT(decoder_config, embedding_layer=self.shared_embedding)
         
-        # Partager aussi avec la couche de sortie du décodeur (weight tying)
+        # Partager avec la couche de sortie du décodeur (weight tying)
         self.decoder.lm_head.weight = self.shared_embedding.weight
         
         # Cross-attention et layer norms
@@ -548,9 +541,13 @@ class EncoderDecoderGPT(nn.Module):
             tok_emb = self.encoder.transformer.wte(encoder_idx)  # [batch_size, seq_len, n_embd]
             pos_emb = self.encoder.transformer.wpe(encoder_pos)  # [seq_len, n_embd]
             
+            print(tok_emb.shape, pos_emb.shape)
+            
             # Étendre pos_emb pour correspondre à la forme de tok_emb
             pos_emb = pos_emb.unsqueeze(0)  # [1, seq_len, n_embd]
             pos_emb = pos_emb.expand(tok_emb.size(0), -1, -1)  # [batch_size, seq_len, n_embd]
+            
+            print(tok_emb.shape, pos_emb.shape)
             
             x = self.encoder.transformer.drop(tok_emb + pos_emb)
             
