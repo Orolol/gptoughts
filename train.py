@@ -27,10 +27,10 @@ access_token=os.getenv('HF_TOKEN')
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
+eval_interval = 200
 log_interval = 1
 generate_interval = 10
-eval_iters = 200
+eval_iters = 20
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
@@ -48,7 +48,7 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = 'cuda:0'
-    batch_size = 32
+    batch_size = 16
     block_size = 64
     
     # Encoder config (plus petit)
@@ -398,6 +398,9 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process and iter_num > 0:
         losses = estimate_loss()
+        # print the first token of the input
+        print(f"First token of the input: {tokenizer.decode(encoder_input[0].tolist())}")
+        
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         print(f"Total tokens processed: {train_dataset.get_total_tokens():,}")
         if wandb_log:
@@ -461,6 +464,10 @@ while True:
     dt = t1 - t0
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
+        
+        # Print the first token of the input
+        print(f"First token of the input: {tokenizer.decode(encoder_input[0].tolist())}")
+        
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
