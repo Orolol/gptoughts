@@ -485,16 +485,31 @@ class GPT(nn.Module):
 class EncoderDecoderGPT(nn.Module):
     def __init__(self, encoder_config, decoder_config):
         super().__init__()
-        self.encoder = GPT(encoder_config)  # Utilise notre GPT existant comme encodeur
-        self.decoder = GPT(decoder_config)  # Utilise notre GPT existant comme décodeur
         
-        # Projection pour la cross-attention
+        # S'assurer que les dimensions d'embedding sont compatibles
+        assert encoder_config.n_embd == decoder_config.n_embd, "Encoder and decoder must have same embedding dimension"
+        assert encoder_config.vocab_size == decoder_config.vocab_size, "Encoder and decoder must have same vocabulary size"
+        
+        # Créer un embedding partagé
+        self.shared_embedding = nn.Embedding(encoder_config.vocab_size, encoder_config.n_embd)
+        
+        # Créer l'encodeur et le décodeur
+        self.encoder = GPT(encoder_config)
+        self.decoder = GPT(decoder_config)
+        
+        # Remplacer les embeddings de l'encodeur et du décodeur par l'embedding partagé
+        self.encoder.transformer.wte = self.shared_embedding
+        self.decoder.transformer.wte = self.shared_embedding
+        
+        # Partager aussi avec la couche de sortie du décodeur (weight tying)
+        self.decoder.lm_head.weight = self.shared_embedding.weight
+        
+        # Cross-attention et layer norms comme avant
         self.cross_attention = nn.ModuleList([
             CausalSelfAttention(decoder_config) 
             for _ in range(decoder_config.n_layer)
         ])
         
-        # Layer norm pour la cross-attention
         self.cross_ln = nn.ModuleList([
             RMSNorm(decoder_config.n_embd)
             for _ in range(decoder_config.n_layer)
