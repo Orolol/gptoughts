@@ -250,22 +250,27 @@ class GPTConfig:
 
 class GPT(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, shared_embedding=None):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            # Utiliser l'embedding partagé s'il est fourni, sinon en créer un nouveau
+            wte = shared_embedding if shared_embedding is not None else nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = RMSNorm(config.n_embd),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight
         
+        # Créer le lm_head et le lier à l'embedding si pas d'embedding partagé
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        if shared_embedding is None:
+            # Weight tying seulement si on utilise notre propre embedding
+            self.transformer.wte.weight = self.lm_head.weight
+
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -493,18 +498,14 @@ class EncoderDecoderGPT(nn.Module):
         # Créer un embedding partagé
         self.shared_embedding = nn.Embedding(encoder_config.vocab_size, encoder_config.n_embd)
         
-        # Créer l'encodeur et le décodeur
-        self.encoder = GPT(encoder_config)
-        self.decoder = GPT(decoder_config)
-        
-        # Remplacer les embeddings de l'encodeur et du décodeur par l'embedding partagé
-        self.encoder.transformer.wte = self.shared_embedding
-        self.decoder.transformer.wte = self.shared_embedding
+        # Créer l'encodeur et le décodeur avec l'embedding partagé
+        self.encoder = GPT(encoder_config, shared_embedding=self.shared_embedding)
+        self.decoder = GPT(decoder_config, shared_embedding=self.shared_embedding)
         
         # Partager aussi avec la couche de sortie du décodeur (weight tying)
         self.decoder.lm_head.weight = self.shared_embedding.weight
         
-        # Cross-attention et layer norms comme avant
+        # Cross-attention et layer norms
         self.cross_attention = nn.ModuleList([
             CausalSelfAttention(decoder_config) 
             for _ in range(decoder_config.n_layer)
