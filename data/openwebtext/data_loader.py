@@ -8,24 +8,11 @@ import numpy as np
 import pickle
 
 class TokenTracker:
-    def __init__(self, save_path='token_count.json'):
-        self.save_path = save_path
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        self.total_tokens = self.load_count()
-    
-    def load_count(self):
-        if os.path.exists(self.save_path):
-            with open(self.save_path, 'r') as f:
-                return json.load(f)['total_tokens']
-        return 0
-    
-    def save_count(self):
-        with open(self.save_path, 'w') as f:
-            json.dump({'total_tokens': self.total_tokens}, f)
+    def __init__(self):
+        self.total_tokens = 0
     
     def update(self, new_tokens):
         self.total_tokens += new_tokens
-        self.save_count()
 
 class StreamingDataset(IterableDataset):
     def __init__(self, block_size, batch_size, dataset_name="HuggingFaceFW/fineweb-2", 
@@ -76,6 +63,8 @@ class StreamingDataset(IterableDataset):
     
     def get_batch(self):
         """Get a batch of token sequences of length block_size."""
+        print(f"Getting batch of size {self.block_size * self.batch_size * 2 + 1}")
+        
         while len(self.token_buffer) < (self.block_size * self.batch_size * 2 + 1):  # Double the buffer size for encoder+decoder
             try:
                 example = next(iter(self.dataset))

@@ -130,6 +130,11 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x, key_value=None):
         B, T, C = x.size()
         
+        # Convertir en bfloat16 pour Flash Attention
+        orig_dtype = x.dtype
+        if self.flash and x.dtype not in [torch.bfloat16, torch.float16]:
+            x = x.to(torch.bfloat16)
+        
         # Si key_value est fourni, on fait de la cross-attention
         if key_value is not None:
             # Projeter la query depuis x
@@ -171,8 +176,14 @@ class CausalSelfAttention(nn.Module):
 
         if self.flash:
             try:
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    y = self.flash_fn(q, k, v, causal=mask is not None)
+                # S'assurer que q, k, v sont en bfloat16
+                q = q.to(torch.bfloat16)
+                k = k.to(torch.bfloat16)
+                v = v.to(torch.bfloat16)
+                
+                y = self.flash_fn(q, k, v, causal=mask is not None)
+                # Reconvertir au dtype original
+                y = y.to(orig_dtype)
             except Exception as e:
                 print(f"Flash Attention failed: {e}")
                 self.flash = False
@@ -196,8 +207,10 @@ class CausalSelfAttention(nn.Module):
             # Calcul final
             y = torch.matmul(att, v)
         
-        # Reshape final
+        # Reshape final et reconversion au dtype original si nécessaire
         y = y.transpose(1, 2).contiguous().view(B, T, C)
+        if y.dtype != orig_dtype:
+            y = y.to(orig_dtype)
         
         return self.resid_dropout(self.o_proj(y))
 
