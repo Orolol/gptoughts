@@ -26,6 +26,7 @@ access_token=os.getenv('HF_TOKEN')
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
+generate_interval = 50
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
@@ -444,6 +445,8 @@ while True:
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
+    if iter_num % generate_interval == 0 and master_process:
+        print(generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8))
     iter_num += 1
     local_iter_num += 1
     encoder_input, decoder_input, target = encoder_input_next, decoder_input_next, target_next
