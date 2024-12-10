@@ -136,31 +136,16 @@ class CausalSelfAttention(nn.Module):
             q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
             
             # Projeter key et value depuis key_value
-            kv_seq_len = key_value.size(1)
-            
-            # Calculer les dimensions attendues pour k et v
-            k_proj_size = B * kv_seq_len * self.n_head_kv * self.head_dim
-            v_proj_size = k_proj_size
-            
-            # Vérifier et ajuster les projections si nécessaire
             k = self.k_proj(key_value)
-            if k.numel() != k_proj_size:
-                k = k.view(B * self.n_head_kv, kv_seq_len, self.head_dim)
-            else:
-                k = k.view(B, kv_seq_len, self.n_head_kv, self.head_dim).transpose(1, 2)
-            
             v = self.v_proj(key_value)
-            if v.numel() != v_proj_size:
-                v = v.view(B * self.n_head_kv, kv_seq_len, self.head_dim)
-            else:
-                v = v.view(B, kv_seq_len, self.n_head_kv, self.head_dim).transpose(1, 2)
             
-            # Ajuster q pour correspondre aux dimensions de k et v
-            q = q.view(B * self.n_head, T, self.head_dim)
+            # Reshape pour l'attention
+            k = k.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
+            v = v.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
             
-            # Répéter k et v pour correspondre au nombre de têtes d'attention
-            k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=0)
-            v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=0)
+            # Repeat K,V pour GQA
+            k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+            v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
             
             # Pas de masque causal en cross-attention
             mask = None
@@ -186,16 +171,8 @@ class CausalSelfAttention(nn.Module):
 
         if self.flash:
             try:
-                # Convertir en bf16/fp16 pour Flash Attention
-                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-                q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
-                
-                with torch.cuda.amp.autocast():
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                     y = self.flash_fn(q, k, v, causal=mask is not None)
-                    
-                # Reconvertir au type d'origine si nécessaire
-                y = y.to(x.dtype)
-                
             except Exception as e:
                 print(f"Flash Attention failed: {e}")
                 self.flash = False
@@ -220,8 +197,6 @@ class CausalSelfAttention(nn.Module):
             y = torch.matmul(att, v)
         
         # Reshape final
-        if key_value is not None:
-            y = y.view(B, self.n_head, T, self.head_dim)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         
         return self.resid_dropout(self.o_proj(y))
@@ -453,53 +428,41 @@ class GPT(nn.Module):
 
 
     @torch.no_grad()
-    def generate(self, input_text, prompt_tokens, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx: torch.LongTensor, max_new_tokens: int, temperature: float = 1.0, top_k: Optional[int] = None) -> torch.LongTensor:
         """
-        Génère du texte en utilisant l'architecture encoder-decoder.
-        
+        Generate text tokens autoregressively.
+
         Args:
-            input_text: Tensor d'entrée pour l'encodeur [batch_size, seq_len]
-            prompt_tokens: Tokens de départ pour le décodeur [batch_size, prompt_len]
-            max_new_tokens: Nombre maximum de nouveaux tokens à générer
-            temperature: Facteur de température pour l'échantillonnage
-            top_k: Limite le nombre de tokens considérés pour l'échantillonnage
-        """
-        # Encoder la séquence d'entrée une seule fois
-        x = self.shared_embedding(input_text)
-        pos = torch.arange(0, input_text.size(1), device=input_text.device)
-        x = x + self.shared_pos_embedding(pos)
-        x = self.encoder.transformer.drop(x)
-        
-        for block in self.encoder.transformer.h:
-            x = block(x)
-        encoder_output = self.encoder.transformer.ln_f(x)
-        
-        # Commencer avec le prompt pour le décodeur
-        decoder_tokens = prompt_tokens
-        
-        # Génération auto-régressive
-        for _ in range(max_new_tokens):
-            # Forward pass avec l'encodeur et le décodeur
-            logits, _ = self(input_text, decoder_tokens)
-            logits = logits[:, -1, :] / temperature
+            idx: Conditioning sequence of indices (shape: batch_size × sequence_length)
+            max_new_tokens: Number of new tokens to generate
+            temperature: Sampling temperature (higher = more random, lower = more deterministic)
+            top_k: If set, only sample from the top k most likely tokens
+
+        Returns:
+            torch.LongTensor: Generated sequence including the conditioning tokens
             
-            # Optionnel: top-k sampling
+        Note:
+            Make sure the model is in eval() mode before generation.
+        """
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits, _ = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float('-inf')
-            
-            # Échantillonner le prochain token
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            
-            # Ajouter le nouveau token à la séquence
-            decoder_tokens = torch.cat([decoder_tokens, next_token], dim=1)
-            
-            # Option: arrêter si on génère un token de fin
-            if next_token[0].item() == tokenizer.eos_token_id:
-                break
-        
-        return decoder_tokens
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
 
     @staticmethod
     def configure_dataloader(dataset, batch_size, num_workers=None):
@@ -639,7 +602,7 @@ class EncoderDecoderGPT(nn.Module):
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """
-        Configure l'optimiseur pour l'ensemble du mod��le encoder-decoder.
+        Configure l'optimiseur pour l'ensemble du modèle encoder-decoder.
         Utilise AdamW avec weight decay sur les paramètres appropriés.
         """
         # Collecter tous les paramètres
@@ -671,51 +634,61 @@ class EncoderDecoderGPT(nn.Module):
 
 
     @torch.no_grad()
-    def generate(self, encoder_input, decoder_start, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
-        Génère du texte en utilisant l'architecture encoder-decoder.
+        Génère du texte de manière auto-régressive.
         
         Args:
-            encoder_input: Tensor d'entrée [batch_size, seq_len]
-            decoder_start: Tensor de départ pour le décodeur [batch_size, initial_seq_len]
-            max_new_tokens: Nombre maximum de nouveaux tokens à générer
-            temperature: Facteur de température pour l'échantillonnage
-            top_k: Limite le nombre de tokens considérés pour l'échantillonnage
+            idx: Tensor d'indices [batch_size, seq_len]
+            max_new_tokens: Nombre de nouveaux tokens à générer
+            temperature: Température pour l'échantillonnage
+            top_k: Nombre de tokens les plus probables à considérer
         """
-        # Encoder la séquence d'entrée une seule fois
-        encoder_hidden = None
-        for block in self.encoder.transformer.h:
-            if encoder_hidden is None:
-                encoder_hidden = self.encoder.transformer.drop(
-                    self.shared_embedding(encoder_input) + 
-                    self.shared_pos_embedding(torch.arange(0, encoder_input.size(1), device=encoder_input.device))
-                )
-            encoder_hidden = block(encoder_hidden)
-        encoder_hidden = self.encoder.transformer.ln_f(encoder_hidden)
+        # Initialiser le tenseur de sortie du décodeur avec le token de début
+        decoder_idx = torch.full((idx.size(0), 1), 
+                               self.shared_embedding.weight.size(0)-1,  # EOS token 
+                               dtype=torch.long, 
+                               device=idx.device)
         
-        # Initialiser la séquence de décodage
-        decoder_tokens = decoder_start
+        # Encoder une seule fois la séquence d'entrée
+        print(f"GENERATE {idx.shape}, {temperature}, {top_k}")
+        with torch.no_grad():
+            # Préparer l'entrée de l'encodeur
+            encoder_seq_len = min(idx.size(1), self.encoder.config.block_size)
+            idx = idx[:, :encoder_seq_len]
+            
+            # Générer les positions pour l'encodeur
+            encoder_pos = torch.arange(0, encoder_seq_len, dtype=torch.long, device=idx.device)
+            
+            # Forward pass de l'encodeur
+            tok_emb = self.shared_embedding(idx)
+            pos_emb = self.shared_pos_embedding(encoder_pos)
+            pos_emb = pos_emb.unsqueeze(0).expand(tok_emb.size(0), -1, -1)
+            
+            x = self.encoder.transformer.drop(tok_emb + pos_emb)
+            for block in self.encoder.transformer.h:
+                x = block(x)
+            encoder_hidden = self.encoder.transformer.ln_f(x)
         
         # Génération auto-régressive
         for _ in range(max_new_tokens):
-            # Obtenir les logits pour le prochain token
-            logits, _ = self(encoder_input, decoder_tokens)
-            logits = logits[:, -1, :] / temperature
+            # Limiter la taille de la séquence du décodeur si nécessaire
+            if decoder_idx.size(1) > self.decoder.config.block_size:
+                decoder_idx = decoder_idx[:, -self.decoder.config.block_size:]
             
-            # Optionnel: top-k sampling
+            # Forward pass complet
+            logits, _ = self(idx, decoder_idx)
+            
+            # Échantillonnage du prochain token
+            logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float('-inf')
+                logits[logits < v[:, [-1]]] = -float('Inf')
             
-            # Échantillonner le prochain token
             probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            idx_next = torch.multinomial(probs, num_samples=1)
             
-            # Ajouter le nouveau token à la séquence
-            decoder_tokens = torch.cat([decoder_tokens, next_token], dim=1)
-            
-            # Option: arrêter si on génère un token de fin
-            if next_token[0].item() == self.config.eos_token_id:
-                break
+            # Concaténer le nouveau token
+            decoder_idx = torch.cat((decoder_idx, idx_next), dim=1)
         
-        return decoder_tokens
+        return decoder_idx

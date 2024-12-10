@@ -75,19 +75,19 @@ if torch.cuda.is_available():
     torch.cuda.set_device(device)
 else:
     device = 'cpu'
-    batch_size = 16
+    batch_size = 2
     block_size = 8
     
     # Encoder config (minimal)
     encoder_n_layer = 1
     encoder_n_head = 1
-    encoder_n_embd = 8
+    encoder_n_embd = 2
     encoder_ratio_kv = 1
     
     # Decoder config (minimal)
     decoder_n_layer = 1
     decoder_n_head = 1
-    decoder_n_embd = 8
+    decoder_n_embd = 2
     decoder_ratio_kv = 1
 
 # adamw optimizer
@@ -168,7 +168,7 @@ PROMPT_TEMPLATES = [
 ]
 
 @torch.no_grad()
-def generate_text(model, input_tokens, max_new_tokens=50, temperature=0.8):
+def generate_text(model, input, max_new_tokens=50, temperature=0.8):
     model.eval()
     
     # Choisir un début de phrase aléatoire et l'encoder
@@ -176,24 +176,20 @@ def generate_text(model, input_tokens, max_new_tokens=50, temperature=0.8):
     prompt_tokens = torch.tensor(
         tokenizer.encode(prompt, add_special_tokens=False), 
         dtype=torch.long, 
-        device=input_tokens.device
-    ).unsqueeze(0)  # Ajouter dimension batch
-    
-    # Utiliser la même entrée pour l'encodeur et le décodeur
-    # L'encodeur utilisera input_tokens
-    # Le décodeur commencera avec le prompt
-    generated_tokens = model.generate(
-        input_tokens,
-        prompt_tokens,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature
+        device=input.device
     )
+    
+    # Ajouter la dimension de batch
+    prompt_tokens = prompt_tokens.unsqueeze(0)  # [1, seq_len]
+    
+    # Générer token par token
+    generated_tokens = model.generate(prompt_tokens, max_new_tokens=max_new_tokens, temperature=temperature)
     
     # Décoder les tokens générés
     decoded_text = decode(generated_tokens[0].tolist())
     
     model.train()
-    return decoded_text
+    return decoded_text  # Retourner directement le texte décodé
 
 # init these up here, can override if init_from='resume'
 iter_num = 0
