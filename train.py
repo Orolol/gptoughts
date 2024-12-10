@@ -186,7 +186,7 @@ def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8):
     decoder_input = prompt_tokens.unsqueeze(0)
     
     # Générer token par token
-    generated_tokens = model.generate(encoder_output, decoder_input, max_new_tokens=max_new_tokens, temperature=temperature)
+    generated_tokens = model.generate(encoder_input, decoder_input, max_new_tokens=max_new_tokens, temperature=temperature)
     
     model.train()
     return generated_tokens[0].tolist()
