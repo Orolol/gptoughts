@@ -249,28 +249,27 @@ class GPTConfig:
     ratio_kv: int = 4      # Ratio of key/value heads
 
 class GPT(nn.Module):
-    def __init__(self, config, embedding_layer):
+    def __init__(self, config, embedding_layer, pos_embedding_layer):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = RMSNorm(config.n_embd),
         ))
         
-        # Stocker la référence à l'embedding partagé
+        # Stocker les références aux embeddings partagés
         self.wte = embedding_layer
+        self.wpe = pos_embedding_layer
         
         # Créer le lm_head
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # init all weights
         self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
@@ -322,8 +321,8 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device)
 
         # forward the GPT model itself
-        tok_emb = self.wte(idx)  # Utilise l'embedding partagé
-        pos_emb = self.transformer.wpe(pos)
+        tok_emb = self.wte(idx)
+        pos_emb = self.wpe(pos)
         x = self.transformer.drop(tok_emb + pos_emb)
         
         for block in self.transformer.h:
@@ -485,15 +484,21 @@ class EncoderDecoderGPT(nn.Module):
         super().__init__()
         
         # S'assurer que les dimensions d'embedding sont compatibles
-        assert encoder_config.n_embd == decoder_config.n_embd, "Encoder and decoder must have same embedding dimension"
-        assert encoder_config.vocab_size == decoder_config.vocab_size, "Encoder and decoder must have same vocabulary size"
+        assert encoder_config.n_embd == decoder_config.n_embd
+        assert encoder_config.vocab_size == decoder_config.vocab_size
+        assert encoder_config.block_size == decoder_config.block_size
         
-        # Créer l'embedding partagé
+        # Créer les embeddings partagés
         self.shared_embedding = nn.Embedding(encoder_config.vocab_size, encoder_config.n_embd)
+        self.shared_pos_embedding = nn.Embedding(encoder_config.block_size, encoder_config.n_embd)
         
-        # Créer l'encodeur et le décodeur avec l'embedding partagé
-        self.encoder = GPT(encoder_config, embedding_layer=self.shared_embedding)
-        self.decoder = GPT(decoder_config, embedding_layer=self.shared_embedding)
+        # Créer l'encodeur et le décodeur avec les embeddings partagés
+        self.encoder = GPT(encoder_config, 
+                         embedding_layer=self.shared_embedding,
+                         pos_embedding_layer=self.shared_pos_embedding)
+        self.decoder = GPT(decoder_config, 
+                         embedding_layer=self.shared_embedding,
+                         pos_embedding_layer=self.shared_pos_embedding)
         
         # Partager avec la couche de sortie du décodeur (weight tying)
         self.decoder.lm_head.weight = self.shared_embedding.weight
@@ -519,8 +524,8 @@ class EncoderDecoderGPT(nn.Module):
             targets: Tensor cible optionnel pour le calcul de la loss
         """
         # Vérifier les dimensions des entrées
-        if encoder_idx.dim() == 4:  # Si l'entrée vient de generate()
-            encoder_idx = encoder_idx.squeeze(0)  # Enlever la dimension supplémentaire
+        if encoder_idx.dim() == 4:
+            encoder_idx = encoder_idx.squeeze(0)
             
         encoder_seq_len = encoder_idx.size(1)
         decoder_seq_len = decoder_idx.size(1)
@@ -538,16 +543,12 @@ class EncoderDecoderGPT(nn.Module):
             encoder_pos = torch.arange(0, encoder_seq_len, dtype=torch.long, device=encoder_idx.device)
             
             # Forward pass de l'encodeur
-            tok_emb = self.encoder.transformer.wte(encoder_idx)  # [batch_size, seq_len, n_embd]
-            pos_emb = self.encoder.transformer.wpe(encoder_pos)  # [seq_len, n_embd]
-            
-            print(tok_emb.shape, pos_emb.shape)
+            tok_emb = self.shared_embedding(encoder_idx)  # Utiliser directement shared_embedding
+            pos_emb = self.shared_pos_embedding(encoder_pos)  # Utiliser directement shared_pos_embedding
             
             # Étendre pos_emb pour correspondre à la forme de tok_emb
-            pos_emb = pos_emb.unsqueeze(0)  # [1, seq_len, n_embd]
-            pos_emb = pos_emb.expand(tok_emb.size(0), -1, -1)  # [batch_size, seq_len, n_embd]
-            
-            print(tok_emb.shape, pos_emb.shape)
+            pos_emb = pos_emb.unsqueeze(0)
+            pos_emb = pos_emb.expand(tok_emb.size(0), -1, -1)
             
             x = self.encoder.transformer.drop(tok_emb + pos_emb)
             
@@ -561,12 +562,12 @@ class EncoderDecoderGPT(nn.Module):
         decoder_pos = torch.arange(0, decoder_seq_len, dtype=torch.long, device=decoder_idx.device)
         
         # Forward pass du décodeur
-        tok_emb = self.decoder.transformer.wte(decoder_idx)  # [batch_size, seq_len, n_embd]
-        pos_emb = self.decoder.transformer.wpe(decoder_pos)  # [seq_len, n_embd]
+        tok_emb = self.shared_embedding(decoder_idx)  # Utiliser directement shared_embedding
+        pos_emb = self.shared_pos_embedding(decoder_pos)  # Utiliser directement shared_pos_embedding
         
         # Étendre pos_emb pour le décodeur aussi
-        pos_emb = pos_emb.unsqueeze(0)  # [1, seq_len, n_embd]
-        pos_emb = pos_emb.expand(tok_emb.size(0), -1, -1)  # [batch_size, seq_len, n_embd]
+        pos_emb = pos_emb.unsqueeze(0)
+        pos_emb = pos_emb.expand(tok_emb.size(0), -1, -1)
         
         x = self.decoder.transformer.drop(tok_emb + pos_emb)
         
