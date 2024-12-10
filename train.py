@@ -49,13 +49,13 @@ if torch.cuda.is_available():
     
     # Encoder config (plus petit)
     encoder_n_layer = 4
-    encoder_n_head = 8
+    encoder_n_head = 4
     encoder_n_embd = 768
     encoder_ratio_kv = 8
     
     # Decoder config (plus grand)
-    decoder_n_layer = 4
-    decoder_n_head = 8
+    decoder_n_layer = 8
+    decoder_n_head = 12
     decoder_n_embd = 768
     decoder_ratio_kv = 8
     
@@ -372,10 +372,8 @@ print("Starting training...")
 while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
-    print(f"Learning rate: {lr}")
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-    print(f"Learning rate set to: {lr}")
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process and iter_num > 0:
         losses = estimate_loss()
