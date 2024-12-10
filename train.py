@@ -51,13 +51,13 @@ if torch.cuda.is_available():
     # Encoder config (plus petit)
     encoder_n_layer = 4
     encoder_n_head = 8
-    encoder_n_embd = 512
+    encoder_n_embd = 768
     encoder_ratio_kv = 8
     
     # Decoder config (plus grand)
     decoder_n_layer = 12
     decoder_n_head = 12
-    decoder_n_embd = 512
+    decoder_n_embd = 768
     decoder_ratio_kv = 8
     
     # Optimisations mémoire
