@@ -138,45 +138,44 @@ class CausalSelfAttention(nn.Module):
         # Si key_value est fourni, on fait de la cross-attention
         if key_value is not None:
             # Projeter la query depuis x
-            q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+            q = self.q_proj(x).view(B, T, self.n_head, self.head_dim)
             
             # Projeter key et value depuis key_value
-            k = self.k_proj(key_value)
-            v = self.v_proj(key_value)
+            k = self.k_proj(key_value).view(B, key_value.size(1), self.n_head_kv, self.head_dim)
+            v = self.v_proj(key_value).view(B, key_value.size(1), self.n_head_kv, self.head_dim)
             
-            # Reshape pour l'attention
-            k = k.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
-            v = v.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
+            # Répéter k et v pour correspondre au nombre de têtes de q
+            k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=2)
+            v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=2)
             
-            # Repeat K,V pour GQA
-            k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-            v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+            # Réorganiser pour Flash Attention
+            q = q.transpose(1, 2)  # [B, n_head, T, head_dim]
+            k = k.transpose(1, 2)  # [B, n_head, S, head_dim]
+            v = v.transpose(1, 2)  # [B, n_head, S, head_dim]
             
-            # Pas de masque causal en cross-attention
             mask = None
             
         else:
             # Self-attention standard
-            q = self.q_proj(x)
-            k = self.k_proj(x)
-            v = self.v_proj(x)
+            q = self.q_proj(x).view(B, T, self.n_head, self.head_dim)
+            k = self.k_proj(x).view(B, T, self.n_head_kv, self.head_dim)
+            v = self.v_proj(x).view(B, T, self.n_head_kv, self.head_dim)
             
-            qkv = torch.cat([q, k, v], dim=-1)
+            # Répéter k et v pour correspondre au nombre de têtes de q
+            k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=2)
+            v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=2)
             
-            q, k, v = qkv.split([self.n_embd, self.n_head_kv * self.head_dim, self.n_head_kv * self.head_dim], dim=-1)
+            # Réorganiser pour Flash Attention
+            q = q.transpose(1, 2)  # [B, n_head, T, head_dim]
+            k = k.transpose(1, 2)  # [B, n_head, T, head_dim]
+            v = v.transpose(1, 2)  # [B, n_head, T, head_dim]
             
-            q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-            k = k.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
-            v = v.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
-            
-            k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-            v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-            
-            mask = self.mask[:T, :T]
+            mask = self.mask[:T, :T] if self.flash else None
 
         if self.flash:
             try:
-                y = self.flash_fn(q, k, v, causal=mask is not None)
+                # Flash Attention attend [B, H, T, D]
+                y = self.flash_fn(q, k, v, causal=True)
             except Exception as e:
                 print(f"Flash Attention failed: {e}")
                 self.flash = False
@@ -188,9 +187,7 @@ class CausalSelfAttention(nn.Module):
             
             # Appliquer le masque et le bias si nécessaire
             if mask is not None:
-                att = att + self.alibi.get_bias(T, x.device).repeat_interleave(
-                    self.n_head // self.n_head_kv, dim=0
-                )[:self.n_head]
+                att = att + self.alibi.get_bias(T, x.device)
                 att = att + mask
             
             # Softmax et dropout
