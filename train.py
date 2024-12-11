@@ -279,11 +279,6 @@ if device_type == 'cuda':
     torch.cuda.empty_cache()
     torch.cuda.memory.empty_cache()
     torch.backends.cudnn.benchmark = True
-    
-    # Réserver de la mémoire CUDA
-    cache_size = 4 * 1024 * 1024 * 1024  # 24GB
-    torch.cuda.empty_cache()
-    torch.cuda.memory.empty_cache()
     torch.cuda.set_per_process_memory_fraction(0.8)  # Utiliser 80% de la mémoire disponible
 
 # Modifier la configuration du scaler
@@ -438,7 +433,9 @@ while True:
         if ddp:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
+            print("forward")
             logits, loss = model(encoder_input, decoder_input, target)
+            print("loss", loss)
             if loss is not None:
                 loss = loss / gradient_accumulation_steps
             else:
