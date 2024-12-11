@@ -103,7 +103,7 @@ def generate_samples(model, tokenizer, device):
                 'generated': generated_text,
                 'output_length': len(output_ids[0])  # Ajouter des métriques utiles
             })
-            print(f"Successfully generated text: {prompt} {generated_text}...")
+            print(f"{prompt} {generated_text}")
             
         except Exception as e:
             print(f"Error generating text for prompt '{prompt}': {str(e)}")
