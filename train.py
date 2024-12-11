@@ -387,7 +387,7 @@ generation_thread = threading.Thread(
     args=(model, device),
     daemon=True
 )
-generation_thread.start()
+# generation_thread.start()
 
 # training loop
 train_iterator = iter(train_dataset)
