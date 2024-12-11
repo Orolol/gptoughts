@@ -314,7 +314,7 @@ if device_type == 'cuda':
     cache_size = 24 * 1024 * 1024 * 1024  # 24GB
     torch.cuda.empty_cache()
     torch.cuda.memory.empty_cache()
-    torch.cuda.set_per_process_memory_fraction(0.8)  # Utiliser 80% de la mémoire disponible
+    torch.cuda.set_per_process_memory_fraction(0.95)  # Utiliser 80% de la mémoire disponible
 
 # Configurer le gradient scaler
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'bfloat16'))
