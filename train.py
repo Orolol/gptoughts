@@ -390,6 +390,27 @@ running_mfu = -1.0
 
 print("Starting training...")
 
+# Avant la boucle d'entraînement
+if device_type == 'cuda':
+    # Optimisations CUDA supplémentaires
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    
+    # Désactiver la synchronisation par défaut
+    torch.cuda.set_device(device)
+    torch.cuda.empty_cache()
+    
+    # Compiler le modèle avec torch.compile
+    if hasattr(torch, 'compile'):
+        model = torch.compile(
+            model,
+            mode='reduce-overhead',
+            fullgraph=True,
+            dynamic=True
+        )
+
 while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -428,47 +449,46 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    # forward backward update, with optional gradient accumulation
+    # Optimiser le forward/backward
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+        
         with ctx:
-            print("forward")
-            logits, loss = model(encoder_input, decoder_input, target)
-            print("loss", loss)
-            if loss is not None:
+            with torch.cuda.amp.autocast(enabled=True):
+                logits, loss = model(encoder_input, decoder_input, target)
                 loss = loss / gradient_accumulation_steps
-            else:
-                continue
             
-            # immediately async prefetch next batch
+            # Backward pass asynchrone
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            
+            # Prefetch next batch en parallèle
             try:
                 encoder_input_next, decoder_input_next, target_next = next(train_iterator)
             except StopIteration:
                 train_iterator = iter(train_dataset)
                 encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-            
-            # backward pass
-            if use_amp:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-        
-    # clip the gradient
+    
+    # Optimiser la mise à jour des poids
     if grad_clip != 0.0:
-        if use_amp:
+        if scaler is not None:
             scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
-    # step the optimizer and scaler if training in fp16
-    if use_amp:
+    
+    if scaler is not None:
         scaler.step(optimizer)
         scaler.update()
     else:
         optimizer.step()
-
-    # flush the gradients
+    
+    # Zero grad avec set_to_none=True pour plus de performance
     optimizer.zero_grad(set_to_none=True)
+    
+    # Déplacer les données du prochain batch
+    encoder_input, decoder_input, target = encoder_input_next, decoder_input_next, target_next
 
     # timing and logging
     t1 = time.time()
@@ -491,7 +511,6 @@ while True:
             generation_queue.put(encoder_input.detach().clone())
     iter_num += 1
     local_iter_num += 1
-    encoder_input, decoder_input, target = encoder_input_next, decoder_input_next, target_next
 
     # termination conditions
     if iter_num > max_iters:
