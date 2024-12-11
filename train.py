@@ -50,17 +50,17 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 if torch.cuda.is_available():
     device = 'cuda:0'
     batch_size = 64
-    block_size = 64
+    block_size = 1024
     
     # Encoder config (plus petit)
-    encoder_n_layer = 12
-    encoder_n_head = 16
+    encoder_n_layer = 24
+    encoder_n_head = 32
     encoder_n_embd = 1024
     encoder_ratio_kv = 8
     
     # Decoder config (plus grand)
-    decoder_n_layer = 12
-    decoder_n_head = 16
+    decoder_n_layer = 24
+    decoder_n_head = 32
     decoder_n_embd = 1024
     decoder_ratio_kv = 8
     
