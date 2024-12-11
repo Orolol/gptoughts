@@ -108,12 +108,14 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         
+        # Définir flash comme un buffer au lieu d'un attribut normal
+        self.register_buffer('_flash_enabled', torch.tensor(False))
+        
         # Flash Attention setup
-        self.flash = False
         if FLASH_ATTN_AVAILABLE and torch.cuda.is_available():
             try:
                 from flash_attn import flash_attn_func
-                self.flash = True
+                self._flash_enabled.fill_(True)
                 self.flash_fn = flash_attn_func
                 print("Flash Attention available")
             except ImportError:
@@ -126,6 +128,14 @@ class CausalSelfAttention(nn.Module):
         mask = torch.full((config.block_size, config.block_size), float('-inf'))
         mask = torch.triu(mask, diagonal=1)
         self.register_buffer('mask', mask)
+
+    @property
+    def flash(self):
+        return self._flash_enabled.item()
+    
+    @flash.setter
+    def flash(self, value):
+        self._flash_enabled.fill_(value)
 
     def forward(self, x, key_value=None, is_generation=False):
         """
@@ -203,7 +213,7 @@ class CausalSelfAttention(nn.Module):
                     y = y.to(orig_dtype)
                 except Exception as e:
                     print(f"Flash Attention failed: {e}")
-                    self.flash = False
+                    self._flash_enabled.fill_(False)
             
             if not self.flash:
                 # Attention standard optimisée pour la mémoire
@@ -232,8 +242,8 @@ class CausalSelfAttention(nn.Module):
             return self.resid_dropout(self.o_proj(y))
             
         finally:
-            # Restaurer l'état initial de flash attention
-            self.flash = initial_flash_state
+            # Restaurer l'état initial
+            self._flash_enabled.fill_(initial_flash_state)
 
 class MLP(nn.Module):
 

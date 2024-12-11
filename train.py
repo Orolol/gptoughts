@@ -284,33 +284,15 @@ model.to(device)
 
 # Après model.to(device)
 if device_type == 'cuda':
-    print("Optimizing for H100...")
+    print("Using mixed precision without compilation for H100...")
     
-    # Compiler le modèle
-    try:
-        model = torch.compile(
-            model,
-            mode='max-autotune',
-            fullgraph=True,
-            dynamic=True,  # Important pour H100
-        )
-        print("Model successfully compiled with torch.compile()")
-    except Exception as e:
-        print(f"Warning: Could not compile model: {e}")
+    # Configurer uniquement mixed precision
+    scaler = torch.cuda.amp.GradScaler(enabled=True)
     
-    # Optimiser les opérations CUDA
+    # Optimisations CUDA de base
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
-    
-    # Configurer le scaler pour mixed precision
-    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'bfloat16'))
-    
-    # Optimiser la mémoire
-    torch.cuda.empty_cache()
-    if hasattr(torch.cuda, 'memory_stats'):
-        torch.cuda.memory_stats()
-    torch.cuda.set_per_process_memory_fraction(0.95)
 
 # Optimisations CUDA
 if device_type == 'cuda':
@@ -523,8 +505,8 @@ while True:
         if ddp:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         
-        # Utiliser autocast pour mixed precision
-        with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
+        # Utiliser torch.amp.autocast au lieu de torch.cuda.amp.autocast
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
             logits, loss = model(encoder_input, decoder_input, target)
             if loss is not None:
                 loss = loss / gradient_accumulation_steps
