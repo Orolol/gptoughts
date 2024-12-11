@@ -402,14 +402,13 @@ if device_type == 'cuda':
     torch.cuda.set_device(device)
     torch.cuda.empty_cache()
     
-    # Compiler le modèle avec torch.compile
-    if hasattr(torch, 'compile'):
-        model = torch.compile(
-            model,
-            mode='reduce-overhead',
-            fullgraph=True,
-            dynamic=True
-        )
+    # Au lieu d'utiliser torch.compile, utilisons torch.jit.script
+    try:
+        model = torch.jit.script(model)
+        print("Model successfully scripted with TorchScript")
+    except Exception as e:
+        print(f"Could not script model: {e}")
+        print("Continuing with regular model")
 
 while True:
     # determine and set the learning rate for this iteration

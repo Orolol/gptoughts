@@ -110,12 +110,11 @@ class CausalSelfAttention(nn.Module):
         
         # Flash Attention setup
         self.flash = False
-        if FLASH_ATTN_AVAILABLE and torch.cuda.is_available():
+        if FLASH_ATTN_AVAILABLE:
             try:
                 from flash_attn import flash_attn_func
                 self.flash = True
-                self.flash_fn = flash_attn_func
-                print("Using Flash Attention")
+                print("Flash Attention enabled")
             except ImportError:
                 print("Flash Attention not available")
         
@@ -169,14 +168,16 @@ class CausalSelfAttention(nn.Module):
             
             mask = self.mask[:T, :T]
 
-        if self.flash:
+        if self.flash and not key_value:
             try:
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                    y = self.flash_fn(q, k, v, causal=mask is not None)
+                # Utiliser Flash Attention de manière plus simple
+                qkv = torch.stack([q, k, v], dim=2)
+                y = flash_attn_func(qkv, causal=True)
+                y = y.transpose(1, 2).contiguous().view(B, T, C)
             except Exception as e:
-                print(f"Flash Attention failed: {e}")
+                print(f"Flash Attention failed, falling back to standard attention: {e}")
                 self.flash = False
-        
+                
         if not self.flash:
             # Attention standard optimisée pour la mémoire
             scale = 1.0 / math.sqrt(self.head_dim)
@@ -184,9 +185,7 @@ class CausalSelfAttention(nn.Module):
             
             # Appliquer le masque et le bias si nécessaire
             if mask is not None:
-                att = att + self.alibi.get_bias(T, x.device).repeat_interleave(
-                    self.n_head // self.n_head_kv, dim=0
-                )[:self.n_head]
+                att = att + self.alibi.get_bias(T, x.device)
                 att = att + mask
             
             # Softmax et dropout
@@ -195,9 +194,7 @@ class CausalSelfAttention(nn.Module):
             
             # Calcul final
             y = torch.matmul(att, v)
-        
-        # Reshape final
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
         
         return self.resid_dropout(self.o_proj(y))
 
