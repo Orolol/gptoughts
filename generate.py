@@ -5,6 +5,7 @@ from model import GPTConfig, EncoderDecoderGPT
 from transformers import AutoTokenizer
 import random
 import json
+import time
 
 # Configuration
 CHECKPOINT_DIR = 'out'
@@ -75,7 +76,6 @@ def generate_samples(model, tokenizer, device):
     print(f"Model dtype: {model_dtype}")
     
     for prompt in PROMPT_TEMPLATES:
-        print(f"\nGenerating for prompt: {prompt}")
         # Encoder le prompt
         input_ids = torch.tensor(
             tokenizer.encode(prompt, add_special_tokens=False),
@@ -92,19 +92,25 @@ def generate_samples(model, tokenizer, device):
                     temperature=TEMPERATURE
                 )
             
+            # Convertir le tensor en liste Python avant le décodage
+            if isinstance(output_ids, torch.Tensor):
+                output_ids = output_ids.cpu().tolist()
+            
             # Décoder le texte généré
             generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
             generations.append({
                 'prompt': prompt,
-                'generated': generated_text
+                'generated': generated_text,
+                'output_length': len(output_ids[0])  # Ajouter des métriques utiles
             })
-            print(f"Successfully generated text: {generated_text[:50]}...")
+            print(f"Successfully generated text: {prompt} {generated_text[:50]}...")
             
         except Exception as e:
             print(f"Error generating text for prompt '{prompt}': {str(e)}")
             generations.append({
                 'prompt': prompt,
-                'generated': f"ERROR: {str(e)}"
+                'generated': f"ERROR: {str(e)}",
+                'error': str(e)
             })
             continue
     
@@ -156,17 +162,22 @@ def main():
             f'generations_iter_{iter_num}_loss_{val_loss:.4f}.json'
         )
         
+        # Sauvegarder les générations avec des métadonnées supplémentaires
+        output_data = {
+            'iteration': int(iter_num),  # Convertir en int pour sûr
+            'val_loss': float(val_loss), # Convertir en float pour sûr
+            'generations': generations,
+            'metadata': {
+                'checkpoint_path': ckpt_path,
+                'device': str(DEVICE),
+                'max_new_tokens': MAX_NEW_TOKENS,
+                'temperature': TEMPERATURE,
+                'generation_time': time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+        }
+        
         with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(
-                {
-                    'iteration': iter_num,
-                    'val_loss': val_loss,
-                    'generations': generations
-                },
-                f,
-                ensure_ascii=False,
-                indent=2
-            )
+            json.dump(output_data, f, ensure_ascii=False, indent=2)
         
         print(f"Saved generations for iteration {iter_num} to {output_file}")
         
