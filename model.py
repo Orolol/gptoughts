@@ -137,6 +137,9 @@ class CausalSelfAttention(nn.Module):
         
         # Si key_value est fourni, on fait de la cross-attention
         if key_value is not None:
+            # Désactiver Flash Attention pour la cross-attention avec GQA
+            self.flash = False
+            
             # Projeter la query depuis x
             q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
             
@@ -156,6 +159,10 @@ class CausalSelfAttention(nn.Module):
             mask = None
             
         else:
+            # Réactiver Flash Attention pour la self-attention
+            if FLASH_ATTN_AVAILABLE and torch.cuda.is_available():
+                self.flash = True
+            
             # Self-attention standard
             qkv = torch.cat([
                 self.q_proj(x),
