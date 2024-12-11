@@ -11,6 +11,7 @@ from contextlib import nullcontext
 import threading
 from queue import Queue
 import gc
+import glob
 
 import numpy as np
 import torch
@@ -49,7 +50,7 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 if torch.cuda.is_available():
     device = 'cuda:0'
     batch_size = 64
-    block_size = 128
+    block_size = 64
     
     # Encoder config (plus petit)
     encoder_n_layer = 4
@@ -247,17 +248,37 @@ if init_from == 'scratch':
     model = EncoderDecoderGPT(encoder_config, decoder_config)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    # Trouver tous les checkpoints
+    checkpoints = glob.glob(os.path.join(out_dir, 'ckpt_iter_*.pt'))
+    if not checkpoints:
+        raise ValueError(f"No checkpoints found in {out_dir}")
+    
+    # Extraire les numéros d'itération et trier
+    def extract_iter_num(filename):
+        try:
+            return int(filename.split('iter_')[1].split('_loss')[0])
+        except:
+            return 0
+    
+    # Prendre le dernier checkpoint
+    checkpoints.sort(key=extract_iter_num)
+    ckpt_path = checkpoints[-1]
+    print(f"Loading checkpoint: {ckpt_path}")
+    
     checkpoint = torch.load(ckpt_path, map_location=device)
     model = EncoderDecoderGPT(encoder_config, decoder_config)
     state_dict = checkpoint['model']
+    
+    # Nettoyer le state dict si nécessaire
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+    print(f"Resuming from iteration {iter_num} with best val loss {best_val_loss}")
 
 model.to(device)
 
