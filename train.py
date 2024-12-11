@@ -406,6 +406,7 @@ while True:
         param_group['lr'] = lr
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process and iter_num > 0:
+        print("Validation")
         losses = estimate_loss()
         # print the first token of the input
         
@@ -487,9 +488,9 @@ while True:
     local_iter_num += 1
     encoder_input, decoder_input, target = encoder_input_next, decoder_input_next, target_next
     
-    if iter_num % 100 == 0:
-        generated = generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8)
-        print(f"\nGenerated text Q: {generated}\n")
+    # if iter_num % 100 == 0:
+    #     generated = generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8)
+    #     print(f"\nGenerated text Q: {generated}\n")
 
     # termination conditions
     if iter_num > max_iters:
