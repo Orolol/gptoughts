@@ -163,8 +163,6 @@ class CausalSelfAttention(nn.Module):
                 # Désactiver Flash Attention pendant la génération pour la cross-attention
                 if is_generation:
                     self.flash = False
-                else:
-                    self.flash = True
                 
                 # Repeat K,V pour GQA seulement si pas en génération
                 if not is_generation:
@@ -231,8 +229,6 @@ class CausalSelfAttention(nn.Module):
             y = y.transpose(1, 2).contiguous().view(B, T, C)
             if y.dtype != orig_dtype:
                 y = y.to(orig_dtype)
-            
-            print(f"Flash Attention: {self.flash}")
             
             return self.resid_dropout(self.o_proj(y))
             

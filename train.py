@@ -372,14 +372,26 @@ print("Initializing training loop...")
 # Créer une queue pour la génération
 generation_queue = Queue()
 
-# Fonction de génération qui tourne dans un thread séparé
-def generation_worker(model, device):
+# Créer une copie du modèle dédiée à la génération
+def create_generation_model(original_model, device):
+    gen_model = type(original_model)(original_model.encoder.config, original_model.decoder.config)
+    gen_model.load_state_dict(original_model.state_dict())
+    gen_model.eval()  # Mettre en mode eval une fois pour toutes
+    gen_model.to(device)
+    return gen_model
+
+# Modifier la fonction generation_worker
+def generation_worker(original_model, device):
+    # Créer une copie dédiée du modèle pour la génération
+    gen_model = create_generation_model(original_model, device)
+    
     while True:
         if not generation_queue.empty():
-            encoder_input = generation_queue.get()
-            with torch.no_grad():
-                generated = generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8)
-                print(f"\nGenerated text: {generated}\n")
+            with torch.cuda.stream(torch.cuda.Stream()):  # Utiliser un stream CUDA dédié
+                encoder_input = generation_queue.get()
+                with torch.no_grad():
+                    generated = generate_text(gen_model, encoder_input, max_new_tokens=50, temperature=0.8)
+                    print(f"\nGenerated text: {generated}\n")
 
 # Démarrer le thread de génération avant la boucle d'entraînement
 generation_thread = threading.Thread(
@@ -482,8 +494,10 @@ while True:
         lossf = loss.item() * gradient_accumulation_steps
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
     if iter_num % generate_interval == 0 and master_process:
-        if generation_queue.empty():  # Pour éviter d'accumuler des requêtes
-            generation_queue.put(encoder_input.detach().clone())
+        if generation_queue.empty():
+            # Créer une copie détachée des données d'entrée
+            input_copy = encoder_input.detach().clone()
+            generation_queue.put(input_copy)
     iter_num += 1
     local_iter_num += 1
     encoder_input, decoder_input, target = encoder_input_next, decoder_input_next, target_next
