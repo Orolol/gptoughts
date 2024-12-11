@@ -333,7 +333,7 @@ train_loader = torch.utils.data.DataLoader(
     train_dataset,
     batch_size=None,  # Déjà géré par StreamingDataset
     num_workers=0,  # Réduire à 0 pour éviter les problèmes de fork avec CUDA
-    pin_memory=True,
+    pin_memory=False,  # Désactiver pin_memory car les données sont déjà sur GPU
     prefetch_factor=None,  # Désactiver le prefetch car num_workers=0
     persistent_workers=False  # Désactiver les workers persistants
 )
@@ -342,7 +342,7 @@ val_loader = torch.utils.data.DataLoader(
     val_dataset,
     batch_size=None,  # Déjà géré par StreamingDataset
     num_workers=0,  # Réduire à 0 pour éviter les problèmes de fork avec CUDA
-    pin_memory=True,
+    pin_memory=False,  # Désactiver pin_memory car les données sont déjà sur GPU
     prefetch_factor=None,  # Désactiver le prefetch car num_workers=0
     persistent_workers=False  # Désactiver les workers persistants
 )
@@ -477,10 +477,6 @@ while True:
             try:
                 with torch.cuda.stream(copy_stream):
                     encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-                    if pin_memory:
-                        encoder_input_next = encoder_input_next.pin_memory()
-                        decoder_input_next = decoder_input_next.pin_memory()
-                        target_next = target_next.pin_memory()
             except StopIteration:
                 train_iterator = iter(train_loader)
                 encoder_input_next, decoder_input_next, target_next = next(train_iterator)
