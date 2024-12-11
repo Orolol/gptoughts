@@ -90,8 +90,6 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        print(config.n_embd, config.n_head, config.ratio_kv)
-        print(config.n_embd % config.n_head)
         assert config.n_embd % config.n_head == 0
         
         # Grouped-Query Attention (GQA)
@@ -165,10 +163,9 @@ class CausalSelfAttention(nn.Module):
                 if is_generation:
                     self.flash = False
                 
-                # Repeat K,V pour GQA seulement si pas en génération
-                if not is_generation:
-                    k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                    v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                # Repeat K,V pour GQA - toujours répéter même en génération
+                k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
                 
                 # Pas de masque causal en cross-attention
                 mask = None
@@ -187,11 +184,11 @@ class CausalSelfAttention(nn.Module):
                 k = k.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
                 v = v.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
                 
-                if not is_generation:
-                    k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                    v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                # Repeat K,V pour GQA
+                k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
                 
-                mask = self.mask[:T, :T]
+                mask = self.mask[:T, :T] if not is_generation else None
 
             if self.flash:
                 try:
