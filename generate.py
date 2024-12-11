@@ -50,8 +50,19 @@ def load_model_from_checkpoint(checkpoint_path, device):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     
     model.load_state_dict(state_dict)
+    
+    # Convertir le modèle en bfloat16 si disponible, sinon float16
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        model = model.to(torch.bfloat16)
+    elif torch.cuda.is_available():
+        model = model.to(torch.float16)
+    
     model.eval()
     model.to(device)
+    
+    # Vérifier le dtype du modèle
+    model_dtype = next(model.parameters()).dtype
+    print(f"Model loaded with dtype: {model_dtype}")
     
     return model, checkpoint['iter_num'], checkpoint['best_val_loss']
 
@@ -59,7 +70,12 @@ def generate_samples(model, tokenizer, device):
     """Génère des échantillons de texte pour chaque prompt"""
     generations = []
     
+    # Détecter le dtype du modèle
+    model_dtype = next(model.parameters()).dtype
+    print(f"Model dtype: {model_dtype}")
+    
     for prompt in PROMPT_TEMPLATES:
+        print(f"\nGenerating for prompt: {prompt}")
         # Encoder le prompt
         input_ids = torch.tensor(
             tokenizer.encode(prompt, add_special_tokens=False),
@@ -67,20 +83,30 @@ def generate_samples(model, tokenizer, device):
             device=device
         ).unsqueeze(0)
         
-        # Générer le texte
-        with torch.no_grad():
-            output_ids = model.generate(
-                input_ids,
-                max_new_tokens=MAX_NEW_TOKENS,
-                temperature=TEMPERATURE
-            )
-        
-        # Décoder le texte généré
-        generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        generations.append({
-            'prompt': prompt,
-            'generated': generated_text
-        })
+        try:
+            # Générer le texte avec gestion des types
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=True, dtype=model_dtype):
+                output_ids = model.generate(
+                    input_ids,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    temperature=TEMPERATURE
+                )
+            
+            # Décoder le texte généré
+            generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            generations.append({
+                'prompt': prompt,
+                'generated': generated_text
+            })
+            print(f"Successfully generated text: {generated_text[:50]}...")
+            
+        except Exception as e:
+            print(f"Error generating text for prompt '{prompt}': {str(e)}")
+            generations.append({
+                'prompt': prompt,
+                'generated': f"ERROR: {str(e)}"
+            })
+            continue
     
     return generations
 
