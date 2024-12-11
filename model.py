@@ -127,7 +127,15 @@ class CausalSelfAttention(nn.Module):
         mask = torch.triu(mask, diagonal=1)
         self.register_buffer('mask', mask)
 
-    def forward(self, x, key_value=None):
+    def forward(self, x, key_value=None, is_generation=False):
+        """
+        Forward pass avec gestion spécifique pour la génération
+        
+        Args:
+            x: Tensor d'entrée
+            key_value: Tensor optionnel pour cross-attention
+            is_generation: Bool indiquant si on est en mode génération
+        """
         B, T, C = x.size()
         
         # Convertir en bfloat16 pour Flash Attention
@@ -137,9 +145,6 @@ class CausalSelfAttention(nn.Module):
         
         # Si key_value est fourni, on fait de la cross-attention
         if key_value is not None:
-            # Désactiver Flash Attention pour la cross-attention avec GQA
-            self.flash = False
-            
             # Projeter la query depuis x
             q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
             
@@ -151,18 +156,19 @@ class CausalSelfAttention(nn.Module):
             k = k.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
             v = v.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
             
-            # Repeat K,V pour GQA
-            k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-            v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+            # Désactiver Flash Attention pendant la génération pour la cross-attention
+            if is_generation:
+                self.flash = False
+            
+            # Repeat K,V pour GQA seulement si pas en génération
+            if not is_generation:
+                k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
             
             # Pas de masque causal en cross-attention
             mask = None
             
         else:
-            # Réactiver Flash Attention pour la self-attention
-            if FLASH_ATTN_AVAILABLE and torch.cuda.is_available():
-                self.flash = True
-            
             # Self-attention standard
             qkv = torch.cat([
                 self.q_proj(x),
@@ -176,8 +182,9 @@ class CausalSelfAttention(nn.Module):
             k = k.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
             v = v.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
             
-            k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-            v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+            if not is_generation:
+                k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
             
             mask = self.mask[:T, :T]
 
@@ -594,13 +601,14 @@ class EncoderDecoderGPT(nn.Module):
         # Appliquer les blocs de décodeur avec cross-attention
         for i, block in enumerate(self.decoder.transformer.h):
             # Self-attention standard
-            x = x + block.attn(block.ln_1(x))
+            x = x + block.attn(block.ln_1(x), is_generation=True)
             
             # Cross-attention avec les hidden states de l'encodeur
             cross_x = self.cross_ln[i](x)
             x = x + self.cross_attention[i](
                 cross_x, 
-                key_value=encoder_hidden
+                key_value=encoder_hidden,
+                is_generation=True
             )
             
             # MLP
