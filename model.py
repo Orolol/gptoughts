@@ -173,22 +173,25 @@ class CausalSelfAttention(nn.Module):
         # Attention computation
         if self.flash and not is_cross_attention:
             try:
-                # Préparer les arguments pour flash attention
+                # Préparer les tenseurs pour flash attention
                 q = q.contiguous()
                 k = k.contiguous()
                 v = v.contiguous()
                 
-                # Calculer les sequence lengths
-                cu_seqlens = torch.arange(0, (B + 1) * T, step=T, dtype=torch.int32, device=x.device)
-                max_seqlen = T
+                # Reshape pour flash attention
+                q = q.view(-1, T, self.head_dim)
+                k = k.view(-1, T, self.head_dim)
+                v = v.view(-1, T, self.head_dim)
                 
-                # Appeler flash attention avec les bons arguments
+                # Appeler flash attention avec la bonne signature
                 y = self.flash_fn(
                     q, k, v,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max_seqlen,
-                    causal=True
+                    causal=True,
+                    softmax_scale=1.0 / math.sqrt(self.head_dim)
                 )
+                
+                # Reshape back
+                y = y.view(B, self.n_head, T, self.head_dim)
                 y = y.transpose(1, 2).contiguous().view(B, T, C)
                 
             except Exception as e:
@@ -619,7 +622,7 @@ class EncoderDecoderGPT(nn.Module):
         # Collecter tous les paramètres
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
         
-        # S��parer les paramètres qui doivent avoir du weight decay de ceux qui n'en ont pas
+        # Séparer les paramètres qui doivent avoir du weight decay de ceux qui n'en ont pas
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         
