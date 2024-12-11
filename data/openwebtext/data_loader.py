@@ -26,8 +26,13 @@ class StreamingDataset(IterableDataset):
         
         access_token = os.getenv('HF_TOKEN')
         
-        # Initialize tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True, access_token=access_token)
+        # Initialize tokenizer avec une longueur maximale
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "meta-llama/Llama-3.2-1B-Instruct", 
+            use_fast=True, 
+            access_token=access_token,
+            model_max_length=block_size  # Limiter la longueur maximale
+        )
         self.tokenizer.pad_token = self.tokenizer.eos_token
         
         # Initialize dataset
@@ -64,10 +69,15 @@ class StreamingDataset(IterableDataset):
             pickle.dump(meta, f)
     
     def process_example(self, example):
-        """Tokenize a single example."""
-        ids = self.tokenizer.encode(example['text'], add_special_tokens=False)
+        """Tokenize a single example with truncation."""
+        ids = self.tokenizer.encode(
+            example['text'], 
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.block_size  # Tronquer si trop long
+        )
         ids.append(self.tokenizer.eos_token_id)
-        return ids
+        return ids[:self.block_size]  # Tronquer une dernière fois pour être sûr
     
     def _prefetch_tokens(self):
         """Précharge un grand nombre de tokens en une fois."""
@@ -94,30 +104,41 @@ class StreamingDataset(IterableDataset):
             
         total_length = self.block_size * self.batch_size
         
-        # Créer les tensors directement sur le device
+        # S'assurer que nous ne dépassons pas la longueur maximale
+        buffer_length = min(len(self.token_buffer), total_length * 2)
+        actual_batch_size = buffer_length // (self.block_size * 2)
+        
+        if actual_batch_size == 0:
+            self._prefetch_tokens()
+            buffer_length = min(len(self.token_buffer), total_length * 2)
+            actual_batch_size = buffer_length // (self.block_size * 2)
+            if actual_batch_size == 0:
+                raise RuntimeError("Not enough tokens to create a batch")
+        
+        # Créer les tensors avec la taille ajustée
         encoder_input = torch.tensor(
-            self.token_buffer[:total_length], 
+            self.token_buffer[:actual_batch_size * self.block_size], 
             dtype=torch.long, 
             device=self.device,
             pin_memory=self.pin_memory
-        ).view(self.batch_size, self.block_size)
+        ).view(actual_batch_size, self.block_size)
         
         decoder_input = torch.tensor(
-            self.token_buffer[total_length:total_length*2], 
+            self.token_buffer[actual_batch_size * self.block_size:actual_batch_size * self.block_size * 2], 
             dtype=torch.long, 
             device=self.device,
             pin_memory=self.pin_memory
-        ).view(self.batch_size, self.block_size)
+        ).view(actual_batch_size, self.block_size)
         
         target = torch.tensor(
-            self.token_buffer[total_length+1:total_length*2+1], 
+            self.token_buffer[actual_batch_size * self.block_size + 1:actual_batch_size * self.block_size * 2 + 1], 
             dtype=torch.long, 
             device=self.device,
             pin_memory=self.pin_memory
-        ).view(self.batch_size, self.block_size)
+        ).view(actual_batch_size, self.block_size)
         
         # Nettoyer le buffer
-        self.token_buffer = self.token_buffer[total_length*2:]
+        self.token_buffer = self.token_buffer[actual_batch_size * self.block_size * 2:]
         
         return encoder_input, decoder_input, target
     

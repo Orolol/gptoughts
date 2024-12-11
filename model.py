@@ -179,9 +179,9 @@ class CausalSelfAttention(nn.Module):
                 v = v.contiguous()
                 
                 # Reshape pour flash attention
-                q = q.view(-1, T, self.head_dim)
-                k = k.view(-1, T, self.head_dim)
-                v = v.view(-1, T, self.head_dim)
+                q = q.view(B * self.n_head, T, self.head_dim)
+                k = k.view(B * self.n_head, T, self.head_dim)
+                v = v.view(B * self.n_head, T, self.head_dim)
                 
                 # Appeler flash attention avec la bonne signature
                 y = self.flash_fn(
@@ -204,8 +204,12 @@ class CausalSelfAttention(nn.Module):
             att = torch.matmul(q, k.transpose(-2, -1)) * scale
             
             if mask is not None:
-                att = att + self.alibi.get_bias(T, x.device)
-                att = att + mask
+                # Ajuster les dimensions du ALiBi bias pour correspondre à l'attention
+                alibi_bias = self.alibi.get_bias(T, x.device)
+                alibi_bias = alibi_bias.view(1, self.n_head, T, T)
+                alibi_bias = alibi_bias.expand(B, -1, -1, -1)
+                att = att + alibi_bias
+                att = att + mask.view(1, 1, T, T)
             
             att = F.softmax(att, dim=-1, dtype=torch.float32)
             att = self.attn_dropout(att.to(q.dtype))
@@ -420,7 +424,7 @@ class GPT(nn.Module):
                 )
                 print("Model compiled with max-autotune mode for H100")
 
-        # Utiliser AdaFactor au lieu de AdamW pour une meilleure efficacité mémoire
+        # Utiliser AdaFactor au lieu de AdamW pour une meilleure efficacité m��moire
         try:
             from transformers.optimization import Adafactor
             optimizer = Adafactor(
