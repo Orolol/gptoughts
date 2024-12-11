@@ -49,7 +49,7 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = 'cuda:0'
-    batch_size = 32  # Augmenté pour H100
+    batch_size = 16  # Augmenté pour H100
     block_size = 512
     
     # Encoder config (plus grand pour H100)
