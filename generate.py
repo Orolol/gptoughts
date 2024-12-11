@@ -84,6 +84,16 @@ def generate_samples(model, tokenizer, device):
     
     return generations
 
+def extract_iter_num(filename):
+    """Extrait le numéro d'itération du nom du fichier checkpoint"""
+    # Le format est 'ckpt_iter_X_loss_Y.pt'
+    try:
+        # Prend la partie après 'iter_' et avant '_loss'
+        iter_str = filename.split('iter_')[1].split('_loss')[0]
+        return int(iter_str)
+    except:
+        return 0
+
 def main():
     # Créer le dossier de sortie
     os.makedirs(GENERATION_OUTPUT_DIR, exist_ok=True)
@@ -96,11 +106,18 @@ def main():
     )
     tokenizer.pad_token = tokenizer.eos_token
     
-    # Trouver tous les checkpoints
+    # Trouver tous les checkpoints et les trier par numéro d'itération
     checkpoints = glob.glob(os.path.join(CHECKPOINT_DIR, 'ckpt_iter_*.pt'))
-    checkpoints.sort(key=lambda x: int(x.split('_')[-2]))  # Trier par numéro d'itération
+    checkpoints.sort(key=extract_iter_num)
+    
+    if not checkpoints:
+        print(f"No checkpoints found in {CHECKPOINT_DIR}")
+        return
+        
+    print(f"Found {len(checkpoints)} checkpoints")
     
     for ckpt_path in checkpoints:
+        print(f"\nProcessing {ckpt_path}")
         # Charger le modèle
         model, iter_num, val_loss = load_model_from_checkpoint(ckpt_path, DEVICE)
         
