@@ -6,7 +6,6 @@ from transformers import AutoTokenizer
 from torch.utils.data import IterableDataset
 import numpy as np
 import pickle
-import itertools
 
 class TokenTracker:
     def __init__(self):
@@ -17,100 +16,98 @@ class TokenTracker:
 
 class StreamingDataset(IterableDataset):
     def __init__(self, block_size, batch_size, dataset_name="HuggingFaceFW/fineweb-2", 
-                 dataset_config="fra_Latn", split="train", device='cuda',
-                 buffer_size=10000):
+                 dataset_config="fra_Latn", split="train", device='cuda'):
         super().__init__()
         self.block_size = block_size
         self.batch_size = batch_size
         self.device = device
-        self.buffer_size = buffer_size
+        self.dataset_config = dataset_config
+        self.split = split
         
         access_token = os.getenv('HF_TOKEN')
         
-        # Initialiser le tokenizer avec fast tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            "meta-llama/Llama-3.2-1B-Instruct", 
-            use_fast=True, 
-            access_token=access_token,
-            model_max_length=block_size
-        )
+        # Initialize tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True, access_token=access_token)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        # Charger le dataset en mode streaming
-        self.dataset = load_dataset(
-            dataset_name, 
-            name=dataset_config, 
-            split=split, 
-            streaming=True
-        ).shuffle(buffer_size=1000)
+        # Initialize dataset
+        self.dataset = load_dataset(dataset_name, name=dataset_config, split=split, streaming=True)
         
-        # Préallouer le buffer
-        self.token_buffer = []
-        self.prefetch_buffer = []
-        
-        # Initialiser le token tracker
+        # Initialize token tracker
+        tracker_dir = os.path.join('data', 'token_tracking')
+        os.makedirs(tracker_dir, exist_ok=True)
         self.token_tracker = TokenTracker()
         
+        # Modifions la façon dont nous gérons le dataset
+        self.dataset_iterator = iter(self.dataset)
+        self.token_buffer = []
+        
+        # Save tokenizer metadata
+        self.save_meta()
+    
+    def save_meta(self):
+        meta = {
+            'vocab_size': len(self.tokenizer),
+            'tokenizer_name': "meta-llama/Llama-3.2-1B-Instruct",
+            'tokenizer': self.tokenizer
+        }
+        meta_dir = os.path.join('data', 'openwebtext')
+        os.makedirs(meta_dir, exist_ok=True)
+        with open(os.path.join(meta_dir, 'meta.pkl'), 'wb') as f:
+            pickle.dump(meta, f)
+    
     def process_example(self, example):
-        """Tokenize un exemple avec batch processing"""
-        return self.tokenizer(
-            example['text'],
-            add_special_tokens=False,
-            truncation=True,
-            max_length=self.block_size,
-            return_tensors='pt'
-        )['input_ids'].squeeze(0)
-
+        """Tokenize a single example."""
+        ids = self.tokenizer.encode(example['text'], add_special_tokens=False)
+        ids.append(self.tokenizer.eos_token_id)
+        return ids
+    
     def get_batch(self):
-        """Optimisation du get_batch avec préchargement"""
-        # Remplir le buffer si nécessaire
+        """Get a batch of token sequences of length block_size."""
+        # On s'assure d'avoir assez de tokens dans le buffer
         while len(self.token_buffer) < (self.block_size * self.batch_size * 2 + 1):
-            if not self.prefetch_buffer:
-                # Précharger plusieurs exemples d'un coup
-                examples = list(itertools.islice(self.dataset, 32))
-                if not examples:
-                    self.dataset = load_dataset(
-                        "HuggingFaceFW/fineweb-2",
-                        name=self.dataset_config,
-                        split=self.split,
-                        streaming=True
-                    ).shuffle(buffer_size=1000)
-                    examples = list(itertools.islice(self.dataset, 32))
-                
-                # Tokenizer en batch
-                tokenized = [self.process_example(ex) for ex in examples]
-                self.prefetch_buffer.extend([t for tokens in tokenized for t in tokens])
-                
-            # Transférer du prefetch buffer au token buffer
-            transfer_size = min(self.buffer_size, len(self.prefetch_buffer))
-            self.token_buffer.extend(self.prefetch_buffer[:transfer_size])
-            self.prefetch_buffer = self.prefetch_buffer[transfer_size:]
-            
-            self.token_tracker.update(transfer_size)
+            try:
+                example = next(self.dataset_iterator)
+                new_tokens = self.process_example(example)
+                self.token_buffer.extend(new_tokens)
+                self.token_tracker.update(len(new_tokens))
+            except StopIteration:
+                # Quand on arrive à la fin du dataset, on crée un nouvel itérateur
+                self.dataset = load_dataset("HuggingFaceFW/fineweb-2", 
+                                         name=self.dataset_config,
+                                         split=self.split,
+                                         streaming=True)
+                self.dataset_iterator = iter(self.dataset)
+                # Si le buffer est vide après avoir atteint la fin du dataset,
+                # on continue à charger des données
+                if len(self.token_buffer) == 0:
+                    continue
+                # Sinon, on peut utiliser ce qu'il reste dans le buffer
+                break
 
-        # Préparer les tenseurs
-        total_length = self.block_size * self.batch_size
+        # Si après avoir essayé de remplir le buffer, on n'a toujours pas assez de tokens,
+        # on utilise ce qu'on a en ajustant la taille du batch
+        available_sequences = len(self.token_buffer) // self.block_size
+        if available_sequences == 0:
+            raise RuntimeError("Not enough tokens to create even one sequence")
         
-        # Transférer directement sur GPU
-        encoder_input = torch.tensor(
-            self.token_buffer[:total_length], 
-            dtype=torch.long, 
-            device=self.device
-        ).view(self.batch_size, self.block_size)
-        
-        decoder_input = torch.tensor(
-            self.token_buffer[total_length:total_length*2], 
-            dtype=torch.long, 
-            device=self.device
-        ).view(self.batch_size, self.block_size)
-        
-        target = torch.tensor(
-            self.token_buffer[total_length+1:total_length*2+1], 
-            dtype=torch.long, 
-            device=self.device
-        ).view(self.batch_size, self.block_size)
+        actual_batch_size = min(self.batch_size, available_sequences // 2)  # Divise par 2 car on a besoin d'input et target
+        total_length = self.block_size * actual_batch_size
 
-        # Nettoyer le buffer
+        # Prepare les tensors comme avant, mais avec la taille de batch ajustée
+        encoder_input = torch.tensor(self.token_buffer[:total_length], 
+                                   dtype=torch.long, device=self.device)
+        decoder_input = torch.tensor(self.token_buffer[total_length:total_length*2], 
+                                   dtype=torch.long, device=self.device)
+        target = torch.tensor(self.token_buffer[total_length+1:total_length*2+1], 
+                            dtype=torch.long, device=self.device)
+
+        # Reshape avec la taille de batch ajustée
+        encoder_input = encoder_input.view(actual_batch_size, self.block_size)
+        decoder_input = decoder_input.view(actual_batch_size, self.block_size)
+        target = target.view(actual_batch_size, self.block_size)
+
+        # Nettoie le buffer
         self.token_buffer = self.token_buffer[total_length*2:]
 
         return encoder_input, decoder_input, target

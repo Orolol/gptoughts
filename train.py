@@ -23,12 +23,6 @@ from data.openwebtext.data_loader import StreamingDataset
 
 access_token=os.getenv('HF_TOKEN')
 
-# Ajouter après les imports
-if torch.cuda.is_available():
-    # Configurer multiprocessing pour CUDA
-    import multiprocessing
-    multiprocessing.set_start_method('spawn', force=True)
-
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -47,14 +41,14 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
 data_dir = 'data/openwebtext'
-gradient_accumulation_steps = 2 # used to simulate larger batch sizes
+gradient_accumulation_steps = 1 # used to simulate larger batch sizes
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = 'cuda:0'
-    batch_size = 16
+    batch_size = 8
     block_size = 64
     
     # Encoder config (plus petit)
@@ -70,7 +64,7 @@ if torch.cuda.is_available():
     decoder_ratio_kv = 8
     
     # Optimisations mémoire
-    gradient_accumulation_steps = 2
+    gradient_accumulation_steps = 1
     dtype = 'bfloat16'
     
     # Activer la gestion de mémoire optimisée
@@ -258,16 +252,6 @@ elif init_from == 'resume':
 
 model.to(device)
 
-# Compiler le modèle avant toute autre opération
-if compile and torch.__version__.startswith('2'):
-    print("Compiling model...")
-    model = torch.compile(
-        model,
-        mode='max-autotune',
-        fullgraph=True,
-        dynamic=True
-    )
-
 # Optimisations CUDA
 if device_type == 'cuda':
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -296,25 +280,11 @@ if device_type == 'cuda':
     torch.cuda.memory.empty_cache()
     torch.backends.cudnn.benchmark = True
     
-    # Réserver de la mémoire CUDA - on utilise directement set_per_process_memory_fraction
-    # sans définir de cache_size inutilisé
+    # Réserver de la mémoire CUDA
+    cache_size = 4 * 1024 * 1024 * 1024  # 24GB
     torch.cuda.empty_cache()
     torch.cuda.memory.empty_cache()
-    torch.cuda.set_per_process_memory_fraction(0.9)  # Utiliser 80% de la mémoire disponible
-    
-    # Ajouter ces lignes
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-    
-    # Augmenter la taille du cache CUDA
-    torch.cuda.empty_cache()
-    torch.cuda.set_per_process_memory_fraction(0.95)  # Utiliser plus de mémoire GPU
-    
-    # Désactiver la synchronisation par défaut
-    torch.cuda.set_device(device)
-    torch.cuda.set_sync_debug_mode(False)
+    torch.cuda.set_per_process_memory_fraction(0.8)  # Utiliser 80% de la mémoire disponible
 
 # Modifier la configuration du scaler
 if dtype == 'float16':
@@ -364,14 +334,15 @@ def estimate_loss():
     for split, dataset in [('train', train_dataset), ('val', val_dataset)]:
         losses = torch.zeros(eval_iters)
         valid_iters = 0
-        dataset_iter = iter(dataset)
         for k in range(eval_iters):
-            encoder_input, decoder_input, target = next(dataset_iter)
+            encoder_input, decoder_input, target = next(iter(dataset))
             with ctx:
                 logits, loss = model(encoder_input, decoder_input, target)
                 if loss is not None:
                     losses[valid_iters] = loss.item()
                     valid_iters += 1
+        
+        # Average only over valid iterations
         out[split] = losses[:valid_iters].mean() if valid_iters > 0 else float('inf')
     model.train()
     return out
@@ -562,6 +533,3 @@ if device_type == 'cuda':
     if hasattr(torch.cuda, 'memory_stats'):
         torch.cuda.memory_stats(device=device)
     torch.cuda.set_stream(torch.cuda.Stream())
-
-if compile and torch.__version__.startswith('2'):
-    model = torch.compile(model)
