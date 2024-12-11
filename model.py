@@ -115,6 +115,7 @@ class CausalSelfAttention(nn.Module):
                 from flash_attn import flash_attn_func
                 self.flash = True
                 self.flash_fn = flash_attn_func
+                print("Flash Attention available")
             except ImportError:
                 print("Flash Attention not available")
         
