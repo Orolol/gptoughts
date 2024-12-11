@@ -34,7 +34,7 @@ generate_interval = 100
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'resume' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -53,14 +53,14 @@ if torch.cuda.is_available():
     block_size = 64
     
     # Encoder config (plus petit)
-    encoder_n_layer = 4
-    encoder_n_head = 8
+    encoder_n_layer = 12
+    encoder_n_head = 16
     encoder_n_embd = 768
     encoder_ratio_kv = 8
     
     # Decoder config (plus grand)
     decoder_n_layer = 12
-    decoder_n_head = 12
+    decoder_n_head = 16
     decoder_n_embd = 768
     decoder_ratio_kv = 8
     
