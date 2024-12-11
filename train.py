@@ -47,7 +47,7 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
 data_dir = 'data/openwebtext'
-gradient_accumulation_steps = 4 # used to simulate larger batch sizes
+gradient_accumulation_steps = 2 # used to simulate larger batch sizes
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 
@@ -70,7 +70,7 @@ if torch.cuda.is_available():
     decoder_ratio_kv = 8
     
     # Optimisations mémoire
-    gradient_accumulation_steps = 4
+    gradient_accumulation_steps = 2
     dtype = 'bfloat16'
     
     # Activer la gestion de mémoire optimisée
@@ -258,6 +258,16 @@ elif init_from == 'resume':
 
 model.to(device)
 
+# Compiler le modèle avant toute autre opération
+if compile and torch.__version__.startswith('2'):
+    print("Compiling model...")
+    model = torch.compile(
+        model,
+        mode='max-autotune',
+        fullgraph=True,
+        dynamic=True
+    )
+
 # Optimisations CUDA
 if device_type == 'cuda':
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -291,6 +301,20 @@ if device_type == 'cuda':
     torch.cuda.empty_cache()
     torch.cuda.memory.empty_cache()
     torch.cuda.set_per_process_memory_fraction(0.9)  # Utiliser 80% de la mémoire disponible
+    
+    # Ajouter ces lignes
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    
+    # Augmenter la taille du cache CUDA
+    torch.cuda.empty_cache()
+    torch.cuda.set_per_process_memory_fraction(0.95)  # Utiliser plus de mémoire GPU
+    
+    # Désactiver la synchronisation par défaut
+    torch.cuda.set_device(device)
+    torch.cuda.set_sync_debug_mode(False)
 
 # Modifier la configuration du scaler
 if dtype == 'float16':
@@ -328,29 +352,6 @@ val_dataset = StreamingDataset(
     device=device
 )
 
-# Créer les DataLoaders avec les optimisations
-train_loader = torch.utils.data.DataLoader(
-    train_dataset,
-    batch_size=None,  # Déjà géré par StreamingDataset
-    num_workers=0,  # Réduire à 0 pour éviter les problèmes de fork avec CUDA
-    pin_memory=False,  # Désactiver pin_memory car les données sont déjà sur GPU
-    prefetch_factor=None,  # Désactiver le prefetch car num_workers=0
-    persistent_workers=False  # Désactiver les workers persistants
-)
-
-val_loader = torch.utils.data.DataLoader(
-    val_dataset,
-    batch_size=None,  # Déjà géré par StreamingDataset
-    num_workers=0,  # Réduire à 0 pour éviter les problèmes de fork avec CUDA
-    pin_memory=False,  # Désactiver pin_memory car les données sont déjà sur GPU
-    prefetch_factor=None,  # Désactiver le prefetch car num_workers=0
-    persistent_workers=False  # Désactiver les workers persistants
-)
-
-# Mettre à jour les itérateurs
-train_iterator = iter(train_loader)
-val_iterator = iter(val_loader)
-
 # Get vocab size from the dataset
 vocab_size = len(train_dataset.tokenizer)
 print(f"vocab_size: {vocab_size}")
@@ -360,18 +361,17 @@ print(f"vocab_size: {vocab_size}")
 def estimate_loss():
     out = {}
     model.eval()
-    for split, loader in [('train', train_loader), ('val', val_loader)]:
+    for split, dataset in [('train', train_dataset), ('val', val_dataset)]:
         losses = torch.zeros(eval_iters)
         valid_iters = 0
+        dataset_iter = iter(dataset)
         for k in range(eval_iters):
-            encoder_input, decoder_input, target = next(iter(loader))
+            encoder_input, decoder_input, target = next(dataset_iter)
             with ctx:
                 logits, loss = model(encoder_input, decoder_input, target)
                 if loss is not None:
                     losses[valid_iters] = loss.item()
                     valid_iters += 1
-        
-        # Average only over valid iterations
         out[split] = losses[:valid_iters].mean() if valid_iters > 0 else float('inf')
     model.train()
     return out
@@ -415,7 +415,7 @@ generation_thread = threading.Thread(
 generation_thread.start()
 
 # training loop
-train_iterator = iter(train_loader)
+train_iterator = iter(train_dataset)
 encoder_input, decoder_input, target = next(train_iterator)
 t0 = time.time()
 local_iter_num = 0
@@ -475,14 +475,10 @@ while True:
             
             # immediately async prefetch next batch
             try:
-                with torch.cuda.stream(copy_stream):
-                    encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-            except StopIteration:
-                train_iterator = iter(train_loader)
                 encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-            
-            # Synchroniser les streams avant d'utiliser les données
-            copy_stream.synchronize()
+            except StopIteration:
+                train_iterator = iter(train_dataset)
+                encoder_input_next, decoder_input_next, target_next = next(train_iterator)
             
             # backward pass
             if use_amp:
