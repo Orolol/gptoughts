@@ -29,7 +29,7 @@ access_token=os.getenv('HF_TOKEN')
 out_dir = 'out'
 eval_interval = 200
 log_interval = 1
-generate_interval = 10
+generate_interval = 100
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
@@ -489,7 +489,7 @@ while True:
     
     if iter_num % 100 == 0:
         generated = generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8)
-        print(f"\nGenerated text: {generated}\n")
+        print(f"\nGenerated text Q: {generated}\n")
 
     # termination conditions
     if iter_num > max_iters:
