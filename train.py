@@ -172,36 +172,52 @@ PROMPT_TEMPLATES = [
 
 @torch.no_grad()
 def generate_text(model, input, max_new_tokens=50, temperature=0.8):
-    model.eval()
+    # Créer une copie du modèle pour la génération
+    generation_model = type(model)(model.encoder.config, model.decoder.config)
+    generation_model.load_state_dict(model.state_dict())
+    generation_model.eval()
     
-    # Choisir un début de phrase aléatoire et l'encoder
-    prompt = random.choice(PROMPT_TEMPLATES)
-    prompt_tokens = torch.tensor(
-        tokenizer.encode(prompt, add_special_tokens=False), 
-        dtype=torch.long, 
-        device=input.device
-    )
+    # Déplacer sur un autre device CUDA si possible
+    if torch.cuda.device_count() > 1:
+        generation_device = f'cuda:{torch.cuda.device_count()-1}'
+        generation_model = generation_model.to(generation_device)
+        input = input.to(generation_device)
     
-    # Ajouter la dimension de batch
-    prompt_tokens = prompt_tokens.unsqueeze(0)  # [1, seq_len]
-    
-    # Convertir au même dtype que le modèle
-    if hasattr(model, 'dtype'):
-        dtype = model.dtype
-    else:
-        # Détecter le dtype à partir des paramètres du modèle
-        dtype = next(model.parameters()).dtype
+    # Utiliser un stream CUDA dédié
+    with torch.cuda.stream(torch.cuda.Stream()):
+        # Choisir un début de phrase aléatoire et l'encoder
+        prompt = random.choice(PROMPT_TEMPLATES)
+        prompt_tokens = tokenizer.encode(prompt, add_special_tokens=True, return_tensors='pt').to(input.device)
         
-    # S'assurer que le modèle et les tenseurs sont dans le même dtype
-    with torch.cuda.amp.autocast(enabled=True, dtype=dtype):
-        # Générer token par token
-        generated_tokens = model.generate(prompt_tokens, max_new_tokens=max_new_tokens, temperature=temperature)
-    
-    # Décoder les tokens générés
-    decoded_text = decode(generated_tokens[0].tolist())
-    
-    model.train()
-    return prompt + " " + decoded_text  # Retourner directement le texte décodé
+        try:
+            # Générer avec un timeout
+            generated_tokens = generation_model.generate(
+                prompt_tokens,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=50  # Ajouter top_k pour améliorer la qualité
+            )
+            
+            # Décoder proprement avec gestion des tokens spéciaux
+            decoded_text = tokenizer.decode(
+                generated_tokens[0],
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True
+            )
+            
+            # Nettoyer la mémoire CUDA
+            del generation_model
+            torch.cuda.empty_cache()
+            
+            return decoded_text
+
+        except Exception as e:
+            print(f"Generation error: {e}")
+            return prompt  # Retourner au moins le prompt en cas d'erreur
+        
+        finally:
+            # S'assurer que tout est nettoyé
+            torch.cuda.synchronize()
 
 # init these up here, can override if init_from='resume'
 iter_num = 0
@@ -372,26 +388,14 @@ print("Initializing training loop...")
 # Créer une queue pour la génération
 generation_queue = Queue()
 
-# Créer une copie du modèle dédiée à la génération
-def create_generation_model(original_model, device):
-    gen_model = type(original_model)(original_model.encoder.config, original_model.decoder.config)
-    gen_model.load_state_dict(original_model.state_dict())
-    gen_model.eval()  # Mettre en mode eval une fois pour toutes
-    gen_model.to(device)
-    return gen_model
-
-# Modifier la fonction generation_worker
-def generation_worker(original_model, device):
-    # Créer une copie dédiée du modèle pour la génération
-    gen_model = create_generation_model(original_model, device)
-    
+# Fonction de génération qui tourne dans un thread séparé
+def generation_worker(model, device):
     while True:
         if not generation_queue.empty():
-            with torch.cuda.stream(torch.cuda.Stream()):  # Utiliser un stream CUDA dédié
-                encoder_input = generation_queue.get()
-                with torch.no_grad():
-                    generated = generate_text(gen_model, encoder_input, max_new_tokens=50, temperature=0.8)
-                    print(f"\nGenerated text: {generated}\n")
+            encoder_input = generation_queue.get()
+            with torch.no_grad():
+                generated = generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8)
+                print(f"\nGenerated text: {generated}\n")
 
 # Démarrer le thread de génération avant la boucle d'entraînement
 generation_thread = threading.Thread(
@@ -494,10 +498,12 @@ while True:
         lossf = loss.item() * gradient_accumulation_steps
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
     if iter_num % generate_interval == 0 and master_process:
-        if generation_queue.empty():
-            # Créer une copie détachée des données d'entrée
-            input_copy = encoder_input.detach().clone()
-            generation_queue.put(input_copy)
+        try:
+            with torch.cuda.stream(torch.cuda.Stream()):  # Stream dédié
+                generated = generate_text(model, encoder_input.detach())
+                print(f"\nGenerated text: {generated}\n")
+        except Exception as e:
+            print(f"Generation failed: {e}")
     iter_num += 1
     local_iter_num += 1
     encoder_input, decoder_input, target = encoder_input_next, decoder_input_next, target_next
