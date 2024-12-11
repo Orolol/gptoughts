@@ -477,6 +477,10 @@ while True:
     iter_num += 1
     local_iter_num += 1
     encoder_input, decoder_input, target = encoder_input_next, decoder_input_next, target_next
+    
+    if iter_num % 100 == 0:
+        generated = generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8)
+        print(f"\nGenerated text: {generated}\n")
 
     # termination conditions
     if iter_num > max_iters:
