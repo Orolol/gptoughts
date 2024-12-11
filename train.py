@@ -562,8 +562,7 @@ while True:
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
-
-    if iter_num % 100 == 0:
+        
         end_event.record()
         torch.cuda.synchronize()
         print(f"CUDA time: {start_event.elapsed_time(end_event)}ms")
@@ -577,3 +576,38 @@ if device_type == 'cuda':
     if hasattr(torch.cuda, 'memory_stats'):
         torch.cuda.memory_stats(device=device)
     torch.cuda.set_stream(torch.cuda.Stream())
+
+# Après la création du modèle
+
+if device_type == 'cuda':
+    # Optimisations H100
+    model = torch.compile(
+        model,
+        mode='max-autotune',
+        fullgraph=True
+    )
+    
+    # Configurer la taille des batch pour H100
+    batch_size = 32  # Augmenter la taille du batch
+    
+    # Utiliser bfloat16 qui est optimal pour H100
+    dtype = torch.bfloat16
+    
+    # Optimiser les opérations CUDA
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    
+    # Configurer le memory pinning
+    pin_memory = True
+    
+    # Optimiser la gestion de la mémoire
+    torch.cuda.empty_cache()
+    torch.cuda.memory.empty_cache()
+    torch.backends.cudnn.benchmark = True
+    
+    # Réserver de la mémoire CUDA
+    cache_size = 70 * 1024 * 1024 * 1024  # 70GB pour H100
+    torch.cuda.empty_cache()
+    torch.cuda.memory.empty_cache()
+    torch.cuda.set_per_process_memory_fraction(0.95)

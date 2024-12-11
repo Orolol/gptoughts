@@ -423,7 +423,7 @@ class GPT(nn.Module):
 
         # Optimiser pour H100
         if device_type == 'cuda':
-            # Activer TF32
+            # Optimiser pour H100
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             
