@@ -9,7 +9,7 @@ tqdm>=4.65.0
 datasets>=2.12.0
 
 # Optional: for faster attention
-#flash-attn>=2.0.0; platform_system != "Windows"
+flash-attn>=2.0.0; platform_system != "Windows"
 
 # Development
 pytest>=7.3.1
