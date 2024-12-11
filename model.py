@@ -115,7 +115,6 @@ class CausalSelfAttention(nn.Module):
                 from flash_attn import flash_attn_func
                 self.flash = True
                 self.flash_fn = flash_attn_func
-                print("Using Flash Attention")
             except ImportError:
                 print("Flash Attention not available")
         
@@ -309,7 +308,7 @@ class GPT(nn.Module):
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+        # print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
         self.gradient_accumulation_steps = 1
 
     def configure_training(self, batch_size, device_memory_gb):
