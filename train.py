@@ -49,7 +49,7 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = 'cuda:0'
-    batch_size = 128
+    batch_size = 64
     block_size = 64
     
     # Encoder config (plus petit)
@@ -205,7 +205,7 @@ def generate_text(model, input, max_new_tokens=50, temperature=0.8):
     return prompt + " " + decoded_text  # Retourner directement le texte décodé
 
 # init these up here, can override if init_from='resume'
-iter_num = 0
+iter_num = 1
 best_val_loss = 1e9
 
 
