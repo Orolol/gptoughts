@@ -90,6 +90,8 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        print(config.n_embd, config.n_head, config.ratio_kv)
+        print(config.n_embd % config.n_head)
         assert config.n_embd % config.n_head == 0
         
         # Grouped-Query Attention (GQA)
