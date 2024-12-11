@@ -49,16 +49,16 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = 'cuda:0'
-    batch_size = 16
+    batch_size = 32  # Augmenté pour H100
     block_size = 512
     
-    # Encoder config (plus petit)
+    # Encoder config (plus grand pour H100)
     encoder_n_layer = 24
     encoder_n_head = 32
     encoder_n_embd = 1024
     encoder_ratio_kv = 8
     
-    # Decoder config (plus grand)
+    # Decoder config
     decoder_n_layer = 24
     decoder_n_head = 32
     decoder_n_embd = 1024
@@ -282,6 +282,36 @@ elif init_from == 'resume':
 
 model.to(device)
 
+# Après model.to(device)
+if device_type == 'cuda':
+    print("Optimizing for H100...")
+    
+    # Compiler le modèle
+    try:
+        model = torch.compile(
+            model,
+            mode='max-autotune',
+            fullgraph=True,
+            dynamic=True,  # Important pour H100
+        )
+        print("Model successfully compiled with torch.compile()")
+    except Exception as e:
+        print(f"Warning: Could not compile model: {e}")
+    
+    # Optimiser les opérations CUDA
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    
+    # Configurer le scaler pour mixed precision
+    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'bfloat16'))
+    
+    # Optimiser la mémoire
+    torch.cuda.empty_cache()
+    if hasattr(torch.cuda, 'memory_stats'):
+        torch.cuda.memory_stats()
+    torch.cuda.set_per_process_memory_fraction(0.95)
+
 # Optimisations CUDA
 if device_type == 'cuda':
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -492,33 +522,34 @@ while True:
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
+        
+        # Utiliser autocast pour mixed precision
+        with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16):
             logits, loss = model(encoder_input, decoder_input, target)
             if loss is not None:
                 loss = loss / gradient_accumulation_steps
             else:
                 continue
-            
-            # immediately async prefetch next batch
-            try:
-                encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-            except StopIteration:
-                train_iterator = iter(train_dataset)
-                encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-            
-            # backward pass, with gradient scaling if training in fp16
-            scaler.scale(loss).backward()
         
-    # clip the gradient
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
-
+        # Scaler pour mixed precision
+        scaler.scale(loss).backward()
+        
+        if grad_clip != 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        
+        scaler.step(optimizer)
+        scaler.update()
+        
+        # immediately async prefetch next batch
+        try:
+            encoder_input_next, decoder_input_next, target_next = next(train_iterator)
+        except StopIteration:
+            train_iterator = iter(train_dataset)
+            encoder_input_next, decoder_input_next, target_next = next(train_iterator)
+        
+        encoder_input, decoder_input, target = encoder_input_next, decoder_input_next, target_next
+    
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
@@ -537,7 +568,6 @@ while True:
             generation_queue.put(encoder_input.detach().clone())
     iter_num += 1
     local_iter_num += 1
-    encoder_input, decoder_input, target = encoder_input_next, decoder_input_next, target_next
     
     # if iter_num % 100 == 0:
     #     generated = generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8)
@@ -566,6 +596,24 @@ while True:
         end_event.record()
         torch.cuda.synchronize()
         print(f"CUDA time: {start_event.elapsed_time(end_event)}ms")
+
+    if iter_num == 1:
+        print("Starting profiler...")
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/profile'),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        ) as prof:
+            # Une itération d'entraînement
+            # Votre code d'entraînement ici
+            prof.step()
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
 if ddp:
     destroy_process_group()
