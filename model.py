@@ -114,6 +114,7 @@ class CausalSelfAttention(nn.Module):
             try:
                 from flash_attn import flash_attn_func
                 self.flash = True
+                self.flash_fn = flash_attn_func
                 print("Flash Attention enabled")
             except ImportError:
                 print("Flash Attention not available")
@@ -130,7 +131,9 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size()
         
         # Si key_value est fourni, on fait de la cross-attention
-        if key_value is not None:
+        is_cross_attention = key_value is not None
+        
+        if is_cross_attention:
             # Projeter la query depuis x
             q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
             
@@ -148,7 +151,6 @@ class CausalSelfAttention(nn.Module):
             
             # Pas de masque causal en cross-attention
             mask = None
-            
         else:
             # Self-attention standard
             qkv = torch.cat([
@@ -168,31 +170,43 @@ class CausalSelfAttention(nn.Module):
             
             mask = self.mask[:T, :T]
 
-        if self.flash and not key_value:
+        # Attention computation
+        if self.flash and not is_cross_attention:
             try:
-                # Utiliser Flash Attention de manière plus simple
-                qkv = torch.stack([q, k, v], dim=2)
-                y = flash_attn_func(qkv, causal=True)
+                # Préparer les arguments pour flash attention
+                q = q.contiguous()
+                k = k.contiguous()
+                v = v.contiguous()
+                
+                # Calculer les sequence lengths
+                cu_seqlens = torch.arange(0, (B + 1) * T, step=T, dtype=torch.int32, device=x.device)
+                max_seqlen = T
+                
+                # Appeler flash attention avec les bons arguments
+                y = self.flash_fn(
+                    q, k, v,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    causal=True
+                )
                 y = y.transpose(1, 2).contiguous().view(B, T, C)
+                
             except Exception as e:
                 print(f"Flash Attention failed, falling back to standard attention: {e}")
                 self.flash = False
-                
-        if not self.flash:
+        
+        if not self.flash or is_cross_attention:
             # Attention standard optimisée pour la mémoire
             scale = 1.0 / math.sqrt(self.head_dim)
             att = torch.matmul(q, k.transpose(-2, -1)) * scale
             
-            # Appliquer le masque et le bias si nécessaire
             if mask is not None:
                 att = att + self.alibi.get_bias(T, x.device)
                 att = att + mask
             
-            # Softmax et dropout
             att = F.softmax(att, dim=-1, dtype=torch.float32)
             att = self.attn_dropout(att.to(q.dtype))
             
-            # Calcul final
             y = torch.matmul(att, v)
             y = y.transpose(1, 2).contiguous().view(B, T, C)
         
@@ -605,7 +619,7 @@ class EncoderDecoderGPT(nn.Module):
         # Collecter tous les paramètres
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
         
-        # Séparer les paramètres qui doivent avoir du weight decay de ceux qui n'en ont pas
+        # S��parer les paramètres qui doivent avoir du weight decay de ceux qui n'en ont pas
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         

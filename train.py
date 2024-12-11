@@ -280,6 +280,25 @@ if device_type == 'cuda':
     torch.cuda.memory.empty_cache()
     torch.backends.cudnn.benchmark = True
     torch.cuda.set_per_process_memory_fraction(0.8)  # Utiliser 80% de la mémoire disponible
+    
+    # Optimisations CUDA supplémentaires
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    
+    # Désactiver la synchronisation par défaut
+    torch.cuda.set_device(device)
+    torch.cuda.empty_cache()
+    
+    # Optimisations mémoire supplémentaires
+    torch.cuda.empty_cache()
+    if hasattr(torch.cuda, 'memory_stats'):
+        torch.cuda.memory_stats()
+    
+    # Activer gradient checkpointing si nécessaire
+    if hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
 
 # Modifier la configuration du scaler
 if dtype == 'float16':
@@ -402,13 +421,14 @@ if device_type == 'cuda':
     torch.cuda.set_device(device)
     torch.cuda.empty_cache()
     
-    # Au lieu d'utiliser torch.compile, utilisons torch.jit.script
-    try:
-        model = torch.jit.script(model)
-        print("Model successfully scripted with TorchScript")
-    except Exception as e:
-        print(f"Could not script model: {e}")
-        print("Continuing with regular model")
+    # Optimisations mémoire supplémentaires
+    torch.cuda.empty_cache()
+    if hasattr(torch.cuda, 'memory_stats'):
+        torch.cuda.memory_stats()
+    
+    # Activer gradient checkpointing si nécessaire
+    if hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
 
 while True:
     # determine and set the learning rate for this iteration
