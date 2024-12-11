@@ -138,95 +138,103 @@ class CausalSelfAttention(nn.Module):
         """
         B, T, C = x.size()
         
+        # Sauvegarder l'état initial de flash attention
+        initial_flash_state = self.flash
+        
         # Convertir en bfloat16 pour Flash Attention
         orig_dtype = x.dtype
         if self.flash and x.dtype not in [torch.bfloat16, torch.float16]:
             x = x.to(torch.bfloat16)
         
-        # Si key_value est fourni, on fait de la cross-attention
-        if key_value is not None:
-            # Projeter la query depuis x
-            q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-            
-            # Projeter key et value depuis key_value
-            k = self.k_proj(key_value)
-            v = self.v_proj(key_value)
-            
-            # Reshape pour l'attention
-            k = k.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
-            v = v.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
-            
-            # Désactiver Flash Attention pendant la génération pour la cross-attention
-            if is_generation:
-                self.flash = False
-            
-            # Repeat K,V pour GQA seulement si pas en génération
-            if not is_generation:
-                k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-            
-            # Pas de masque causal en cross-attention
-            mask = None
-            
-        else:
-            # Self-attention standard
-            qkv = torch.cat([
-                self.q_proj(x),
-                self.k_proj(x),
-                self.v_proj(x)
-            ], dim=-1)
-            
-            q, k, v = qkv.split([self.n_embd, self.n_head_kv * self.head_dim, self.n_head_kv * self.head_dim], dim=-1)
-            
-            q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-            k = k.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
-            v = v.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
-            
-            if not is_generation:
-                k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-            
-            mask = self.mask[:T, :T]
-
-        if self.flash:
-            try:
-                # S'assurer que q, k, v sont en bfloat16
-                q = q.to(torch.bfloat16)
-                k = k.to(torch.bfloat16)
-                v = v.to(torch.bfloat16)
+        try:
+            # Si key_value est fourni, on fait de la cross-attention
+            if key_value is not None:
+                # Projeter la query depuis x
+                q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
                 
-                y = self.flash_fn(q, k, v, causal=mask is not None)
-                # Reconvertir au dtype original
+                # Projeter key et value depuis key_value
+                k = self.k_proj(key_value)
+                v = self.v_proj(key_value)
+                
+                # Reshape pour l'attention
+                k = k.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
+                v = v.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
+                
+                # Désactiver Flash Attention pendant la génération pour la cross-attention
+                if is_generation:
+                    self.flash = False
+                
+                # Repeat K,V pour GQA seulement si pas en génération
+                if not is_generation:
+                    k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                    v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                
+                # Pas de masque causal en cross-attention
+                mask = None
+                
+            else:
+                # Self-attention standard
+                qkv = torch.cat([
+                    self.q_proj(x),
+                    self.k_proj(x),
+                    self.v_proj(x)
+                ], dim=-1)
+                
+                q, k, v = qkv.split([self.n_embd, self.n_head_kv * self.head_dim, self.n_head_kv * self.head_dim], dim=-1)
+                
+                q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+                k = k.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
+                v = v.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
+                
+                if not is_generation:
+                    k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                    v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                
+                mask = self.mask[:T, :T]
+
+            if self.flash:
+                try:
+                    # S'assurer que q, k, v sont en bfloat16
+                    q = q.to(torch.bfloat16)
+                    k = k.to(torch.bfloat16)
+                    v = v.to(torch.bfloat16)
+                    
+                    y = self.flash_fn(q, k, v, causal=mask is not None)
+                    # Reconvertir au dtype original
+                    y = y.to(orig_dtype)
+                except Exception as e:
+                    print(f"Flash Attention failed: {e}")
+                    self.flash = False
+            
+            if not self.flash:
+                # Attention standard optimisée pour la mémoire
+                scale = 1.0 / math.sqrt(self.head_dim)
+                att = torch.matmul(q, k.transpose(-2, -1)) * scale
+                
+                # Appliquer le masque et le bias si nécessaire
+                if mask is not None:
+                    att = att + self.alibi.get_bias(T, x.device).repeat_interleave(
+                        self.n_head // self.n_head_kv, dim=0
+                    )[:self.n_head]
+                    att = att + mask
+                
+                # Softmax et dropout
+                att = F.softmax(att, dim=-1, dtype=torch.float32)
+                att = self.attn_dropout(att.to(q.dtype))
+                
+                # Calcul final
+                y = torch.matmul(att, v)
+            
+            # Reshape final et reconversion au dtype original si nécessaire
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
+            if y.dtype != orig_dtype:
                 y = y.to(orig_dtype)
-            except Exception as e:
-                print(f"Flash Attention failed: {e}")
-                self.flash = False
-        
-        if not self.flash:
-            # Attention standard optimisée pour la mémoire
-            scale = 1.0 / math.sqrt(self.head_dim)
-            att = torch.matmul(q, k.transpose(-2, -1)) * scale
             
-            # Appliquer le masque et le bias si nécessaire
-            if mask is not None:
-                att = att + self.alibi.get_bias(T, x.device).repeat_interleave(
-                    self.n_head // self.n_head_kv, dim=0
-                )[:self.n_head]
-                att = att + mask
+            return self.resid_dropout(self.o_proj(y))
             
-            # Softmax et dropout
-            att = F.softmax(att, dim=-1, dtype=torch.float32)
-            att = self.attn_dropout(att.to(q.dtype))
-            
-            # Calcul final
-            y = torch.matmul(att, v)
-        
-        # Reshape final et reconversion au dtype original si nécessaire
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        if y.dtype != orig_dtype:
-            y = y.to(orig_dtype)
-        
-        return self.resid_dropout(self.o_proj(y))
+        finally:
+            # Restaurer l'état initial de flash attention
+            self.flash = initial_flash_state
 
 class MLP(nn.Module):
 
