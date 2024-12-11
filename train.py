@@ -48,7 +48,7 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = 'cuda:0'
-    batch_size = 16
+    batch_size = 64
     block_size = 64
     
     # Encoder config (plus petit)
@@ -185,8 +185,17 @@ def generate_text(model, input, max_new_tokens=50, temperature=0.8):
     # Ajouter la dimension de batch
     prompt_tokens = prompt_tokens.unsqueeze(0)  # [1, seq_len]
     
-    # Générer token par token
-    generated_tokens = model.generate(prompt_tokens, max_new_tokens=max_new_tokens, temperature=temperature)
+    # Convertir au même dtype que le modèle
+    if hasattr(model, 'dtype'):
+        dtype = model.dtype
+    else:
+        # Détecter le dtype à partir des paramètres du modèle
+        dtype = next(model.parameters()).dtype
+        
+    # S'assurer que le modèle et les tenseurs sont dans le même dtype
+    with torch.cuda.amp.autocast(enabled=True, dtype=dtype):
+        # Générer token par token
+        generated_tokens = model.generate(prompt_tokens, max_new_tokens=max_new_tokens, temperature=temperature)
     
     # Décoder les tokens générés
     decoded_text = decode(generated_tokens[0].tolist())
