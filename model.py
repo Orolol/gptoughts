@@ -161,12 +161,14 @@ class CausalSelfAttention(nn.Module):
             
             q, k, v = qkv.split([self.n_embd, self.n_head_kv * self.head_dim, self.n_head_kv * self.head_dim], dim=-1)
             
-            q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-            k = k.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
-            v = v.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
+            # Reshape pour l'attention avec GQA
+            q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hd)
+            k = k.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)  # (B, nh_kv, T, hd)
+            v = v.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)  # (B, nh_kv, T, hd)
             
-            k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-            v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+            # Repeat K,V pour GQA
+            k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)  # (B, nh, T, hd)
+            v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)  # (B, nh, T, hd)
             
             mask = self.mask[:T, :T]
 
@@ -179,9 +181,9 @@ class CausalSelfAttention(nn.Module):
                 v = v.contiguous()
                 
                 # Reshape pour flash attention
-                q = q.view(B * self.n_head, T, self.head_dim)
-                k = k.view(B * self.n_head, T, self.head_dim)
-                v = v.view(B * self.n_head, T, self.head_dim)
+                q = q.transpose(1, 2).reshape(B * T, self.n_head, self.head_dim)
+                k = k.transpose(1, 2).reshape(B * T, self.n_head, self.head_dim)
+                v = v.transpose(1, 2).reshape(B * T, self.n_head, self.head_dim)
                 
                 # Appeler flash attention avec la bonne signature
                 y = self.flash_fn(
@@ -191,7 +193,7 @@ class CausalSelfAttention(nn.Module):
                 )
                 
                 # Reshape back
-                y = y.view(B, self.n_head, T, self.head_dim)
+                y = y.view(B, T, self.n_head, self.head_dim)
                 y = y.transpose(1, 2).contiguous().view(B, T, C)
                 
             except Exception as e:
@@ -201,20 +203,21 @@ class CausalSelfAttention(nn.Module):
         if not self.flash or is_cross_attention:
             # Attention standard optimisée pour la mémoire
             scale = 1.0 / math.sqrt(self.head_dim)
-            att = torch.matmul(q, k.transpose(-2, -1)) * scale
+            att = torch.matmul(q, k.transpose(-2, -1)) * scale  # (B, nh, T, T)
             
             if mask is not None:
                 # Ajuster les dimensions du ALiBi bias pour correspondre à l'attention
-                alibi_bias = self.alibi.get_bias(T, x.device)
-                alibi_bias = alibi_bias.view(1, self.n_head, T, T)
-                alibi_bias = alibi_bias.expand(B, -1, -1, -1)
+                alibi_bias = self.alibi.get_bias(T, x.device)  # (nh, T, T)
+                # Répéter le bias pour chaque batch
+                alibi_bias = alibi_bias.unsqueeze(0).expand(B, -1, -1, -1)  # (B, nh, T, T)
+                # Appliquer le masque et le bias
                 att = att + alibi_bias
                 att = att + mask.view(1, 1, T, T)
             
             att = F.softmax(att, dim=-1, dtype=torch.float32)
             att = self.attn_dropout(att.to(q.dtype))
             
-            y = torch.matmul(att, v)
+            y = torch.matmul(att, v)  # (B, nh, T, hd)
             y = y.transpose(1, 2).contiguous().view(B, T, C)
         
         return self.resid_dropout(self.o_proj(y))
@@ -424,7 +427,7 @@ class GPT(nn.Module):
                 )
                 print("Model compiled with max-autotune mode for H100")
 
-        # Utiliser AdaFactor au lieu de AdamW pour une meilleure efficacité m��moire
+        # Utiliser AdaFactor au lieu de AdamW pour une meilleure efficacité mémoire
         try:
             from transformers.optimization import Adafactor
             optimizer = Adafactor(
