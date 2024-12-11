@@ -334,7 +334,7 @@ train_loader = torch.utils.data.DataLoader(
     batch_size=None,  # Déjà géré par StreamingDataset
     num_workers=0,  # Réduire à 0 pour éviter les problèmes de fork avec CUDA
     pin_memory=True,
-    prefetch_factor=2,
+    prefetch_factor=None,  # Désactiver le prefetch car num_workers=0
     persistent_workers=False  # Désactiver les workers persistants
 )
 
@@ -343,7 +343,7 @@ val_loader = torch.utils.data.DataLoader(
     batch_size=None,  # Déjà géré par StreamingDataset
     num_workers=0,  # Réduire à 0 pour éviter les problèmes de fork avec CUDA
     pin_memory=True,
-    prefetch_factor=2,
+    prefetch_factor=None,  # Désactiver le prefetch car num_workers=0
     persistent_workers=False  # Désactiver les workers persistants
 )
 
