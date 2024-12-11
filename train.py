@@ -420,6 +420,29 @@ running_mfu = -1.0
 
 print("Starting training...")
 
+def cleanup_old_checkpoints(out_dir, keep_last_n=4):
+    """Ne garde que les N derniers checkpoints"""
+    checkpoints = glob.glob(os.path.join(out_dir, 'ckpt_iter_*.pt'))
+    if len(checkpoints) <= keep_last_n:
+        return
+    
+    def extract_iter_num(filename):
+        try:
+            return int(filename.split('iter_')[1].split('_loss')[0])
+        except:
+            return 0
+    
+    # Trier les checkpoints par numéro d'itération
+    checkpoints.sort(key=extract_iter_num)
+    
+    # Supprimer les plus anciens
+    for ckpt in checkpoints[:-keep_last_n]:
+        try:
+            os.remove(ckpt)
+            print(f"Removed old checkpoint: {ckpt}")
+        except Exception as e:
+            print(f"Error removing checkpoint {ckpt}: {e}")
+
 while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -459,6 +482,9 @@ while True:
                 )
                 print(f"saving checkpoint to {checkpoint_path}")
                 torch.save(checkpoint, checkpoint_path)
+                
+                # Nettoyer les anciens checkpoints
+                cleanup_old_checkpoints(out_dir, keep_last_n=4)
     if iter_num == 0 and eval_only:
         break
 
