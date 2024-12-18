@@ -353,8 +353,10 @@ class Trainer:
             self.model = DDP(self.model, device_ids=[self.ddp_local_rank])
         
     def setup_optimizer(self):
+        # Get the underlying model if using DDP
+        model = self.model.module if self.ddp else self.model
         # Optimizer initialization logic here
-        self.optimizer = self.model.configure_optimizers(
+        self.optimizer = model.configure_optimizers(
             self.config.weight_decay,
             self.config.learning_rate,
             (self.config.beta1, self.config.beta2),
