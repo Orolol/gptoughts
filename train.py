@@ -401,6 +401,7 @@ class Trainer:
             
             # Forward backward update, with optional gradient accumulation
             encoder_input, decoder_input, target = next(iter(train_dataset))
+            print(encoder_input)
             with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
                 logits, loss = self.model(encoder_input, decoder_input, target)
                 print(f"step {iter_num}: train loss {loss.item():.4f}")
@@ -515,41 +516,5 @@ def main():
     trainer = Trainer(config)
     trainer.train()
 
-<<<<<<< HEAD
 if __name__ == '__main__':
     main()
-=======
-    # Dans la boucle d'entraînement, après chaque N itérations
-    if iter_num % 100 == 0:  # Ajuster la fréquence selon vos besoins
-        print(f"Collecting garbage at iter {iter_num}")
-        if device_type == 'cuda':
-            # Forcer la synchronisation CUDA
-            torch.cuda.synchronize()
-            
-        # Collecter manuellement le garbage
-        if gc.isenabled():
-            gc.collect()
-
-    if iter_num % 100 == 0:  # Pour profiler périodiquement
-        print(f"Profiling at iter {iter_num}")
-        torch.cuda.synchronize()
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-
-    if iter_num % 100 == 0:
-        print(f"Profiling at iter {iter_num}")
-        end_event.record()
-        torch.cuda.synchronize()
-        print(f"CUDA time: {start_event.elapsed_time(end_event)}ms")
-
-if ddp:
-    destroy_process_group()
-
-# Nettoyage final CUDA
-if device_type == 'cuda':
-    torch.cuda.empty_cache()
-    if hasattr(torch.cuda, 'memory_stats'):
-        torch.cuda.memory_stats(device=device)
-    torch.cuda.set_stream(torch.cuda.Stream())
->>>>>>> origin/main
