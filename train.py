@@ -119,16 +119,16 @@ class TrainingConfig:
         """Configuration optimisée pour RTX 4090"""
         self.device = 'cuda:0'
         self.batch_size = 16
-        self.block_size = 1024
+        self.block_size = 512
         self.encoder_config = {
             'n_layer': 24,
-            'n_head': 32,
+            'n_head': 24,
             'n_embd': 1024,
             'ratio_kv': 8
         }
         self.decoder_config = {
             'n_layer': 24,
-            'n_head': 32,
+            'n_head': 24,
             'n_embd': 1024,
             'ratio_kv': 8
         }
@@ -139,7 +139,7 @@ class TrainingConfig:
         torch.cuda.empty_cache()
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        torch.cuda.set_per_process_memory_fraction(0.85)
+        torch.cuda.set_per_process_memory_fraction(0.90)
         
     def setup_a100_config(self):
         """Configuration optimisée pour A100"""
