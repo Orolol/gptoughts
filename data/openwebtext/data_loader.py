@@ -68,6 +68,7 @@ class StreamingDataset(IterableDataset):
         while len(self.token_buffer) < (self.block_size * self.batch_size * 2 + 1):
             try:
                 example = next(self.dataset_iterator)
+                print(example)
                 new_tokens = self.process_example(example)
                 self.token_buffer.extend(new_tokens)
                 self.token_tracker.update(len(new_tokens))

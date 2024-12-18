@@ -118,8 +118,8 @@ class TrainingConfig:
     def setup_4090_config(self):
         """Configuration optimisée pour RTX 4090"""
         self.device = 'cuda:0'
-        self.batch_size = 16
-        self.block_size = 512
+        self.batch_size = 8
+        self.block_size = 256
         self.encoder_config = {
             'n_layer': 16,
             'n_head': 16,
