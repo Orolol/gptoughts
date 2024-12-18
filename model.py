@@ -696,6 +696,7 @@ class EncoderDecoderGPT(nn.Module):
                                device=idx.device)
         
         # Encoder une seule fois la séquence d'entrée
+
         with torch.no_grad():
             # Préparer l'entrée de l'encodeur
             encoder_seq_len = min(idx.size(1), self.encoder.config.block_size)
