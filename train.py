@@ -413,7 +413,6 @@ class Trainer:
             with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
                 logits, loss = self.model(encoder_input, encoder_input, target)
                 # we should print loss, time  per step and total number of tokens processed
-                print(f"")
                 print(f"step {iter_num}: train loss {loss.item():.4f}")
                 if loss is not None:
                     loss = loss / self.config.gradient_accumulation_steps
