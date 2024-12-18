@@ -34,7 +34,7 @@ generate_interval = 100
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'resume' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -243,42 +243,45 @@ model_args = {
     'block_size': block_size
 }
 
-if init_from == 'scratch':
-    print("Initializing a new encoder-decoder model from scratch")
-    model = EncoderDecoderGPT(encoder_config, decoder_config)
-elif init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
+if init_from == 'resume':
+    print(f"Attempting to resume training from {out_dir}")
     # Trouver tous les checkpoints
     checkpoints = glob.glob(os.path.join(out_dir, 'ckpt_iter_*.pt'))
     if not checkpoints:
-        raise ValueError(f"No checkpoints found in {out_dir}")
-    
-    # Extraire les numéros d'itération et trier
-    def extract_iter_num(filename):
-        try:
-            return int(filename.split('iter_')[1].split('_loss')[0])
-        except:
-            return 0
-    
-    # Prendre le dernier checkpoint
-    checkpoints.sort(key=extract_iter_num)
-    ckpt_path = checkpoints[-1]
-    print(f"Loading checkpoint: {ckpt_path}")
-    
-    checkpoint = torch.load(ckpt_path, map_location=device)
+        print("No checkpoints found, initializing from scratch instead")
+        init_from = 'scratch'
+        model = EncoderDecoderGPT(encoder_config, decoder_config)
+    else:
+        # Extraire les numéros d'itération et trier
+        def extract_iter_num(filename):
+            try:
+                return int(filename.split('iter_')[1].split('_loss')[0])
+            except:
+                return 0
+        
+        # Prendre le dernier checkpoint
+        checkpoints.sort(key=extract_iter_num)
+        ckpt_path = checkpoints[-1]
+        print(f"Loading checkpoint: {ckpt_path}")
+        
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        model = EncoderDecoderGPT(encoder_config, decoder_config)
+        state_dict = checkpoint['model']
+        
+        # Nettoyer le state dict si nécessaire
+        unwanted_prefix = '_orig_mod.'
+        for k,v in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+        
+        model.load_state_dict(state_dict)
+        iter_num = checkpoint['iter_num']
+        best_val_loss = checkpoint['best_val_loss']
+        print(f"Resuming from iteration {iter_num} with best val loss {best_val_loss}")
+
+if init_from == 'scratch':
+    print("Initializing a new encoder-decoder model from scratch")
     model = EncoderDecoderGPT(encoder_config, decoder_config)
-    state_dict = checkpoint['model']
-    
-    # Nettoyer le state dict si nécessaire
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
-    print(f"Resuming from iteration {iter_num} with best val loss {best_val_loss}")
 
 model.to(device)
 
@@ -420,6 +423,29 @@ running_mfu = -1.0
 
 print("Starting training...")
 
+def cleanup_old_checkpoints(out_dir, keep_num=3):
+    """Garde uniquement les 'keep_num' checkpoints les plus récents."""
+    checkpoints = glob.glob(os.path.join(out_dir, 'ckpt_iter_*.pt'))
+    if len(checkpoints) <= keep_num:
+        return
+        
+    # Trier les checkpoints par numéro d'itération
+    def extract_iter_num(filename):
+        try:
+            return int(filename.split('iter_')[1].split('_loss')[0])
+        except:
+            return 0
+            
+    checkpoints.sort(key=extract_iter_num)
+    
+    # Supprimer les checkpoints les plus anciens
+    for ckpt in checkpoints[:-keep_num]:
+        try:
+            os.remove(ckpt)
+            print(f"Removed old checkpoint: {ckpt}")
+        except Exception as e:
+            print(f"Error removing checkpoint {ckpt}: {e}")
+
 while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -459,6 +485,8 @@ while True:
                 )
                 print(f"saving checkpoint to {checkpoint_path}")
                 torch.save(checkpoint, checkpoint_path)
+                # Nettoyer les anciens checkpoints
+                cleanup_old_checkpoints(out_dir, keep_num=3)
     if iter_num == 0 and eval_only:
         break
 
