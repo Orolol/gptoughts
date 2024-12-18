@@ -95,15 +95,15 @@ class TrainingConfig:
         self.batch_size = 16  # Plus grand batch size grâce à la grande mémoire
         self.block_size = 1024
         self.encoder_config = {
-            'n_layer': 24,
-            'n_head': 24,
-            'n_embd': 1152,
+            'n_layer': 16,
+            'n_head': 16,
+            'n_embd': 768,
             'ratio_kv': 8
         }
         self.decoder_config = {
-            'n_layer': 24,
-            'n_head': 24,
-            'n_embd': 1152,
+            'n_layer': 16,
+            'n_head': 16,
+            'n_embd': 768,
             'ratio_kv': 8
         }
         self.gradient_accumulation_steps = 1
