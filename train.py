@@ -367,6 +367,8 @@ class Trainer:
         
     def train(self):
         # Training loop logic here
+        
+        print("Loading datasets...")
         train_dataset = StreamingDataset(
             block_size=self.config.block_size,
             batch_size=self.config.batch_size,
@@ -386,7 +388,7 @@ class Trainer:
         
         iter_num = 1
         best_val_loss = 1e9
-        
+        print("Training...")
         while True:
             # Determine and set the learning rate for this iteration
             lr = self.get_lr(iter_num) if self.config.decay_lr else self.config.learning_rate
@@ -403,7 +405,6 @@ class Trainer:
             
             # Forward backward update, with optional gradient accumulation
             encoder_input, decoder_input, target = next(iter(train_dataset))
-            print(encoder_input)
             with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
                 logits, loss = self.model(encoder_input, decoder_input, target)
                 print(f"step {iter_num}: train loss {loss.item():.4f}")
