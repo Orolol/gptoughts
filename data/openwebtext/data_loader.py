@@ -63,55 +63,50 @@ class StreamingDataset(IterableDataset):
         return ids
     
     def get_batch(self):
-        """Get a batch of token sequences of length block_size."""
+        """Get a batch of token sequences where target is input shifted by one position."""
         # On s'assure d'avoir assez de tokens dans le buffer
-        while len(self.token_buffer) < (self.block_size * self.batch_size * 2 + 1):
+        while len(self.token_buffer) < (self.block_size + 1) * self.batch_size:
             try:
                 example = next(self.dataset_iterator)
-                print(example)
                 new_tokens = self.process_example(example)
                 self.token_buffer.extend(new_tokens)
                 self.token_tracker.update(len(new_tokens))
             except StopIteration:
-                # Quand on arrive à la fin du dataset, on crée un nouvel itérateur
                 self.dataset = load_dataset("HuggingFaceFW/fineweb-2", 
                                          name=self.dataset_config,
                                          split=self.split,
                                          streaming=True)
                 self.dataset_iterator = iter(self.dataset)
-                # Si le buffer est vide après avoir atteint la fin du dataset,
-                # on continue à charger des données
                 if len(self.token_buffer) == 0:
                     continue
-                # Sinon, on peut utiliser ce qu'il reste dans le buffer
                 break
 
-        # Si après avoir essayé de remplir le buffer, on n'a toujours pas assez de tokens,
-        # on utilise ce qu'on a en ajustant la taille du batch
-        available_sequences = len(self.token_buffer) // self.block_size
-        if available_sequences == 0:
+        # Vérifie qu'on a assez de tokens pour au moins une séquence
+        if len(self.token_buffer) < self.block_size + 1:
             raise RuntimeError("Not enough tokens to create even one sequence")
         
-        actual_batch_size = min(self.batch_size, available_sequences // 2)  # Divise par 2 car on a besoin d'input et target
-        total_length = self.block_size * actual_batch_size
-
-        # Prepare les tensors comme avant, mais avec la taille de batch ajustée
-        encoder_input = torch.tensor(self.token_buffer[:total_length], 
-                                   dtype=torch.long, device=self.device)
-        decoder_input = torch.tensor(self.token_buffer[total_length:total_length*2], 
-                                   dtype=torch.long, device=self.device)
-        target = torch.tensor(self.token_buffer[total_length+1:total_length*2+1], 
-                            dtype=torch.long, device=self.device)
-
-        # Reshape avec la taille de batch ajustée
-        encoder_input = encoder_input.view(actual_batch_size, self.block_size)
-        decoder_input = decoder_input.view(actual_batch_size, self.block_size)
-        target = target.view(actual_batch_size, self.block_size)
-
-        # Nettoie le buffer
-        self.token_buffer = self.token_buffer[total_length*2:]
-
-        return encoder_input, decoder_input, target
+        # Calcule combien de séquences complètes on peut créer
+        available_sequences = (len(self.token_buffer) - 1) // self.block_size
+        actual_batch_size = min(self.batch_size, available_sequences)
+        
+        # Prépare les tenseurs pour input et target
+        sequences = []
+        for i in range(actual_batch_size):
+            start_idx = i * self.block_size
+            # Input: séquence de tokens
+            input_sequence = self.token_buffer[start_idx:start_idx + self.block_size]
+            # Target: même séquence décalée d'un token vers la gauche
+            target_sequence = self.token_buffer[start_idx + 1:start_idx + self.block_size + 1]
+            sequences.append((input_sequence, target_sequence))
+        
+        # Supprime les tokens utilisés du buffer
+        self.token_buffer = self.token_buffer[actual_batch_size * self.block_size:]
+        
+        # Convertit en tenseurs
+        inputs = torch.tensor([seq[0] for seq in sequences], dtype=torch.long, device=self.device)
+        targets = torch.tensor([seq[1] for seq in sequences], dtype=torch.long, device=self.device)
+        
+        return inputs, targets
     
     def __iter__(self):
         while True:
@@ -127,10 +122,9 @@ if __name__ == "__main__":
     dataset = StreamingDataset(block_size=1024, batch_size=4)
     
     # Get a few batches
-    for i, (encoder_input, decoder_input, target) in enumerate(dataset):
+    for i, (input, target) in enumerate(dataset):
         print(f"Batch {i}:")
-        print(f"Encoder input shape: {encoder_input.shape}")
-        print(f"Decoder input shape: {decoder_input.shape}")
+        print(f"Encoder input shape: {input.shape}")
         print(f"Target shape: {target.shape}")
         print(f"Total tokens processed: {dataset.get_total_tokens():,}")
         

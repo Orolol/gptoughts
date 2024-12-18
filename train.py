@@ -31,7 +31,7 @@ class TrainingConfig:
         self.out_dir = 'out'
         self.eval_interval = 1000
         self.log_interval = 1
-        self.generate_interval = 100
+        self.generate_interval = 20
         self.eval_iters = 100
         self.eval_only = False
         self.always_save_checkpoint = True
@@ -272,7 +272,10 @@ class TextGenerator:
         
         dtype = model.dtype if hasattr(model, 'dtype') else next(model.parameters()).dtype
         with torch.cuda.amp.autocast(enabled=True, dtype=dtype):
-            return model.generate(prompt_tokens, max_new_tokens=max_new_tokens, temperature=temperature)
+            result = model.generate(prompt_tokens, max_new_tokens=max_new_tokens, temperature=temperature)
+            # Now we print the generated text
+            print(prompt + " " + self.tokenizer.decode(result[0].tolist()))
+            return result
 
 class Trainer:
     def __init__(self, config):
@@ -403,10 +406,13 @@ class Trainer:
                     best_val_loss = losses['val']
                     self.save_checkpoint(iter_num, best_val_loss, losses['val'])
             
+            
+            
             # Forward backward update, with optional gradient accumulation
-            encoder_input, decoder_input, target = next(iter(train_dataset))
+            encoder_input, target = next(iter(train_dataset))
             with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
-                logits, loss = self.model(encoder_input, decoder_input, target)
+                logits, loss = self.model(encoder_input, encoder_input, target)
+                
                 print(f"step {iter_num}: train loss {loss.item():.4f}")
                 if loss is not None:
                     loss = loss / self.config.gradient_accumulation_steps
@@ -422,6 +428,9 @@ class Trainer:
             
             self.scaler.step(self.optimizer)
             self.scaler.update()
+            
+            if iter_num % self.config.generate_interval == 0 and self.master_process:
+                self.text_generator.generate(self.model)
             
             iter_num += 1
             
@@ -446,9 +455,9 @@ class Trainer:
             losses = torch.zeros(self.config.eval_iters)
             valid_iters = 0
             for k in range(self.config.eval_iters):
-                encoder_input, decoder_input, target = next(iter(dataset))
+                encoder_input, target = next(iter(dataset))
                 with self.ctx:
-                    logits, loss = self.model(encoder_input, decoder_input, target)
+                    logits, loss = self.model(encoder_input, encoder_input, target)
                     if loss is not None:
                         losses[valid_iters] = loss.item()
                         valid_iters += 1
