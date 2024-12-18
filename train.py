@@ -93,17 +93,17 @@ class TrainingConfig:
         """Configuration optimisée pour H100"""
         self.device = 'cuda:0'
         self.batch_size = 32  # Plus grand batch size grâce à la grande mémoire
-        self.block_size = 2048
+        self.block_size = 1024
         self.encoder_config = {
-            'n_layer': 32,
-            'n_head': 40,
-            'n_embd': 2048,
+            'n_layer': 24,
+            'n_head': 24,
+            'n_embd': 1024,
             'ratio_kv': 8
         }
         self.decoder_config = {
-            'n_layer': 32,
-            'n_head': 40,
-            'n_embd': 2048,
+            'n_layer': 24,
+            'n_head': 24,
+            'n_embd': 1024,
             'ratio_kv': 8
         }
         self.gradient_accumulation_steps = 1
