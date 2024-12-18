@@ -29,7 +29,7 @@ class TrainingConfig:
     def __init__(self):
         # I/O settings
         self.out_dir = 'out'
-        self.eval_interval = 1000
+        self.eval_interval = 100000
         self.log_interval = 1
         self.generate_interval = 20
         self.eval_iters = 100
@@ -412,7 +412,8 @@ class Trainer:
             encoder_input, target = next(iter(train_dataset))
             with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=True):
                 logits, loss = self.model(encoder_input, encoder_input, target)
-                
+                # we should print loss, time  per step and total number of tokens processed
+                print(f"")
                 print(f"step {iter_num}: train loss {loss.item():.4f}")
                 if loss is not None:
                     loss = loss / self.config.gradient_accumulation_steps
