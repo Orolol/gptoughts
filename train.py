@@ -97,13 +97,13 @@ class TrainingConfig:
         self.encoder_config = {
             'n_layer': 24,
             'n_head': 24,
-            'n_embd': 1024,
+            'n_embd': 1152,
             'ratio_kv': 8
         }
         self.decoder_config = {
             'n_layer': 24,
             'n_head': 24,
-            'n_embd': 1024,
+            'n_embd': 1152,
             'ratio_kv': 8
         }
         self.gradient_accumulation_steps = 1
