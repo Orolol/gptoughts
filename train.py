@@ -53,8 +53,8 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'  # Use LOCAL_RANK for DDP
-    batch_size = 64 # Scale batch size with number of GPUs
-    block_size = 64
+    batch_size = 128  # Augmenté de 64 à 128
+    block_size = 128  # Augmenté de 64 à 128
     
     print(f"Using device: {device}")
     print(f"Batch size: {batch_size}")
@@ -74,7 +74,7 @@ if torch.cuda.is_available():
     
     # Optimisations mémoire
     # gradient_accumulation_steps = max(1, 32 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
-    gradient_accumulation_steps = 1
+    gradient_accumulation_steps = 1  # Réduit car nous augmentons le batch_size
     
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
     dtype = 'bfloat16'
@@ -121,7 +121,7 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 backend = 'nccl' # 'nccl', 'gloo', etc.
 
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
-compile = False # use PyTorch 2.0 to compile the model to be faster
+compile = True  # Était False
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -295,39 +295,33 @@ if init_from == 'scratch':
 
 model.to(device)
 
-# Optimisations CUDA
+# Après la création du modèle
+if compile:
+    print("Compiling model...")
+    model = torch.compile(
+        model, 
+        mode='max-autotune',
+        fullgraph=True,
+        dynamic=True,
+    )
+
+# Optimiser le chargement des données
 if device_type == 'cuda':
+    # Ajouter ces optimisations
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
     
-    default_stream = torch.cuda.current_stream()
-    copy_stream = torch.cuda.Stream()
-    
-    torch.multiprocessing.set_sharing_strategy('file_system')
-    
-    device_index = 0 if isinstance(device, str) else device
-    if isinstance(device, str) and ':' in device:
-        device_index = int(device.split(':')[1])
-    torch.cuda.set_device(device_index)
-    torch.cuda.empty_cache()
-    
+    # Utiliser un DataLoader avec num_workers
+    num_workers = 4  # Ajuster selon votre CPU
     pin_memory = True
     
-    # Désactiver le garbage collector automatique
-    gc.disable()
-    
-    # Configurer la gestion de la mémoire CUDA
+    # Optimiser la mémoire CUDA
     torch.cuda.empty_cache()
-    torch.cuda.memory.empty_cache()
-    torch.backends.cudnn.benchmark = True
-    
-    # Réserver de la mémoire CUDA
-    cache_size = 24 * 1024 * 1024 * 1024  # 24GB
-    torch.cuda.empty_cache()
-    torch.cuda.memory.empty_cache()
-    torch.cuda.set_per_process_memory_fraction(0.8)  # Utiliser 80% de la mémoire disponible
+    if hasattr(torch.cuda, 'memory_stats'):
+        torch.cuda.memory_stats()
+    torch.cuda.set_per_process_memory_fraction(0.95)  # Augmenté de 0.8 à 0.95
 
 # Configurer le gradient scaler
 scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
@@ -502,24 +496,20 @@ while True:
 
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
+            # Optimiser la synchronisation DDP
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         
         with ctx:
-            # Debug prints
-            # print(f"[Rank {ddp_rank}] Input shapes - encoder: {encoder_input.shape}, decoder: {decoder_input.shape}, target: {target.shape}")
-            # print(f"[Rank {ddp_rank}] Input device: {encoder_input.device}")
-            
-            logits, current_loss = model(encoder_input, decoder_input, target)
-            if current_loss is None:
-                # print(f"[Rank {ddp_rank}] current_loss is None → skipping optimizer step")
-                # print(f"[Rank {ddp_rank}] logits shape: {logits.shape if logits is not None else None}")
-                skip_optimizer_step = True
-                break
-            else:
+            # Utiliser torch.cuda.amp.autocast() pour les calculs mixtes
+            with torch.cuda.amp.autocast(enabled=True):
+                logits, current_loss = model(encoder_input, decoder_input, target)
+                
+            if current_loss is not None:
                 current_loss = current_loss / gradient_accumulation_steps
+                # Utiliser le gradient scaler
                 scaled_loss = scaler.scale(current_loss)
                 scaled_loss.backward()
-                loss = current_loss  # Retenir la dernière loss valable
+                loss = current_loss
         
         # Préparer la prochaine itération : charger le batch suivant
         try:
