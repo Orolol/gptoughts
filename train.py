@@ -74,7 +74,7 @@ if torch.cuda.is_available():
     
     # Optimisations mémoire
     # gradient_accumulation_steps = max(1, 32 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
-    gradient_accumulation_steps = 16
+    gradient_accumulation_steps = 1
     
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
     dtype = 'bfloat16'
