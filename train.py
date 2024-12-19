@@ -21,6 +21,7 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT, EncoderDecoderGPT
 from data.openwebtext.data_loader import StreamingDataset
+from run_train import get_datasets
 
 from rich.console import Console
 console = Console()
@@ -341,42 +342,9 @@ if init_from == 'resume':
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
 
-# Charger le dataset partagé
-dataset_path = os.environ.get('DATASET_PATH')
-if dataset_path:
-    checkpoint = torch.load(dataset_path)
-    dataset_state = checkpoint['dataset_state']
-    
-    # Créer un nouveau dataset avec les paramètres sauvegardés
-    train_dataset = StreamingDataset(
-        block_size=dataset_state['block_size'],
-        batch_size=dataset_state['batch_size'],
-        dataset_name=dataset_state['dataset_name'],
-        dataset_config=dataset_state['dataset_config'],
-        split=dataset_state['split'],
-        device=device
-    )
-    train_dataset.load_state_dict(dataset_state)
-    
-    # Si DDP, configurer le dataset pour le rang actuel
-    if ddp:
-        train_dataset.rank = ddp_rank
-        train_dataset.world_size = ddp_world_size
-else:
-    train_dataset = StreamingDataset(
-        block_size=block_size,
-        batch_size=batch_size,
-        device=device
-    )
-
-val_dataset = StreamingDataset(
-    block_size=block_size,
-    batch_size=batch_size,
-    dataset_name="HuggingFaceFW/fineweb-2",
-    dataset_config="fra_Latn",
-    split="test",
-    device=device
-)
+# Initialize datasets
+train_dataset, val_dataset = get_datasets(block_size, batch_size, device)
+print(f"vocab_size: {len(train_dataset.tokenizer)}")
 
 # Get vocab size from the dataset
 vocab_size = len(train_dataset.tokenizer)

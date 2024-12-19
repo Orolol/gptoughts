@@ -22,64 +22,28 @@ class StreamingDataset(IterableDataset):
         self.batch_size = batch_size
         self.device = device
         self.dataset_config = dataset_config
-        self.dataset_name = dataset_name
         self.split = split
         
-        # Initialize tokenizer
         access_token = os.getenv('HF_TOKEN')
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            "meta-llama/Llama-3.2-1B-Instruct", 
-            use_fast=True, 
-            access_token=access_token
-        )
+        
+        # Initialize tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True, access_token=access_token)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        # État pour le tracking des tokens
-        self.token_tracker = TokenTracker()
-        self.token_buffer = []
+        # Initialize dataset
+        self.dataset = load_dataset(dataset_name, name=dataset_config, split=split, streaming=True)
         
-        # Initialiser le dataset et l'iterator
-        self._init_dataset()
+        # Initialize token tracker
+        tracker_dir = os.path.join('data', 'token_tracking')
+        os.makedirs(tracker_dir, exist_ok=True)
+        self.token_tracker = TokenTracker()
+        
+        # Modifions la façon dont nous gérons le dataset
+        self.dataset_iterator = iter(self.dataset)
+        self.token_buffer = []
         
         # Save tokenizer metadata
         self.save_meta()
-    
-    def _init_dataset(self):
-        """Initialise ou réinitialise le dataset"""
-        self.dataset = load_dataset(
-            self.dataset_name, 
-            name=self.dataset_config, 
-            split=self.split, 
-            streaming=True
-        )
-        self.dataset_iterator = iter(self.dataset)
-    
-    def get_state_dict(self):
-        """Retourne l'état sérialisable du dataset"""
-        return {
-            'block_size': self.block_size,
-            'batch_size': self.batch_size,
-            'device': self.device,
-            'dataset_config': self.dataset_config,
-            'dataset_name': self.dataset_name,
-            'split': self.split,
-            'token_buffer': self.token_buffer,
-            'total_tokens': self.token_tracker.total_tokens
-        }
-    
-    def load_state_dict(self, state_dict):
-        """Charge l'état du dataset"""
-        self.block_size = state_dict['block_size']
-        self.batch_size = state_dict['batch_size']
-        self.device = state_dict['device']
-        self.dataset_config = state_dict['dataset_config']
-        self.dataset_name = state_dict['dataset_name']
-        self.split = state_dict['split']
-        self.token_buffer = state_dict['token_buffer']
-        self.token_tracker.total_tokens = state_dict['total_tokens']
-        
-        # Réinitialiser le dataset et l'iterator
-        self._init_dataset()
     
     def save_meta(self):
         meta = {
