@@ -341,15 +341,24 @@ if init_from == 'resume':
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
 
-# Initialize datasets
-train_dataset = StreamingDataset(
-    block_size=block_size,
-    batch_size=batch_size,
-    dataset_name="HuggingFaceFW/fineweb-2",
-    dataset_config="fra_Latn",
-    split="train",
-    device=device
-)
+# Charger le dataset partagé
+dataset_path = os.environ.get('DATASET_PATH')
+if dataset_path:
+    checkpoint = torch.load(dataset_path)
+    train_dataset = checkpoint['dataset']
+    train_dataset.device = device  # Mettre à jour le device
+    train_dataset.load_state_dict(checkpoint['iterator_state'])
+    
+    # Si DDP, configurer le dataset pour le rang actuel
+    if ddp:
+        train_dataset.rank = ddp_rank
+        train_dataset.world_size = ddp_world_size
+else:
+    train_dataset = StreamingDataset(
+        block_size=block_size,
+        batch_size=batch_size,
+        device=device
+    )
 
 val_dataset = StreamingDataset(
     block_size=block_size,
