@@ -330,7 +330,7 @@ if device_type == 'cuda':
     torch.cuda.set_per_process_memory_fraction(0.8)  # Utiliser 80% de la mémoire disponible
 
 # Configurer le gradient scaler
-scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16'))
+scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -506,6 +506,8 @@ while True:
         break
 
     # forward backward update, with optional gradient accumulation
+    optimizer.zero_grad(set_to_none=True)
+    
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
@@ -513,10 +515,8 @@ while True:
             logits, loss = model(encoder_input, decoder_input, target)
             if loss is not None:
                 loss = loss / gradient_accumulation_steps
-                # Scale the loss
-                scaled_loss = scaler.scale(loss)
-                # Backward pass with scaled loss
-                scaled_loss.backward()
+                # Scale the loss and perform backward pass
+                scaler.scale(loss).backward()
             else:
                 continue
             
@@ -526,16 +526,15 @@ while True:
             except StopIteration:
                 train_iterator = iter(train_dataset)
                 encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-        
-    # clip the gradient
+    
+    # After accumulation, unscale and clip gradients if needed
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
+    
+    # step the optimizer and scaler
     scaler.step(optimizer)
     scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
     t1 = time.time()
