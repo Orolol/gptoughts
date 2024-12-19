@@ -497,30 +497,32 @@ while True:
     # Track if we need to skip optimizer step
     skip_optimizer_step = False
     
+    # Déclarer les variables pour la prochaine itération
+    encoder_input_next, decoder_input_next, target_next = None, None, None
+    loss = None
+
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
-            # Only synchronize gradients in the last micro-step
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         
         with ctx:
-            logits, loss = model(encoder_input, decoder_input, target)
-            if loss is not None:
-                # Scale loss for gradient accumulation
-                loss = loss / gradient_accumulation_steps
-                # Scale and backward
-                scaled_loss = scaler.scale(loss)
+            logits, current_loss = model(encoder_input, decoder_input, target)
+            if current_loss is not None:
+                current_loss = current_loss / gradient_accumulation_steps
+                scaled_loss = scaler.scale(current_loss)
                 scaled_loss.backward()
+                loss = current_loss  # Retenir la dernière loss valable
             else:
                 skip_optimizer_step = True
                 break
-            
-            # immediately async prefetch next batch while model is doing the backward pass
+
+            # Préparer la prochaine itération : charger le batch suivant
             try:
                 encoder_input_next, decoder_input_next, target_next = next(train_iterator)
             except StopIteration:
                 train_iterator = iter(train_dataset)
                 encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-    
+
     if not skip_optimizer_step:
         if scaler.is_enabled() and scaler._scale is not None:
             if grad_clip != 0.0:
