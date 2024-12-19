@@ -330,7 +330,7 @@ if device_type == 'cuda':
     torch.cuda.set_per_process_memory_fraction(0.8)  # Utiliser 80% de la mémoire disponible
 
 # Configurer le gradient scaler
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'bfloat16'))
+scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -513,6 +513,10 @@ while True:
             logits, loss = model(encoder_input, decoder_input, target)
             if loss is not None:
                 loss = loss / gradient_accumulation_steps
+                # Scale the loss
+                scaled_loss = scaler.scale(loss)
+                # Backward pass with scaled loss
+                scaled_loss.backward()
             else:
                 continue
             
@@ -522,9 +526,6 @@ while True:
             except StopIteration:
                 train_iterator = iter(train_dataset)
                 encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-            
-            # backward pass, with gradient scaling if training in fp16
-            scaler.scale(loss).backward()
         
     # clip the gradient
     if grad_clip != 0.0:
