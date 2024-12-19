@@ -73,8 +73,8 @@ if torch.cuda.is_available():
     decoder_ratio_kv = 8
     
     # Optimisations mémoire
-    gradient_accumulation_steps = max(1, 32 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
-    # gradient_accumulation_steps = 1
+    # gradient_accumulation_steps = max(1, 32 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
+    gradient_accumulation_steps = 16
     
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
     dtype = 'bfloat16'
@@ -560,15 +560,15 @@ while True:
         elapsed = time.time() - train_start_time
         
         # Afficher les métriques de manière élégante
-        print(
-            f"[bold green]{iter_num}:[/bold green] "
-            f"loss {loss.item():.4f} | "
-            f"[yellow]{tokens_per_sec:.1f}[/yellow] t/s | "
-            f"[blue]{total_tokens/1e6:.1f}M[/blue] total t | "
-            f"lr {lr:.2e} | "
-            f"time {dt:.2f}s | "
-            f"total {elapsed/60:.2f}min"
-        )
+        # console.print(
+        #     f"[bold green]{iter_num}:[/bold green] "
+        #     f"loss {loss.item():.4f} | "
+        #     f"[yellow]{tokens_per_sec:.1f}[/yellow] t/s | "
+        #     f"[blue]{total_tokens/1e6:.1f}M[/blue] total t | "
+        #     f"lr {lr:.2e} | "
+        #     f"time {dt:.2f}s | "
+        #     f"total {elapsed/60:.2f}min"
+        # )
         
         # Simple print sans coloration
         print(f"iter_num: {iter_num}, loss: {loss.item():.4f}, tps: {tokens_per_sec:.1f} t/s, tt: {total_tokens/1e6:.1f}M, lr: {lr:.2e}, time: {dt:.2f}s, total: {elapsed/60:.2f}min")
