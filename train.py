@@ -339,7 +339,7 @@ if init_from == 'resume':
 
 # wrap model into DDP container
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=False)
+    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
 
 # Initialize datasets
 train_dataset, val_dataset = get_datasets(block_size, batch_size, device)
@@ -466,23 +466,35 @@ def profile_training_step(model, encoder_input, decoder_input, target, optimizer
         # Forward pass
         with record_function("forward"):
             with ctx:
-                logits, loss = model(encoder_input, decoder_input, target)
+                try:
+                    logits, loss = model(encoder_input, decoder_input, target)
+                except Exception as e:
+                    print(f"Forward pass failed: {e}")
+                    return None
         
         # Backward pass
         with record_function("backward"):
             if loss is not None:
-                scaled_loss = scaler.scale(loss)
-                scaled_loss.backward()
+                try:
+                    scaled_loss = scaler.scale(loss)
+                    scaled_loss.backward()
+                except Exception as e:
+                    print(f"Backward pass failed: {e}")
+                    return None
         
         # Optimizer step
         with record_function("optimizer"):
-            if scaler.is_enabled() and scaler._scale is not None:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            
-            optimizer.zero_grad(set_to_none=True)
+            try:
+                if scaler.is_enabled() and scaler._scale is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                
+                optimizer.zero_grad(set_to_none=True)
+            except Exception as e:
+                print(f"Optimizer step failed: {e}")
+                return None
     
     return prof
 
@@ -538,32 +550,38 @@ while True:
             optimizer, scaler, ctx
         )
         
-        print("\nProfiling results:")
-        print(prof.key_averages().table(
-            sort_by="cuda_time_total", row_limit=10))
-        
-        print("\nMemory stats:")
-        print(f"Allocated memory: {torch.cuda.memory_allocated() / 1024**2:.1f}MB")
-        print(f"Reserved memory: {torch.cuda.memory_reserved() / 1024**2:.1f}MB")
-        print(f"Max memory allocated: {torch.cuda.max_memory_allocated() / 1024**2:.1f}MB")
-        
-        # Temps par étape
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        
-        start_event.record()
-        # Une étape d'entraînement normale
-        with ctx:
-            logits, loss = model(encoder_input, decoder_input, target)
-            if loss is not None:
-                scaled_loss = scaler.scale(loss)
-                scaled_loss.backward()
-        end_event.record()
-        
-        torch.cuda.synchronize()
-        step_time = start_event.elapsed_time(end_event)
-        print(f"\nSingle step time: {step_time:.2f}ms")
-        print("=" * 40 + "\n")
+        if prof is not None:
+            print("\nProfiling results:")
+            print(prof.key_averages().table(
+                sort_by="cuda_time_total", row_limit=10))
+            
+            print("\nMemory stats:")
+            print(f"Allocated memory: {torch.cuda.memory_allocated() / 1024**2:.1f}MB")
+            print(f"Reserved memory: {torch.cuda.memory_reserved() / 1024**2:.1f}MB")
+            print(f"Max memory allocated: {torch.cuda.max_memory_allocated() / 1024**2:.1f}MB")
+            
+            # Temps par étape
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            
+            start_event.record()
+            # Une étape d'entraînement normale
+            with ctx:
+                try:
+                    logits, loss = model(encoder_input, decoder_input, target)
+                    if loss is not None:
+                        scaled_loss = scaler.scale(loss)
+                        scaled_loss.backward()
+                except Exception as e:
+                    print(f"Error during timing measurement: {e}")
+            end_event.record()
+            
+            torch.cuda.synchronize()
+            step_time = start_event.elapsed_time(end_event)
+            print(f"\nSingle step time: {step_time:.2f}ms")
+            print("=" * 40 + "\n")
+        else:
+            print("Profiling failed")
         
     # Continue avec le code normal d'entraînement
     optimizer.zero_grad(set_to_none=True)
