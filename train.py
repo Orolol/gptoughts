@@ -204,7 +204,7 @@ def generate_text(model, input, max_new_tokens=50, temperature=0.8):
         dtype = next(model.parameters()).dtype
         
     # S'assurer que le modèle et les tenseurs sont dans le même dtype
-    with torch.cuda.amp.autocast(enabled=True, dtype=dtype):
+    with torch.amp.autocast(enabled=True, dtype=dtype):
         # Générer token par token
         generated_tokens = model.generate(prompt_tokens, max_new_tokens=max_new_tokens, temperature=temperature)
     
@@ -501,7 +501,7 @@ while True:
         
         with ctx:
             # Utiliser torch.cuda.amp.autocast() pour les calculs mixtes
-            with torch.cuda.amp.autocast(enabled=True):
+            with torch.amp.autocast(enabled=True):
                 logits, current_loss = model(encoder_input, decoder_input, target)
                 
             if current_loss is not None:
