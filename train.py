@@ -522,7 +522,7 @@ while True:
                 encoder_input_next, decoder_input_next, target_next = next(train_iterator)
     
     if not skip_optimizer_step:
-        if scaler.is_enabled():
+        if scaler.is_enabled() and scaler._scale is not None:
             if grad_clip != 0.0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
