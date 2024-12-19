@@ -53,7 +53,7 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'  # Use LOCAL_RANK for DDP
-    batch_size = 32 # Scale batch size with number of GPUs
+    batch_size = 16  # Réduire la taille du batch
     block_size = 64
     
     print(f"Using device: {device}")
@@ -74,7 +74,7 @@ if torch.cuda.is_available():
     
     # Optimisations mémoire
     # gradient_accumulation_steps = max(1, 32 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
-    gradient_accumulation_steps = 1
+    gradient_accumulation_steps = 8  # Augmenter l'accumulation
     
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
     dtype = 'bfloat16'
@@ -131,6 +131,19 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
+    # Optimisations NCCL
+    os.environ["NCCL_DEBUG"] = "INFO"
+    os.environ["NCCL_IB_DISABLE"] = "0"
+    os.environ["NCCL_NET_GDR_LEVEL"] = "2"
+    os.environ["NCCL_P2P_DISABLE"] = "0"
+    os.environ["NCCL_MIN_NCHANNELS"] = "4"
+    os.environ["NCCL_SOCKET_IFNAME"] = "^docker0,lo"
+    os.environ["NCCL_BUFFSIZE"] = "2097152"
+    
+    # Réduire la fréquence de synchronisation
+    os.environ["NCCL_ALGO"] = "Ring"
+    os.environ["NCCL_PROTO"] = "Simple"
+    
     init_process_group(backend=backend)
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
@@ -328,6 +341,20 @@ if device_type == 'cuda':
     torch.cuda.empty_cache()
     torch.cuda.memory.empty_cache()
     torch.cuda.set_per_process_memory_fraction(0.8)  # Utiliser 80% de la mémoire disponible
+    
+    # Optimisations mémoire supplémentaires
+    torch.cuda.empty_cache()
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    
+    # Configurer la pagination de la mémoire
+    torch.cuda.set_per_process_memory_fraction(0.95)
+    
+    # Désactiver le gradient synchrone pour DDP
+    os.environ["NCCL_BLOCKING_WAIT"] = "0"
+    os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
 
 # Configurer le gradient scaler
 scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
@@ -343,9 +370,10 @@ if ddp:
         model, 
         device_ids=[ddp_local_rank],
         find_unused_parameters=True,
-        broadcast_buffers=False,  # Désactiver si pas nécessaire
-        gradient_as_bucket_view=True,  # Réduire la mémoire
-        static_graph=True  # Si le graphe de calcul est stable
+        broadcast_buffers=False,
+        gradient_as_bucket_view=True,
+        static_graph=True,
+        bucket_cap_mb=25  # Augmenter la taille des buckets
     )
 
 # Initialize datasets
@@ -600,26 +628,32 @@ while True:
 
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
+            # Ne synchroniser qu'à la dernière étape d'accumulation
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         
-        # Utiliser un stream séparé pour le transfert des données
-        with torch.cuda.stream(copy_stream):
-            try:
-                encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-            except StopIteration:
-                train_iterator = iter(train_dataset)
-                encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-        
-        # S'assurer que le calcul attend les données
-        copy_stream.synchronize()
-        
-        with ctx:
+        with torch.cuda.amp.autocast(enabled=True, dtype=ptdtype):
+            with torch.cuda.stream(copy_stream):
+                try:
+                    encoder_input_next, decoder_input_next, target_next = next(train_iterator)
+                except StopIteration:
+                    train_iterator = iter(train_dataset)
+                    encoder_input_next, decoder_input_next, target_next = next(train_iterator)
+            
+            # Attendre que les données soient prêtes
+            torch.cuda.current_stream().wait_stream(copy_stream)
+            
+            # Forward pass
             logits, current_loss = model(encoder_input, decoder_input, target)
             if current_loss is not None:
+                # Scale loss
                 current_loss = current_loss / gradient_accumulation_steps
+                
+                # Backward pass
                 scaled_loss = scaler.scale(current_loss)
                 scaled_loss.backward()
-                loss = current_loss  # Retenir la dernière loss valable
+                
+                # Mettre à jour loss pour le logging
+                loss = current_loss
         
         # Préparer la prochaine itération : charger le batch suivant
         try:
