@@ -548,7 +548,7 @@ class EncoderDecoderGPT(nn.Module):
             for _ in range(decoder_config.n_layer)
         ])
 
-    def forward(self, encoder_idx, decoder_idx, targets=None):
+    def forward(self, idx, targets=None):
         """
         Forward pass de l'architecture encoder-decoder.
         
@@ -557,6 +557,10 @@ class EncoderDecoderGPT(nn.Module):
             decoder_idx: Tensor d'indices pour le décodeur [batch_size, decoder_seq_len]
             targets: Tensor cible optionnel pour le calcul de la loss
         """
+        
+        encoder_idx = idx
+        decoder_idx = idx
+        
         # Vérifier les dimensions des entrées
         if encoder_idx.dim() == 4:
             encoder_idx = encoder_idx.squeeze(0)

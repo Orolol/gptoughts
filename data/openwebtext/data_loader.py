@@ -110,7 +110,7 @@ class StreamingDataset(IterableDataset):
         # Nettoie le buffer
         self.token_buffer = self.token_buffer[total_length*2:]
 
-        return encoder_input, decoder_input, target
+        return encoder_input, target
     
     def __iter__(self):
         while True:

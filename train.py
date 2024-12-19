@@ -18,55 +18,63 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from rich.console import Console
+from rich.progress import Progress
+from rich import print as rprint
 
 from model import GPTConfig, GPT, EncoderDecoderGPT
 from data.openwebtext.data_loader import StreamingDataset
+from config import TrainingConfig
 
-access_token=os.getenv('HF_TOKEN')
+# Initialize rich console for pretty printing
+console = Console()
+
+# Load configuration
+training_config = TrainingConfig()
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = 'out'
-eval_interval = 200
-log_interval = 1
-generate_interval = 100
-eval_iters = 200
-eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+out_dir = training_config.out_dir
+eval_interval = training_config.eval_interval
+log_interval = training_config.log_interval
+generate_interval = training_config.generate_interval
+eval_iters = training_config.eval_iters
+eval_only = training_config.eval_only # if True, script exits right after the first eval
+always_save_checkpoint = training_config.always_save_checkpoint # if True, always save a checkpoint after each eval
+init_from = training_config.init_from # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_log = training_config.wandb_log # disabled by default
+wandb_project = training_config.wandb_project
+wandb_run_name = training_config.wandb_run_name # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
-data_dir = 'data/openwebtext'
-gradient_accumulation_steps = 1 # used to simulate larger batch sizes
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear layers?
+dataset = training_config.dataset
+data_dir = training_config.data_dir
+gradient_accumulation_steps = training_config.gradient_accumulation_steps # used to simulate larger batch sizes
+dropout = training_config.dropout # for pretraining 0 is good, for finetuning try 0.1+
+bias = training_config.bias # do we use bias inside LayerNorm and Linear layers?
 
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = 'cuda:0'
-    batch_size = 8
-    block_size = 64
+    batch_size = training_config.batch_size
+    block_size = training_config.block_size
     
     # Encoder config (plus petit)
-    encoder_n_layer = 4
-    encoder_n_head = 8
-    encoder_n_embd = 768
-    encoder_ratio_kv = 8
+    encoder_n_layer = training_config.encoder_n_layer
+    encoder_n_head = training_config.encoder_n_head
+    encoder_n_embd = training_config.encoder_n_embd
+    encoder_ratio_kv = training_config.encoder_ratio_kv
     
     # Decoder config (plus grand)
-    decoder_n_layer = 12
-    decoder_n_head = 12
-    decoder_n_embd = 768
-    decoder_ratio_kv = 8
+    decoder_n_layer = training_config.decoder_n_layer
+    decoder_n_head = training_config.decoder_n_head
+    decoder_n_embd = training_config.decoder_n_embd
+    decoder_ratio_kv = training_config.decoder_ratio_kv
     
     # Optimisations mémoire
-    gradient_accumulation_steps = 1
-    dtype = 'bfloat16'
+    gradient_accumulation_steps = training_config.gradient_accumulation_steps
+    dtype = training_config.dtype
     
     # Activer la gestion de mémoire optimisée
     torch.cuda.empty_cache()
@@ -79,43 +87,39 @@ if torch.cuda.is_available():
     torch.cuda.set_device(device)
 else:
     device = 'cpu'
-    batch_size = 2
-    block_size = 64
+    batch_size = training_config.batch_size
+    block_size = training_config.block_size
     
     # Encoder config (minimal)
-    encoder_n_layer = 1
-    encoder_n_head = 1
-    encoder_n_embd = 2
-    encoder_ratio_kv = 1
+    encoder_n_layer = training_config.encoder_n_layer
+    encoder_n_head = training_config.encoder_n_head
+    encoder_n_embd = training_config.encoder_n_embd
+    encoder_ratio_kv = training_config.encoder_ratio_kv
     
     # Decoder config (minimal)
-    decoder_n_layer = 1
-    decoder_n_head = 1
-    decoder_n_embd = 2
-    decoder_ratio_kv = 1
+    decoder_n_layer = training_config.decoder_n_layer
+    decoder_n_head = training_config.decoder_n_head
+    decoder_n_embd = training_config.decoder_n_embd
+    decoder_ratio_kv = training_config.decoder_ratio_kv
 
 # adamw optimizer
-learning_rate = 3e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
-weight_decay = 0.1
-beta1 = 0.9
-beta2 = 0.95
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+learning_rate = training_config.learning_rate # max learning rate
+max_iters = training_config.max_iters # total number of training iterations
+weight_decay = training_config.weight_decay
+beta1 = training_config.beta1
+beta2 = training_config.beta2
+grad_clip = training_config.grad_clip # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
-decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+decay_lr = training_config.decay_lr # whether to decay the learning rate
+warmup_iters = training_config.warmup_iters # how many steps to warm up for
+lr_decay_iters = training_config.lr_decay_iters # should be ~= max_iters per Chinchilla
+min_lr = training_config.min_lr # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
-backend = 'nccl' # 'nccl', 'gloo', etc.
+backend = training_config.backend # 'nccl', 'gloo', etc.
 
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
-compile = False # use PyTorch 2.0 to compile the model to be faster
-# -----------------------------------------------------------------------------
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
-config = {k: globals()[k] for k in config_keys} # will be useful for logging
-# -----------------------------------------------------------------------------
+compile = training_config.compile # use PyTorch 2.0 to compile the model to be faster
+# ----------------------------------------------------------------------------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -152,7 +156,7 @@ import random
 import pickle
 import os
 
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True, access_token=access_token)
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True, access_token=training_config.access_token)
 tokenizer.pad_token = tokenizer.eos_token
 
 decode = lambda tokens: tokenizer.decode(tokens, skip_special_tokens=True)
@@ -254,8 +258,9 @@ if init_from == 'resume':
     else:
         # Extraire les numéros d'itération et trier
         def extract_iter_num(filename):
+            """Extrait le numéro d'itération d'un nom de fichier checkpoint."""
             try:
-                return int(filename.split('iter_')[1].split('_loss')[0])
+                return int(filename.split('ckpt_')[1].split('.pt')[0])
             except:
                 return 0
         
@@ -284,6 +289,18 @@ if init_from == 'scratch':
     model = EncoderDecoderGPT(encoder_config, decoder_config)
 
 model.to(device)
+
+# Wrap model in DDP if using distributed training
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+
+# Pour sauvegarder le modèle, nous avons besoin d'accéder au modèle sous-jacent
+raw_model = model.module if ddp else model
+
+# Initialize optimizer
+optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+if init_from == 'resume':
+    optimizer.load_state_dict(checkpoint['optimizer'])
 
 # Optimisations CUDA
 if device_type == 'cuda':
@@ -322,15 +339,6 @@ if device_type == 'cuda':
 # Configurer le gradient scaler
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'bfloat16'))
 
-# optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
-
-# wrap model into DDP container
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-
 # Initialize datasets
 train_dataset = StreamingDataset(
     block_size=block_size,
@@ -363,9 +371,9 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         valid_iters = 0
         for k in range(eval_iters):
-            encoder_input, decoder_input, target = next(iter(dataset))
+            X, Y = next(iter(dataset))
             with ctx:
-                logits, loss = model(encoder_input, decoder_input, target)
+                logits, loss = model(X, Y)
                 if loss is not None:
                     losses[valid_iters] = loss.item()
                     valid_iters += 1
@@ -389,7 +397,7 @@ def get_lr(it):
 # logging
 if wandb_log and master_process:
     import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    wandb.init(project=wandb_project, name=wandb_run_name, config=training_config)
 
 print("Initializing training loop...")
 
@@ -413,29 +421,25 @@ generation_thread = threading.Thread(
 )
 # generation_thread.start()
 
-# training loop
-train_iterator = iter(train_dataset)
-encoder_input, decoder_input, target = next(train_iterator)
+train_start_time = time.time()
+total_tokens = 0
+X, Y = next(iter(train_dataset)) # fetch first batch
 t0 = time.time()
-local_iter_num = 0
-raw_model = model.module if ddp else model
-running_mfu = -1.0
 
-print("Starting training...")
+def extract_iter_num(filename):
+    """Extrait le numéro d'itération d'un nom de fichier checkpoint."""
+    try:
+        return int(filename.split('ckpt_')[1].split('.pt')[0])
+    except:
+        return 0
 
 def cleanup_old_checkpoints(out_dir, keep_num=3):
     """Garde uniquement les 'keep_num' checkpoints les plus récents."""
-    checkpoints = glob.glob(os.path.join(out_dir, 'ckpt_iter_*.pt'))
+    checkpoints = glob.glob(os.path.join(out_dir, 'ckpt_*.pt'))
     if len(checkpoints) <= keep_num:
         return
         
     # Trier les checkpoints par numéro d'itération
-    def extract_iter_num(filename):
-        try:
-            return int(filename.split('iter_')[1].split('_loss')[0])
-        except:
-            return 0
-            
     checkpoints.sort(key=extract_iter_num)
     
     # Supprimer les checkpoints les plus anciens
@@ -446,27 +450,23 @@ def cleanup_old_checkpoints(out_dir, keep_num=3):
         except Exception as e:
             print(f"Error removing checkpoint {ckpt}: {e}")
 
-while True:
+for iter_num in range(iter_num, max_iters):
+    
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+    
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process and iter_num > 0:
-        print("Validation")
+    if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        # print the first token of the input
-        
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        print(f"Total tokens processed: {train_dataset.get_total_tokens():,}")
+        console.print(f"\n[bold cyan]Step {iter_num}:[/bold cyan] val loss {losses['val']:.4f}, train loss {losses['train']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
-                "train/loss": losses['train'],
                 "val/loss": losses['val'],
+                "train/loss": losses['train'],
                 "lr": lr,
-                "mfu": running_mfu*100,
-                "total_tokens": train_dataset.get_total_tokens()
             })
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
@@ -477,74 +477,67 @@ while True:
                     'model_args': model_args,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
-                    'config': config,
+                    'config': training_config.__dict__,
                 }
-                checkpoint_path = os.path.join(
-                    out_dir, 
-                    f'ckpt_iter_{iter_num}_loss_{losses["val"]:.4f}.pt'
-                )
-                print(f"saving checkpoint to {checkpoint_path}")
-                torch.save(checkpoint, checkpoint_path)
-                # Nettoyer les anciens checkpoints
-                cleanup_old_checkpoints(out_dir, keep_num=3)
-    if iter_num == 0 and eval_only:
-        break
+                save_path = os.path.join(out_dir, f'ckpt_{iter_num}.pt')
+                print(f"saving checkpoint to {save_path}")
+                torch.save(checkpoint, save_path)
+                cleanup_old_checkpoints(out_dir)
+    
 
-    # forward backward update, with optional gradient accumulation
+    
+    # forward backward update, with optional gradient accumulation to simulate larger batch size
+    # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
-        if ddp:
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
-            logits, loss = model(encoder_input, decoder_input, target)
-            if loss is not None:
-                loss = loss / gradient_accumulation_steps
+        if device_type == 'cuda':
+            # Transférer les tenseurs sur GPU de manière optimisée
+            if X.device.type == 'cpu':
+                X = X.pin_memory().to(device, non_blocking=True)
             else:
-                continue
-            
-            # immediately async prefetch next batch
-            try:
-                encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-            except StopIteration:
-                train_iterator = iter(train_dataset)
-                encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-            
-            # backward pass, with gradient scaling if training in fp16
-            scaler.scale(loss).backward()
+                X = X.to(device)
+            if Y.device.type == 'cpu':
+                Y = Y.pin_memory().to(device, non_blocking=True)
+            else:
+                Y = Y.to(device)
+        with ctx:
+            logits, loss = model(X, Y)
+            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+        # immediately async prefetch next batch while model is doing the forward pass on the GPU
+        X, Y = next(iter(train_dataset))
+        # backward pass, with gradient scaling if training in fp16
+        scaler.scale(loss).backward() if scaler else loss.backward()
         
+    if iter_num % log_interval == 0 and master_process:
+        # Calculer les métriques
+        dt = time.time() - t0
+        tokens_per_sec = batch_size * block_size / dt
+        total_tokens += batch_size * block_size
+        elapsed = time.time() - train_start_time
+        
+        # Afficher les métriques de manière élégante
+        console.print(
+            f"[bold green]iter {iter_num}:[/bold green] "
+            f"loss {loss.item():.4f} | "
+            f"[yellow]{tokens_per_sec:.1f}[/yellow] tokens/s | "
+            f"[blue]{total_tokens/1e6:.1f}M[/blue] total tokens | "
+            f"lr {lr:.2e} | "
+            f"time {elapsed/3600:.2f}h"
+        )
+    
     # clip the gradient
     if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
+        scaler.unscale_(optimizer) if scaler else None
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
+    scaler.step(optimizer) if scaler else optimizer.step()
+    if scaler:
+        scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if iter_num % log_interval == 0 and master_process:
-        
-        # Print the first token of the input
-        # print(f"First token of the input: {tokenizer.decode(encoder_input[0].tolist())}")
-        
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
-    if iter_num % generate_interval == 0 and master_process:
-        if generation_queue.empty():  # Pour éviter d'accumuler des requêtes
-            generation_queue.put(encoder_input.detach().clone())
-    iter_num += 1
-    local_iter_num += 1
-    encoder_input, decoder_input, target = encoder_input_next, decoder_input_next, target_next
+    t0 = time.time()
     
-    # if iter_num % 100 == 0:
-    #     generated = generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8)
-    #     print(f"\nGenerated text Q: {generated}\n")
-
     # termination conditions
     if iter_num > max_iters:
         break
