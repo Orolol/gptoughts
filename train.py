@@ -139,7 +139,6 @@ if ddp:
     torch.cuda.set_device(device)
     master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
     seed_offset = ddp_rank # each process gets a different seed
-    gradient_accumulation_steps //= ddp_world_size
 else:
     master_process = True
     seed_offset = 0
@@ -506,9 +505,14 @@ while True:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         
         with ctx:
+            # Debug prints
+            print(f"[Rank {ddp_rank}] Input shapes - encoder: {encoder_input.shape}, decoder: {decoder_input.shape}, target: {target.shape}")
+            print(f"[Rank {ddp_rank}] Input device: {encoder_input.device}")
+            
             logits, current_loss = model(encoder_input, decoder_input, target)
             if current_loss is None:
-                print("(DEBUG) current_loss is None → skipping optimizer step")
+                print(f"[Rank {ddp_rank}] current_loss is None → skipping optimizer step")
+                print(f"[Rank {ddp_rank}] logits shape: {logits.shape if logits is not None else None}")
                 skip_optimizer_step = True
                 break
             else:
@@ -611,3 +615,11 @@ if device_type == 'cuda':
     if hasattr(torch.cuda, 'memory_stats'):
         torch.cuda.memory_stats(device=device)
     torch.cuda.set_stream(torch.cuda.Stream())
+
+# Après l'initialisation des datasets
+if master_process:
+    print(f"Train dataset size: {len(train_dataset)}")
+    print(f"Val dataset size: {len(val_dataset)}")
+    # Vérifier un échantillon
+    sample_encoder, sample_decoder, sample_target = next(iter(train_dataset))
+    print(f"Sample batch shapes - encoder: {sample_encoder.shape}, decoder: {sample_decoder.shape}, target: {sample_target.shape}")
