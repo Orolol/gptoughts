@@ -339,7 +339,14 @@ if init_from == 'resume':
 
 # wrap model into DDP container
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
+    model = DDP(
+        model, 
+        device_ids=[ddp_local_rank],
+        find_unused_parameters=True,
+        broadcast_buffers=False,  # Désactiver si pas nécessaire
+        gradient_as_bucket_view=True,  # Réduire la mémoire
+        static_graph=True  # Si le graphe de calcul est stable
+    )
 
 # Initialize datasets
 train_dataset, val_dataset = get_datasets(block_size, batch_size, device)
@@ -595,18 +602,20 @@ while True:
         if ddp:
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         
+        # Utiliser un stream séparé pour le transfert des données
+        with torch.cuda.stream(copy_stream):
+            try:
+                encoder_input_next, decoder_input_next, target_next = next(train_iterator)
+            except StopIteration:
+                train_iterator = iter(train_dataset)
+                encoder_input_next, decoder_input_next, target_next = next(train_iterator)
+        
+        # S'assurer que le calcul attend les données
+        copy_stream.synchronize()
+        
         with ctx:
-            # Debug prints
-            # print(f"[Rank {ddp_rank}] Input shapes - encoder: {encoder_input.shape}, decoder: {decoder_input.shape}, target: {target.shape}")
-            # print(f"[Rank {ddp_rank}] Input device: {encoder_input.device}")
-            
             logits, current_loss = model(encoder_input, decoder_input, target)
-            if current_loss is None:
-                # print(f"[Rank {ddp_rank}] current_loss is None → skipping optimizer step")
-                # print(f"[Rank {ddp_rank}] logits shape: {logits.shape if logits is not None else None}")
-                skip_optimizer_step = True
-                break
-            else:
+            if current_loss is not None:
                 current_loss = current_loss / gradient_accumulation_steps
                 scaled_loss = scaler.scale(current_loss)
                 scaled_loss.backward()
