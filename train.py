@@ -507,21 +507,22 @@ while True:
         
         with ctx:
             logits, current_loss = model(encoder_input, decoder_input, target)
-            if current_loss is not None:
+            if current_loss is None:
+                print("(DEBUG) current_loss is None → skipping optimizer step")
+                skip_optimizer_step = True
+                break
+            else:
                 current_loss = current_loss / gradient_accumulation_steps
                 scaled_loss = scaler.scale(current_loss)
                 scaled_loss.backward()
                 loss = current_loss  # Retenir la dernière loss valable
-            else:
-                skip_optimizer_step = True
-                break
-
-            # Préparer la prochaine itération : charger le batch suivant
-            try:
-                encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-            except StopIteration:
-                train_iterator = iter(train_dataset)
-                encoder_input_next, decoder_input_next, target_next = next(train_iterator)
+        
+        # Préparer la prochaine itération : charger le batch suivant
+        try:
+            encoder_input_next, decoder_input_next, target_next = next(train_iterator)
+        except StopIteration:
+            train_iterator = iter(train_dataset)
+            encoder_input_next, decoder_input_next, target_next = next(train_iterator)
 
     if not skip_optimizer_step:
         if scaler.is_enabled() and scaler._scale is not None:
