@@ -501,7 +501,7 @@ while True:
         
         with ctx:
             # Utiliser torch.cuda.amp.autocast() pour les calculs mixtes
-            with torch.amp.autocast(enabled=True):
+            with torch.amp.autocast(enabled=True, dtype=dtype):
                 logits, current_loss = model(encoder_input, decoder_input, target)
                 
             if current_loss is not None:
