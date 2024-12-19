@@ -1,5 +1,5 @@
 # Core dependencies
-torch==2.4.0
+torch==2.4.1
 numpy>=1.24.0
 transformers>=4.30.0
 
