@@ -12,14 +12,12 @@ import threading
 from queue import Queue
 import gc
 import glob
-import argparse
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-import torch.multiprocessing as mp
 
 from model import GPTConfig, GPT, EncoderDecoderGPT
 from data.openwebtext.data_loader import StreamingDataset
@@ -52,71 +50,59 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 
 # Configurations pour l'encoder et le decoder
-def setup_device_config():
-    if torch.cuda.is_available():
-        n_gpus = torch.cuda.device_count()
-        if n_gpus > 1:
-            ddp_world_size = n_gpus
-            device = 'cuda'
-        else:
-            device = 'cuda:0'
-            ddp_world_size = 1
-            
-        batch_size = 32 // ddp_world_size  # Ajuster le batch size par GPU
-        block_size = 512
-        
-        # Encoder config
-        encoder_n_layer = 4
-        encoder_n_head = 8
-        encoder_n_embd = 768
-        encoder_ratio_kv = 8
-        
-        # Decoder config
-        decoder_n_layer = 12
-        decoder_n_head = 12
-        decoder_n_embd = 768
-        decoder_ratio_kv = 8
-        
-        # Optimisations mémoire
-        gradient_accumulation_steps = 1
-        dtype = 'bfloat16'
-        
-        torch.cuda.empty_cache()
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        
-    else:
-        device = 'cpu'
-        ddp_world_size = 1
-        batch_size = 2
-        block_size = 64
-        
-        # Configs minimales
-        encoder_n_layer = encoder_n_head = 1
-        encoder_n_embd = encoder_ratio_kv = 2
-        decoder_n_layer = decoder_n_head = 1
-        decoder_n_embd = decoder_ratio_kv = 2
-        
-    return (device, ddp_world_size, batch_size, block_size, 
-            encoder_n_layer, encoder_n_head, encoder_n_embd, encoder_ratio_kv,
-            decoder_n_layer, decoder_n_head, decoder_n_embd, decoder_ratio_kv)
-
-# Fonction pour initialiser le processus DDP
-def setup_ddp(rank, world_size):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    init_process_group(backend='nccl', rank=rank, world_size=world_size)
-
-# Fonction principale d'entraînement
-def train(rank, world_size, model_args):
-    setup_ddp(rank, world_size)
+if torch.cuda.is_available():
+    device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'  # Use LOCAL_RANK for DDP
+    batch_size = 32 # Scale batch size with number of GPUs
+    block_size = 64
     
-    # Déplacer le modèle sur le GPU approprié
-    torch.cuda.set_device(rank)
-    model = EncoderDecoderGPT(**model_args).to(rank)
-    model = DDP(model, device_ids=[rank])
+    print(f"Using device: {device}")
+    print(f"Batch size: {batch_size}")
+    print(f"Block size: {block_size}")
     
-    # ... reste de la logique d'entraînement ...
+    # Encoder config (plus petit)
+    encoder_n_layer = 4
+    encoder_n_head = 8
+    encoder_n_embd = 768
+    encoder_ratio_kv = 8
+    
+    # Decoder config (plus grand)
+    decoder_n_layer = 12
+    decoder_n_head = 12
+    decoder_n_embd = 768 
+    decoder_ratio_kv = 8
+    
+    # Optimisations mémoire
+    # gradient_accumulation_steps = max(1, 32 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
+    gradient_accumulation_steps = 1
+    
+    print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
+    dtype = 'bfloat16'
+    
+    # Activer la gestion de mémoire optimisée
+    torch.cuda.empty_cache()
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # Activer la mémoire partagée
+    if hasattr(torch.cuda, 'memory_stats'):
+        torch.cuda.memory_stats()
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))  # Set device based on LOCAL_RANK
+else:
+    device = 'cpu'
+    batch_size = 2
+    block_size = 64
+    
+    # Encoder config (minimal)
+    encoder_n_layer = 1
+    encoder_n_head = 1
+    encoder_n_embd = 2
+    encoder_ratio_kv = 1
+    
+    # Decoder config (minimal)
+    decoder_n_layer = 1
+    decoder_n_head = 1
+    decoder_n_embd = 2
+    decoder_ratio_kv = 1
 
 # adamw optimizer
 learning_rate = 3e-4 # max learning rate
@@ -136,6 +122,10 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
+config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+exec(open('configurator.py').read()) # overrides from command line or config file
+config = {k: globals()[k] for k in config_keys} # will be useful for logging
+# -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -153,6 +143,9 @@ else:
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
+
+tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
+print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -212,7 +205,7 @@ def generate_text(model, input, max_new_tokens=50, temperature=0.8):
         
     # S'assurer que le modèle et les tenseurs sont dans le même dtype
     with torch.cuda.amp.autocast(enabled=True, dtype=dtype):
-        # Gnérer token par token
+        # Générer token par token
         generated_tokens = model.generate(prompt_tokens, max_new_tokens=max_new_tokens, temperature=temperature)
     
     # Décoder les tokens générés
@@ -346,7 +339,7 @@ if init_from == 'resume':
 
 # wrap model into DDP container
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
 
 # Initialize datasets
 train_dataset = StreamingDataset(
@@ -467,71 +460,6 @@ def cleanup_old_checkpoints(out_dir, keep_num=3):
             print(f"Removed old checkpoint: {ckpt}")
         except Exception as e:
             print(f"Error removing checkpoint {ckpt}: {e}")
-
-def setup_memory_management(rank):
-    if torch.cuda.is_available():
-        # Configurer la mémoire pour ce GPU spécifique
-        torch.cuda.set_device(rank)
-        torch.cuda.empty_cache()
-        
-        # Réserver environ 80% de la mémoire disponible sur ce GPU
-        total_memory = torch.cuda.get_device_properties(rank).total_memory
-        torch.cuda.set_per_process_memory_fraction(0.8, rank)
-        
-        # Activer les optimisations CUDA
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-
-def parse_args():
-    parser = argparse.ArgumentParser(description='Training script with configurable batch size')
-    parser.add_argument('--batch_size', type=int, default=None, 
-                       help='Batch size for training. If not specified, uses default configuration.')
-    parser.add_argument('--multi_gpu', action='store_true',
-                       help='Enable automatic multi-GPU training')
-    return parser.parse_args()
-
-args = parse_args()
-
-if torch.cuda.is_available():
-    device = 'cuda:0'
-    # Utiliser la batch_size des arguments si spécifiée, sinon utiliser la valeur par défaut
-    batch_size = args.batch_size if args.batch_size is not None else 32
-    
-    if args.multi_gpu:
-        n_gpus = torch.cuda.device_count()
-        if n_gpus > 1:
-            print(f"Using {n_gpus} GPUs")
-            batch_size = batch_size // n_gpus  # Ajuster le batch size par GPU
-            print(f"Adjusted batch size per GPU: {batch_size}")
-    
-    block_size = 512
-    
-    # Encoder config (plus petit)
-    encoder_n_layer = 4
-    encoder_n_head = 8
-    encoder_n_embd = 768
-    encoder_ratio_kv = 8
-    
-    # Decoder config
-    decoder_n_layer = 12
-    decoder_n_head = 12
-    decoder_n_embd = 768
-    decoder_ratio_kv = 8
-    
-    # Optimisations mémoire
-    gradient_accumulation_steps = 1
-    dtype = 'bfloat16'
-    
-    torch.cuda.empty_cache()
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    
-else:
-    device = 'cpu'
-    # Même logique pour CPU
-    batch_size = args.batch_size if args.batch_size is not None else 2
-    block_size = 64
-    # ... (reste de la configuration CPU)
 
 while True:
     # determine and set the learning rate for this iteration
@@ -682,21 +610,3 @@ if device_type == 'cuda':
     if hasattr(torch.cuda, 'memory_stats'):
         torch.cuda.memory_stats(device=device)
     torch.cuda.set_stream(torch.cuda.Stream())
-
-if __name__ == '__main__':
-    # Obtenir la configuration
-    (device, ddp_world_size, batch_size, block_size,
-     encoder_n_layer, encoder_n_head, encoder_n_embd, encoder_ratio_kv,
-     decoder_n_layer, decoder_n_head, decoder_n_embd, decoder_ratio_kv) = setup_device_config()
-
-    if ddp_world_size > 1:
-        # Lancer l'entraînement multi-GPU
-        mp.spawn(
-            train,
-            args=(ddp_world_size, model_args),
-            nprocs=ddp_world_size,
-            join=True
-        )
-    else:
-        # Entraînement single-GPU ou CPU
-        train(0, 1, model_args)
