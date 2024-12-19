@@ -26,12 +26,11 @@ def init_dataset():
             device='cpu'  # Initialiser sur CPU d'abord
         )
         
-        # Sauvegarder le dataset et son état
+        # Sauvegarder uniquement l'état sérialisable
         torch.save({
-            'dataset': dataset,
-            'iterator_state': dataset.get_state_dict()
+            'dataset_state': dataset.get_state_dict()
         }, dataset_path)
-        print("Dataset initialized and saved.")
+        print("Dataset state initialized and saved.")
     
     return dataset_path
 
