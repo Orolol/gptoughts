@@ -73,8 +73,8 @@ if torch.cuda.is_available():
     decoder_ratio_kv = 8
     
     # Optimisations mémoire
-    # gradient_accumulation_steps = max(1, 32 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
-    gradient_accumulation_steps = 1
+    gradient_accumulation_steps = max(1, 32 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
+    # gradient_accumulation_steps = 1
     
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
     dtype = 'bfloat16'
@@ -506,13 +506,13 @@ while True:
         
         with ctx:
             # Debug prints
-            print(f"[Rank {ddp_rank}] Input shapes - encoder: {encoder_input.shape}, decoder: {decoder_input.shape}, target: {target.shape}")
-            print(f"[Rank {ddp_rank}] Input device: {encoder_input.device}")
+            # print(f"[Rank {ddp_rank}] Input shapes - encoder: {encoder_input.shape}, decoder: {decoder_input.shape}, target: {target.shape}")
+            # print(f"[Rank {ddp_rank}] Input device: {encoder_input.device}")
             
             logits, current_loss = model(encoder_input, decoder_input, target)
             if current_loss is None:
-                print(f"[Rank {ddp_rank}] current_loss is None → skipping optimizer step")
-                print(f"[Rank {ddp_rank}] logits shape: {logits.shape if logits is not None else None}")
+                # print(f"[Rank {ddp_rank}] current_loss is None → skipping optimizer step")
+                # print(f"[Rank {ddp_rank}] logits shape: {logits.shape if logits is not None else None}")
                 skip_optimizer_step = True
                 break
             else:
@@ -569,6 +569,9 @@ while True:
             f"time {dt:.2f}s | "
             f"total {elapsed/60:.2f}min"
         )
+        
+        # Simple print sans coloration
+        print(f"iter_num: {iter_num}, loss: {loss.item():.4f}, tps: {tokens_per_sec:.1f} t/s, tt: {total_tokens/1e6:.1f}M, lr: {lr:.2e}, time: {dt:.2f}s, total: {elapsed/60:.2f}min")
         
     if iter_num % generate_interval == 0 and master_process:
         if generation_queue.empty():  # Pour éviter d'accumuler des requêtes
