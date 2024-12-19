@@ -339,7 +339,7 @@ if init_from == 'resume':
 
 # wrap model into DDP container
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
+    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=False)
 
 # Initialize datasets
 train_dataset, val_dataset = get_datasets(block_size, batch_size, device)
@@ -446,6 +446,46 @@ def cleanup_old_checkpoints(out_dir, keep_num=3):
         except Exception as e:
             print(f"Error removing checkpoint {ckpt}: {e}")
 
+# Ajouter ces imports au début du fichier
+from torch.profiler import profile, record_function, ProfilerActivity
+import time
+
+# Ajouter cette fonction après la fonction estimate_loss()
+def profile_training_step(model, encoder_input, decoder_input, target, optimizer, scaler, ctx):
+    """Profile une étape d'entraînement complète"""
+    with profile(
+        activities=[
+            ProfilerActivity.CPU,
+            ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+        with_flops=True
+    ) as prof:
+        # Forward pass
+        with record_function("forward"):
+            with ctx:
+                logits, loss = model(encoder_input, decoder_input, target)
+        
+        # Backward pass
+        with record_function("backward"):
+            if loss is not None:
+                scaled_loss = scaler.scale(loss)
+                scaled_loss.backward()
+        
+        # Optimizer step
+        with record_function("optimizer"):
+            if scaler.is_enabled() and scaler._scale is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            
+            optimizer.zero_grad(set_to_none=True)
+    
+    return prof
+
 while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -490,10 +530,43 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    # forward backward update, with optional gradient accumulation
+    # Profiling périodique (toutes les 100 itérations)
+    if iter_num % 100 == 0 and master_process:
+        print("\n=== Starting profiling for iteration", iter_num, "===")
+        prof = profile_training_step(
+            model, encoder_input, decoder_input, target,
+            optimizer, scaler, ctx
+        )
+        
+        print("\nProfiling results:")
+        print(prof.key_averages().table(
+            sort_by="cuda_time_total", row_limit=10))
+        
+        print("\nMemory stats:")
+        print(f"Allocated memory: {torch.cuda.memory_allocated() / 1024**2:.1f}MB")
+        print(f"Reserved memory: {torch.cuda.memory_reserved() / 1024**2:.1f}MB")
+        print(f"Max memory allocated: {torch.cuda.max_memory_allocated() / 1024**2:.1f}MB")
+        
+        # Temps par étape
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        start_event.record()
+        # Une étape d'entraînement normale
+        with ctx:
+            logits, loss = model(encoder_input, decoder_input, target)
+            if loss is not None:
+                scaled_loss = scaler.scale(loss)
+                scaled_loss.backward()
+        end_event.record()
+        
+        torch.cuda.synchronize()
+        step_time = start_event.elapsed_time(end_event)
+        print(f"\nSingle step time: {step_time:.2f}ms")
+        print("=" * 40 + "\n")
+        
+    # Continue avec le code normal d'entraînement
     optimizer.zero_grad(set_to_none=True)
-    
-    # Track if we need to skip optimizer step
     skip_optimizer_step = False
     
     # Déclarer les variables pour la prochaine itération
