@@ -53,7 +53,7 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'  # Use LOCAL_RANK for DDP
-    batch_size = 32 # Scale batch size with number of GPUs
+    batch_size = 8 # Scale batch size with number of GPUs
     block_size = 64
     
     print(f"Using device: {device}")
@@ -560,7 +560,7 @@ while True:
         elapsed = time.time() - train_start_time
         
         # Afficher les métriques de manière élégante
-        console.print(
+        print(
             f"[bold green]{iter_num}:[/bold green] "
             f"loss {loss.item():.4f} | "
             f"[yellow]{tokens_per_sec:.1f}[/yellow] t/s | "
