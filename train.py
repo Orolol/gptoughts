@@ -508,33 +508,41 @@ while True:
     # forward backward update, with optional gradient accumulation
     optimizer.zero_grad(set_to_none=True)
     
+    # Track if we need to skip optimizer step
+    skip_optimizer_step = False
+    
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
+            # Only synchronize gradients in the last micro-step
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+        
         with ctx:
             logits, loss = model(encoder_input, decoder_input, target)
             if loss is not None:
+                # Scale loss for gradient accumulation
                 loss = loss / gradient_accumulation_steps
-                # Scale the loss and perform backward pass
-                scaler.scale(loss).backward()
+                # Scale and backward
+                scaled_loss = scaler.scale(loss)
+                scaled_loss.backward()
             else:
-                continue
+                skip_optimizer_step = True
+                break
             
-            # immediately async prefetch next batch
+            # immediately async prefetch next batch while model is doing the backward pass
             try:
                 encoder_input_next, decoder_input_next, target_next = next(train_iterator)
             except StopIteration:
                 train_iterator = iter(train_dataset)
                 encoder_input_next, decoder_input_next, target_next = next(train_iterator)
     
-    # After accumulation, unscale and clip gradients if needed
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    
-    # step the optimizer and scaler
-    scaler.step(optimizer)
-    scaler.update()
+    if not skip_optimizer_step:
+        if grad_clip != 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        
+        # Step the optimizer and update the scaler
+        scaler.step(optimizer)
+        scaler.update()
 
     # timing and logging
     t1 = time.time()
