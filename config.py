@@ -31,8 +31,8 @@ class TrainingConfig:
         
         # Training
         if self.device == 'cuda':
-            self.batch_size = 8 * max(1, self.n_gpus)  # Scale with number of GPUs
-            self.block_size = 64
+            self.batch_size = 32 * max(1, self.n_gpus)  # Scale with number of GPUs
+            self.block_size = 512
             
             # Encoder config
             self.encoder_n_layer = 4

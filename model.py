@@ -478,24 +478,30 @@ class GPT(nn.Module):
         Note:
             Make sure the model is in eval() mode before generation.
         """
+        B, T = idx.size()
+        
+        # Forcer le mode d'évaluation
+        self.eval()
+        
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
+            # Si la séquence est trop longue, on la tronque
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-
+            
+            # Forward pass
+            with torch.no_grad():
+                logits, _ = self.forward(idx_cond)
+                logits = logits[:, -1, :] / temperature  # Prendre seulement le dernier token
+                
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = float('-inf')
+                
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+            
+            # Ajouter le nouveau token
+            idx = torch.cat([idx, idx_next], dim=1)
+        
         return idx
 
     @staticmethod
@@ -683,50 +689,28 @@ class EncoderDecoderGPT(nn.Module):
             temperature: Température pour l'échantillonnage
             top_k: Nombre de tokens les plus probables à considérer
         """
-        # Initialiser le tenseur de sortie du décodeur avec le token de début
-        decoder_idx = torch.full((idx.size(0), 1), 
-                               self.shared_embedding.weight.size(0)-1,  # EOS token 
-                               dtype=torch.long, 
-                               device=idx.device)
+        B, T = idx.size()
         
-        # Encoder une seule fois la séquence d'entrée
-        with torch.no_grad():
-            # Préparer l'entrée de l'encodeur
-            encoder_seq_len = min(idx.size(1), self.encoder.config.block_size)
-            idx = idx[:, :encoder_seq_len]
-            
-            # Générer les positions pour l'encodeur
-            encoder_pos = torch.arange(0, encoder_seq_len, dtype=torch.long, device=idx.device)
-            
-            # Forward pass de l'encodeur
-            tok_emb = self.shared_embedding(idx)
-            pos_emb = self.shared_pos_embedding(encoder_pos)
-            pos_emb = pos_emb.unsqueeze(0).expand(tok_emb.size(0), -1, -1)
-            
-            x = self.encoder.transformer.drop(tok_emb + pos_emb)
-            for block in self.encoder.transformer.h:
-                x = block(x)
-            encoder_hidden = self.encoder.transformer.ln_f(x)
+        # Forcer le mode d'évaluation
+        self.eval()
         
-        # Génération auto-régressive
         for _ in range(max_new_tokens):
-            # Limiter la taille de la séquence du décodeur si nécessaire
-            if decoder_idx.size(1) > self.decoder.config.block_size:
-                decoder_idx = decoder_idx[:, -self.decoder.config.block_size:]
+            # Si la séquence est trop longue, on la tronque
+            idx_cond = idx if idx.size(1) <= self.decoder.config.block_size else idx[:, -self.decoder.config.block_size:]
             
-            # Forward pass complet
-            logits, _ = self(idx, decoder_idx)
+            # Forward pass
+            with torch.no_grad():
+                logits, _ = self.forward(idx_cond)
+                logits = logits[:, -1, :] / temperature  # Prendre seulement le dernier token
+                
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = float('-inf')
+                
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
             
-            # Échantillonnage du prochain token
-            logits = logits[:, -1, :] / temperature
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            
-            # Concaténer le nouveau token
-            decoder_idx = torch.cat((decoder_idx, idx_next), dim=1)
+            # Ajouter le nouveau token
+            idx = torch.cat([idx, idx_next], dim=1)
         
-        return decoder_idx
+        return idx

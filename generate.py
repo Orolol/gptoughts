@@ -13,6 +13,7 @@ GENERATION_OUTPUT_DIR = 'generations'
 NUM_GENERATIONS = 10
 MAX_NEW_TOKENS = 50
 TEMPERATURE = 0.8
+TOP_K = 50  # Ajouter la valeur de TOP_K
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Prompt templates
@@ -70,48 +71,36 @@ def load_model_from_checkpoint(checkpoint_path, device):
 def generate_samples(model, tokenizer, device):
     """Génère des échantillons de texte pour chaque prompt"""
     generations = []
-    
-    # Détecter le dtype du modèle
     model_dtype = next(model.parameters()).dtype
-    print(f"Model dtype: {model_dtype}")
     
     for prompt in PROMPT_TEMPLATES:
-        # Encoder le prompt
-        input_ids = torch.tensor(
-            tokenizer.encode(prompt, add_special_tokens=False),
-            dtype=torch.long,
-            device=device
-        ).unsqueeze(0)
-        
         try:
+            # Préparer l'entrée
+            input_ids = torch.tensor(
+                tokenizer.encode(prompt, add_special_tokens=False),
+                dtype=torch.long,
+                device=device
+            ).unsqueeze(0)  # Ajouter la dimension batch
+            
             # Générer le texte avec gestion des types
-            with torch.no_grad(), torch.cuda.amp.autocast(enabled=True, dtype=model_dtype):
+            with torch.no_grad(), torch.amp.autocast('cuda', dtype=model_dtype):
                 output_ids = model.generate(
                     input_ids,
                     max_new_tokens=MAX_NEW_TOKENS,
-                    temperature=TEMPERATURE
+                    temperature=TEMPERATURE,
+                    top_k=TOP_K
                 )
-            
-            # Convertir le tensor en liste Python avant le décodage
-            if isinstance(output_ids, torch.Tensor):
-                output_ids = output_ids.cpu().tolist()
             
             # Décoder le texte généré
             generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
             generations.append({
                 'prompt': prompt,
-                'generated': generated_text,
-                'output_length': len(output_ids[0])  # Ajouter des métriques utiles
+                'generated': generated_text
             })
-            print(f"{prompt} {generated_text}")
+            print(f"{generated_text}\n")
             
         except Exception as e:
             print(f"Error generating text for prompt '{prompt}': {str(e)}")
-            generations.append({
-                'prompt': prompt,
-                'generated': f"ERROR: {str(e)}",
-                'error': str(e)
-            })
             continue
     
     return generations
@@ -139,7 +128,7 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     
     # Trouver tous les checkpoints et les trier par numéro d'itération
-    checkpoints = glob.glob(os.path.join(CHECKPOINT_DIR, 'ckpt_iter_*.pt'))
+    checkpoints = glob.glob(os.path.join(CHECKPOINT_DIR, '*.pt'))
     checkpoints.sort(key=extract_iter_num)
     
     if not checkpoints:

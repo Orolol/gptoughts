@@ -521,7 +521,7 @@ for iter_num in range(iter_num, max_iters):
             f"[yellow]{tokens_per_sec:.1f}[/yellow] tokens/s | "
             f"[blue]{total_tokens/1e6:.1f}M[/blue] total tokens | "
             f"lr {lr:.2e} | "
-            f"time {elapsed/3600:.2f}h"
+            f"time {elapsed/60:.2f}min"
         )
     
     # clip the gradient
