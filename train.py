@@ -562,7 +562,8 @@ while True:
             f"[yellow]{tokens_per_sec:.1f}[/yellow] tokens/s | "
             f"[blue]{total_tokens/1e6:.1f}M[/blue] total tokens | "
             f"lr {lr:.2e} | "
-            f"time {elapsed/60:.2f}min"
+            f"time {dt:.2f}s | "
+            f"total time {elapsed/60:.2f}min"
         )
         
     if iter_num % generate_interval == 0 and master_process:
