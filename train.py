@@ -557,13 +557,13 @@ while True:
         
         # Afficher les métriques de manière élégante
         console.print(
-            f"[bold green]iter {iter_num}:[/bold green] "
+            f"[bold green]{iter_num}:[/bold green] "
             f"loss {loss.item():.4f} | "
-            f"[yellow]{tokens_per_sec:.1f}[/yellow] tokens/s | "
-            f"[blue]{total_tokens/1e6:.1f}M[/blue] total tokens | "
+            f"[yellow]{tokens_per_sec:.1f}[/yellow] t/s | "
+            f"[blue]{total_tokens/1e6:.1f}M[/blue] total t | "
             f"lr {lr:.2e} | "
             f"time {dt:.2f}s | "
-            f"total time {elapsed/60:.2f}min"
+            f"total {elapsed/60:.2f}min"
         )
         
     if iter_num % generate_interval == 0 and master_process:
