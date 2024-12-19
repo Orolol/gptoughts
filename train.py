@@ -22,16 +22,19 @@ from torch.distributed import init_process_group, destroy_process_group
 from model import GPTConfig, GPT, EncoderDecoderGPT
 from data.openwebtext.data_loader import StreamingDataset
 
+from rich.console import Console
+console = Console()
+
 access_token=os.getenv('HF_TOKEN')
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 200
+eval_interval = 1000
 log_interval = 1
 generate_interval = 100
-eval_iters = 200
+eval_iters = 100
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
@@ -423,6 +426,11 @@ running_mfu = -1.0
 
 print("Starting training...")
 
+
+train_start_time = time.time()
+total_tokens = 0
+t0 = time.time()
+
 def cleanup_old_checkpoints(out_dir, keep_num=3):
     """Garde uniquement les 'keep_num' checkpoints les plus récents."""
     checkpoints = glob.glob(os.path.join(out_dir, 'ckpt_iter_*.pt'))
@@ -532,8 +540,24 @@ while True:
         
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+        
+
         lossf = loss.item() * gradient_accumulation_steps
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms")
+        dt = time.time() - t0
+        tokens_per_sec = batch_size * block_size / dt
+        total_tokens += batch_size * block_size
+        elapsed = time.time() - train_start_time
+        
+        # Afficher les métriques de manière élégante
+        console.print(
+            f"[bold green]iter {iter_num}:[/bold green] "
+            f"loss {loss.item():.4f} | "
+            f"[yellow]{tokens_per_sec:.1f}[/yellow] tokens/s | "
+            f"[blue]{total_tokens/1e6:.1f}M[/blue] total tokens | "
+            f"lr {lr:.2e} | "
+            f"time {elapsed/60:.2f}min"
+        )
+        
     if iter_num % generate_interval == 0 and master_process:
         if generation_queue.empty():  # Pour éviter d'accumuler des requêtes
             generation_queue.put(encoder_input.detach().clone())
