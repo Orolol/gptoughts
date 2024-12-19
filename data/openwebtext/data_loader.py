@@ -24,6 +24,15 @@ class StreamingDataset(IterableDataset):
         self.dataset_config = dataset_config
         self.split = split
         
+        # Initialize tokenizer first
+        access_token = os.getenv('HF_TOKEN')
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "meta-llama/Llama-3.2-1B-Instruct", 
+            use_fast=True, 
+            access_token=access_token
+        )
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+        
         # Initialisation du dataset partagé
         self._init_shared_dataset(dataset_name, dataset_config, split)
         
@@ -48,13 +57,16 @@ class StreamingDataset(IterableDataset):
         """Retourne l'état du dataset pour la sauvegarde"""
         return {
             'token_buffer': self.token_buffer,
-            'total_tokens': self.token_tracker.total_tokens
+            'total_tokens': self.token_tracker.total_tokens,
+            'tokenizer': self.tokenizer  # Ajouter le tokenizer à l'état
         }
     
     def load_state_dict(self, state_dict):
         """Charge l'état du dataset"""
         self.token_buffer = state_dict['token_buffer']
         self.token_tracker.total_tokens = state_dict['total_tokens']
+        if 'tokenizer' in state_dict:
+            self.tokenizer = state_dict['tokenizer']
     
     def save_meta(self):
         meta = {
