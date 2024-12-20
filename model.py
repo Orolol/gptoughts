@@ -204,21 +204,27 @@ class CausalSelfAttention(nn.Module):
                     # Convert to correct dtype for Flash Attention 2
                     target_dtype = torch.bfloat16
                     
-                    # Ensure q, k, v are in the correct dtype
+                    # For GQA, we need to repeat k,v heads before stacking
+                    if not is_generation:
+                        k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                        v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                    
+                    # Ensure q, k, v are in the correct dtype and shape
+                    # q: [batch, num_heads, seq_len, head_dim]
+                    # k,v: [batch, num_heads, seq_len, head_dim] (after repeat_interleave)
                     q = q.to(target_dtype)
                     k = k.to(target_dtype)
                     v = v.to(target_dtype)
                     
-                    # Prepare QKV for flash attention
-                    # [batch, seqlen, 3, num_heads, head_dim]
-                    qkv = torch.stack([q, k, v], dim=2)
-                    qkv = qkv.transpose(1, 3)  # [batch, num_heads, 3, seqlen, head_dim]
+                    # Reshape tensors for Flash Attention
+                    # [batch_size, seq_len, num_heads, head_dim]
+                    q = q.transpose(1, 2)
+                    k = k.transpose(1, 2)
+                    v = v.transpose(1, 2)
                     
                     # Create attention mask for variable sequence lengths if needed
                     if mask is not None:
-                        # Create attention mask
                         attention_mask = torch.ones((B, T), dtype=torch.bool, device=q.device)
-                        # Convert to cuda contiguous format
                         cu_seqlens = torch.arange(0, (B + 1) * T, step=T, dtype=torch.int32, device=q.device)
                         max_seqlen = T
                     else:
@@ -228,16 +234,15 @@ class CausalSelfAttention(nn.Module):
                     
                     # Call Flash Attention 2
                     output = flash_attn_func_2(
-                        qkv,
+                        q, k, v,
                         cu_seqlens=cu_seqlens,
                         max_seqlen=max_seqlen,
                         dropout_p=self.attn_dropout.p if self.training else 0.0,
                         causal=True
                     )
                     
-                    # Reshape output
-                    output = output.transpose(1, 2).contiguous()
-                    y = output.view(B, T, -1)
+                    # Reshape output back to [batch, seq_len, num_heads * head_dim]
+                    y = output.reshape(B, T, -1)
                     
                     # Convert back to original dtype
                     y = y.to(orig_dtype)
