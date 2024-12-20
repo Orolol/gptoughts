@@ -24,8 +24,7 @@ import torch.utils.checkpoint as checkpoint
 
 # Try to import flash attention 2, but don't fail if not available
 try:
-    from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func as flash_attn_func_2
-    from flash_attn.bert_padding import unpad_input, pad_input
+    from flash_attn import flash_attn_func as flash_attn_func_2
     print("Flash Attention 2 available")
     FLASH_ATTN_AVAILABLE_2 = True
 except ImportError:
