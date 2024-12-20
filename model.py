@@ -204,19 +204,23 @@ class CausalSelfAttention(nn.Module):
                     # Convert to correct dtype for Flash Attention 2
                     target_dtype = torch.bfloat16
                     
-                    # For GQA, we need to repeat k,v heads before stacking
-                    if not is_generation:
-                        k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                        v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                    
                     # Ensure q, k, v are in the correct dtype and shape
-                    q = q.to(target_dtype)
-                    k = k.to(target_dtype)
-                    v = v.to(target_dtype)
+                    q = q.to(target_dtype)  # [batch, n_head, seq_len, head_dim]
+                    k = k.to(target_dtype)  # [batch, n_head_kv, seq_len, head_dim]
+                    v = v.to(target_dtype)  # [batch, n_head_kv, seq_len, head_dim]
+                    
+                    # Transpose to [batch, seq_len, n_head, head_dim]
+                    q = q.transpose(1, 2)
+                    k = k.transpose(1, 2)
+                    v = v.transpose(1, 2)
                     
                     # Pack the tensors into qkv
                     # [batch_size, seq_len, 3, num_heads, head_dim]
-                    qkv = torch.stack([q, k, v], dim=2)
+                    qkv = torch.stack([
+                        q,  # [batch, seq_len, n_head, head_dim]
+                        k.repeat_interleave(self.n_head // self.n_head_kv, dim=2) if not is_generation else k,  # Repeat for GQA
+                        v.repeat_interleave(self.n_head // self.n_head_kv, dim=2) if not is_generation else v   # Repeat for GQA
+                    ], dim=2)
                     
                     # Create attention mask for variable sequence lengths if needed
                     if mask is not None:
