@@ -57,7 +57,7 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'  # Use LOCAL_RANK for DDP
-    batch_size = 16  # Réduire la taille du batch
+    batch_size = 64  # Réduire la taille du batch
     block_size = 512
     
     print(f"Using device: {device}")
@@ -77,8 +77,8 @@ if torch.cuda.is_available():
     decoder_ratio_kv = 8
     
     # Optimisations mémoire
-    gradient_accumulation_steps = max(1, 64 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
-    # gradient_accumulation_steps = 32  # Augmenter l'accumulation
+    # gradient_accumulation_steps = max(1, 64 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
+    gradient_accumulation_steps = 8  # Augmenter l'accumulation
     
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
     dtype = 'bfloat16'
@@ -188,57 +188,11 @@ tokenizer.pad_token = tokenizer.eos_token
 
 decode = lambda tokens: tokenizer.decode(tokens, skip_special_tokens=True)
 
-# Liste de débuts de phrases
-PROMPT_TEMPLATES = [
-    "Il était une fois",
-    "Dans un futur lointain",
-    "Le roi dit",
-    "Elle le regarda et",
-    "Au fond de la forêt",
-    "Quand le soleil se leva",
-    "Le vieux sorcier",
-    "Dans le château",
-    "Le dragon",
-    "Au bord de la rivière"
-]
 
-@torch.no_grad()
-def generate_text(model, input, max_new_tokens=50, temperature=0.8):
-    model.eval()
-    
-    # Choisir un début de phrase aléatoire et l'encoder
-    prompt = random.choice(PROMPT_TEMPLATES)
-    prompt_tokens = torch.tensor(
-        tokenizer.encode(prompt, add_special_tokens=False), 
-        dtype=torch.long, 
-        device=input.device
-    )
-    
-    # Ajouter la dimension de batch
-    prompt_tokens = prompt_tokens.unsqueeze(0)  # [1, seq_len]
-    
-    # Convertir au même dtype que le modèle
-    if hasattr(model, 'dtype'):
-        dtype = model.dtype
-    else:
-        # Détecter le dtype à partir des paramètres du modèle
-        dtype = next(model.parameters()).dtype
-        
-    # S'assurer que le modèle et les tenseurs sont dans le même dtype
-    with torch.amp.autocast(enabled=True, dtype=dtype):
-        # Générer token par token
-        generated_tokens = model.generate(prompt_tokens, max_new_tokens=max_new_tokens, temperature=temperature)
-    
-    # Décoder les tokens générés
-    decoded_text = decode(generated_tokens[0].tolist())
-    
-    model.train()
-    return prompt + " " + decoded_text  # Retourner directement le texte décodé
 
 # init these up here, can override if init_from='resume'
 iter_num = 0
 best_val_loss = 1e9
-
 
 # model init
 vocab_size = len(tokenizer)
@@ -404,7 +358,9 @@ if device_type == 'cuda':
 scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2, beta3), device_type)
+#  optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2, beta3), device_type)
+optimizer = model.configure_optimizers_adamw(weight_decay, learning_rate, (beta1, beta2), device_type)
+
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 
