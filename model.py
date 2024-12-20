@@ -198,63 +198,14 @@ class CausalSelfAttention(nn.Module):
 
             if self.flash:
                 try:
-                    # Convert to correct dtype for Flash Attention 2
-                    target_dtype = torch.bfloat16
+                    # S'assurer que q, k, v sont en bfloat16
+                    q = q.to(torch.bfloat16)
+                    k = k.to(torch.bfloat16)
+                    v = v.to(torch.bfloat16)
                     
-                    # Ensure q, k, v are in the correct dtype and shape
-                    q = q.to(target_dtype)  # [batch, n_head, seq_len, head_dim]
-                    k = k.to(target_dtype)  # [batch, n_head_kv, seq_len, head_dim]
-                    v = v.to(target_dtype)  # [batch, n_head_kv, seq_len, head_dim]
-                    
-                    # Handle GQA by repeating k,v heads if needed
-                    if not is_generation:
-                        k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                        v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                    
-                    # Transpose to [batch, seq_len, n_head, head_dim]
-                    q = q.transpose(1, 2)
-                    k = k.transpose(1, 2)
-                    v = v.transpose(1, 2)
-                    
-                    # Pack the tensors into qkv
-                    # [batch_size, seq_len, 3, num_heads, head_dim]
-                    qkv = torch.stack([q, k, v], dim=2)
-                    
-                    # Create attention mask for variable sequence lengths if needed
-                    if mask is not None:
-                        attention_mask = torch.ones((B, T), dtype=torch.bool, device=q.device)
-                        cu_seqlens = torch.arange(0, (B + 1) * T, step=T, dtype=torch.int32, device=q.device)
-                        max_seqlen = T
-                        
-                        # Unpad input if using variable sequence lengths
-                        qkv_unpad, indices, cu_seqlens, max_seqlen = unpad_input(
-                            qkv, attention_mask
-                        )
-                        
-                        # Call Flash Attention 2 with unpadded input
-                        output_unpad = flash_attn_func_2(
-                            qkv_unpad,
-                            causal=True,
-                            dropout_p=self.attn_dropout.p if self.training else 0.0
-                        )
-                        
-                        # Pad output back
-                        output = pad_input(output_unpad, indices, B, T)
-                        
-                    else:
-                        # Call Flash Attention 2 without padding handling
-                        output = flash_attn_func_2(
-                            qkv,
-                            causal=True,
-                            dropout_p=self.attn_dropout.p if self.training else 0.0
-                        )
-                    
-                    # Reshape output back to [batch, seq_len, num_heads * head_dim]
-                    y = output.view(B, T, -1)
-                    
-                    # Convert back to original dtype
+                    y = flash_attn_func_2(q, k, v, causal=mask is not None)
+                    # Reconvertir au dtype original
                     y = y.to(orig_dtype)
-                    
                 except Exception as e:
                     print(f"Flash Attention failed: {e}")
                     self.flash = False
