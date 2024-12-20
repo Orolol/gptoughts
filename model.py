@@ -201,31 +201,47 @@ class CausalSelfAttention(nn.Module):
 
             if self.flash:
                 try:
-                    # Convertir au bon dtype pour Flash Attention 2
+                    # Convert to correct dtype for Flash Attention 2
                     target_dtype = torch.bfloat16
                     
-                    # S'assurer que q, k, v sont dans le bon dtype
+                    # Ensure q, k, v are in the correct dtype
                     q = q.to(target_dtype)
                     k = k.to(target_dtype)
                     v = v.to(target_dtype)
                     
-                    # Flash Attention 2
-                    # Préparer les données pour flash_attn_2
+                    # Prepare QKV for flash attention
+                    # [batch, seqlen, 3, num_heads, head_dim]
                     qkv = torch.stack([q, k, v], dim=2)
-                    qkv = qkv.transpose(1, 2).contiguous()
+                    qkv = qkv.transpose(1, 3)  # [batch, num_heads, 3, seqlen, head_dim]
                     
-                    # Utiliser unpad_input si nécessaire pour les séquences de longueur variable
+                    # Create attention mask for variable sequence lengths if needed
                     if mask is not None:
+                        # Create attention mask
+                        attention_mask = torch.ones((B, T), dtype=torch.bool, device=q.device)
+                        # Convert to cuda contiguous format
                         cu_seqlens = torch.arange(0, (B + 1) * T, step=T, dtype=torch.int32, device=q.device)
                         max_seqlen = T
-                        qkv_unpad, indices, cu_seqlens, max_seqlen = unpad_input(qkv, torch.ones(B, T, dtype=torch.bool, device=q.device))
-                        output_unpad = flash_attn_func_2(qkv_unpad, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, 0.0, causal=True)
-                        y = pad_input(output_unpad, indices, B, T)
                     else:
-                        y = flash_attn_func_2(qkv, causal=True)
+                        attention_mask = None
+                        cu_seqlens = None
+                        max_seqlen = None
                     
-                    # Reconvertir au dtype original
+                    # Call Flash Attention 2
+                    output = flash_attn_func_2(
+                        qkv,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                        dropout_p=self.attn_dropout.p if self.training else 0.0,
+                        causal=True
+                    )
+                    
+                    # Reshape output
+                    output = output.transpose(1, 2).contiguous()
+                    y = output.view(B, T, -1)
+                    
+                    # Convert back to original dtype
                     y = y.to(orig_dtype)
+                    
                 except Exception as e:
                     print(f"Flash Attention failed: {e}")
                     self.flash = False
@@ -466,82 +482,6 @@ class GPT(nn.Module):
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        """
-        Configure the AdamW optimizer with weight decay.
-        
-        Args:
-            weight_decay: Weight decay coefficient
-            learning_rate: Learning rate
-            betas: Adam betas parameters
-            device_type: Device type ('cuda' or 'cpu')
-            
-        Returns:
-            Configured AdamW optimizer
-        """
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
-
-        # Optimiser pour H100
-        if device_type == 'cuda':
-            # Activer TF32
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            
-            # Optimisations CUDA
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-            
-            # Compiler avec des options optimisées pour H100
-            if hasattr(torch, 'compile'):
-                self = torch.compile(
-                    self,
-                    mode='max-autotune',  # Utiliser le mode max-autotune au lieu des options détaillées
-                    fullgraph=True
-                )
-                print("Model compiled with max-autotune mode for H100")
-
-        # Utiliser AdaFactor au lieu de AdamW pour une meilleure efficacité mémoire
-        try:
-            from transformers.optimization import Adafactor
-            optimizer = Adafactor(
-                self.parameters(),
-                lr=learning_rate,
-                scale_parameter=True,
-                relative_step=False,
-                warmup_init=False,
-                clip_threshold=1.0
-            )
-        except ImportError:
-            # Fallback sur AdamW optimisé
-            fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-            use_fused = fused_available and device_type == 'cuda'
-            extra_args = dict(fused=True) if use_fused else dict()
-            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-
-        return optimizer
-
-
     @torch.no_grad()
     def generate(self, idx: torch.LongTensor, max_new_tokens: int, temperature: float = 1.0, top_k: Optional[int] = None) -> torch.LongTensor:
         """
@@ -767,6 +707,84 @@ class EncoderDecoderGPT(nn.Module):
             print(f"using fused AdamW: {use_fused}")
         
         return optimizer
+    
+    
+    def configure_optimizers_adamw(self, weight_decay, learning_rate, betas, device_type):
+        """
+        Configure the AdamW optimizer with weight decay.
+        
+        Args:
+            weight_decay: Weight decay coefficient
+            learning_rate: Learning rate
+            betas: Adam betas parameters
+            device_type: Device type ('cuda' or 'cpu')
+            
+        Returns:
+            Configured AdamW optimizer
+        """
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+
+        # Optimiser pour H100
+        if device_type == 'cuda':
+            # Activer TF32
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            
+            # Optimisations CUDA
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+            
+            # Compiler avec des options optimisées pour H100
+            if hasattr(torch, 'compile'):
+                self = torch.compile(
+                    self,
+                    mode='max-autotune',  # Utiliser le mode max-autotune au lieu des options détaillées
+                    fullgraph=True
+                )
+                print("Model compiled with max-autotune mode for H100")
+
+        # Utiliser AdaFactor au lieu de AdamW pour une meilleure efficacité mémoire
+        try:
+            from transformers.optimization import Adafactor
+            optimizer = Adafactor(
+                self.parameters(),
+                lr=learning_rate,
+                scale_parameter=True,
+                relative_step=False,
+                warmup_init=False,
+                clip_threshold=1.0
+            )
+        except ImportError:
+            # Fallback sur AdamW optimisé
+            fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+            use_fused = fused_available and device_type == 'cuda'
+            extra_args = dict(fused=True) if use_fused else dict()
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+
+        return optimizer
+
+
 
 
     @torch.no_grad()
