@@ -193,10 +193,7 @@ class CausalSelfAttention(nn.Module):
                 k = k.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
                 v = v.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
                 
-                if not is_generation:
-                    k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                    v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                
+                # Remove the repeat_interleave here since we'll handle it in the attention implementations
                 mask = self.mask[:T, :T]
 
             if self.flash:
@@ -209,6 +206,11 @@ class CausalSelfAttention(nn.Module):
                     k = k.to(target_dtype)  # [batch, n_head_kv, seq_len, head_dim]
                     v = v.to(target_dtype)  # [batch, n_head_kv, seq_len, head_dim]
                     
+                    # Handle GQA by repeating k,v heads if needed
+                    if not is_generation:
+                        k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                        v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                    
                     # Transpose to [batch, seq_len, n_head, head_dim]
                     q = q.transpose(1, 2)
                     k = k.transpose(1, 2)
@@ -216,11 +218,7 @@ class CausalSelfAttention(nn.Module):
                     
                     # Pack the tensors into qkv
                     # [batch_size, seq_len, 3, num_heads, head_dim]
-                    qkv = torch.stack([
-                        q,  # [batch, seq_len, n_head, head_dim]
-                        k.repeat_interleave(self.n_head // self.n_head_kv, dim=2) if not is_generation else k,  # Repeat for GQA
-                        v.repeat_interleave(self.n_head // self.n_head_kv, dim=2) if not is_generation else v   # Repeat for GQA
-                    ], dim=2)
+                    qkv = torch.stack([q, k, v], dim=2)
                     
                     # Create attention mask for variable sequence lengths if needed
                     if mask is not None:
@@ -262,8 +260,11 @@ class CausalSelfAttention(nn.Module):
                     self.flash = False
             
             elif self.use_sdpa:
-                # Utiliser l'implémentation native de PyTorch
-                # Appliquer l'attention avec SDPA
+                # Handle GQA for SDPA
+                if not is_generation:
+                    k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                    v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                
                 y = F.scaled_dot_product_attention(
                     q, k, v,
                     dropout_p=self.attn_dropout.p if self.training else 0.0,
@@ -407,7 +408,7 @@ class GPT(nn.Module):
             ln_f = RMSNorm(config.n_embd),
         ))
         
-        # Stocker les références aux embeddings partagés
+        # Stocker les r��férences aux embeddings partagés
         self.wte = embedding_layer
         self.wpe = pos_embedding_layer
         
