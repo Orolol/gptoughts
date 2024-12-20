@@ -20,16 +20,23 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.optim import AdamW
+import torch.utils.checkpoint as checkpoint
 
 # Try to import flash attention 2, but don't fail if not available
 try:
-    from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func as flash_attn_func
+    from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func as flash_attn_func_2
     from flash_attn.bert_padding import unpad_input, pad_input
-    FLASH_ATTN_AVAILABLE = True
+    print("Flash Attention 2 available")
+    FLASH_ATTN_AVAILABLE_2 = True
 except ImportError:
-    FLASH_ATTN_AVAILABLE = False
+    FLASH_ATTN_AVAILABLE_2 = False
     print("Flash Attention 2 not available, falling back to standard attention")
-
+    
+# Check if SDPA with CUDA backend is available
+SDPA_AVAILABLE = hasattr(F, "scaled_dot_product_attention") and torch.cuda.is_available()
+if SDPA_AVAILABLE:
+    print("PyTorch SDPA available")
+    
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization"""
     
@@ -110,13 +117,14 @@ class CausalSelfAttention(nn.Module):
         
         # Flash Attention setup
         self.flash = False
-        if FLASH_ATTN_AVAILABLE and torch.cuda.is_available():
-            try:
-                from flash_attn import flash_attn_func
-                self.flash = True
-                self.flash_fn = flash_attn_func
-            except ImportError:
-                print("Flash Attention not available")
+        self.flash_version = None
+        self.use_sdpa = False
+        
+        if FLASH_ATTN_AVAILABLE_2 and torch.cuda.is_available():
+            self.flash = True
+            self.flash_version = 2
+        elif SDPA_AVAILABLE:
+            self.use_sdpa = True
         
         # ALiBi positional bias - ajusté pour GQA
         self.alibi = AlibiPositionalBias(self.n_head, config.block_size)
@@ -193,19 +201,45 @@ class CausalSelfAttention(nn.Module):
 
             if self.flash:
                 try:
-                    # S'assurer que q, k, v sont en bfloat16
-                    q = q.to(torch.bfloat16)
-                    k = k.to(torch.bfloat16)
-                    v = v.to(torch.bfloat16)
+                    # Convertir au bon dtype pour Flash Attention 2
+                    target_dtype = torch.bfloat16
                     
-                    y = self.flash_fn(q, k, v, causal=mask is not None)
+                    # S'assurer que q, k, v sont dans le bon dtype
+                    q = q.to(target_dtype)
+                    k = k.to(target_dtype)
+                    v = v.to(target_dtype)
+                    
+                    # Flash Attention 2
+                    # Préparer les données pour flash_attn_2
+                    qkv = torch.stack([q, k, v], dim=2)
+                    qkv = qkv.transpose(1, 2).contiguous()
+                    
+                    # Utiliser unpad_input si nécessaire pour les séquences de longueur variable
+                    if mask is not None:
+                        cu_seqlens = torch.arange(0, (B + 1) * T, step=T, dtype=torch.int32, device=q.device)
+                        max_seqlen = T
+                        qkv_unpad, indices, cu_seqlens, max_seqlen = unpad_input(qkv, torch.ones(B, T, dtype=torch.bool, device=q.device))
+                        output_unpad = flash_attn_func_2(qkv_unpad, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, 0.0, causal=True)
+                        y = pad_input(output_unpad, indices, B, T)
+                    else:
+                        y = flash_attn_func_2(qkv, causal=True)
+                    
                     # Reconvertir au dtype original
                     y = y.to(orig_dtype)
                 except Exception as e:
                     print(f"Flash Attention failed: {e}")
                     self.flash = False
             
-            if not self.flash:
+            elif self.use_sdpa:
+                # Utiliser l'implémentation native de PyTorch
+                # Appliquer l'attention avec SDPA
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    dropout_p=self.attn_dropout.p if self.training else 0.0,
+                    is_causal=True
+                )
+            
+            if not (self.flash or self.use_sdpa):
                 # Attention standard optimisée pour la mémoire
                 scale = 1.0 / math.sqrt(self.head_dim)
                 att = torch.matmul(q, k.transpose(-2, -1)) * scale
@@ -262,11 +296,58 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ln_2 = RMSNorm(config.n_embd)
         self.mlp = MLP(config)
+        self.use_checkpoint = True
 
-    def forward(self, x):
-        # Simple residual connections sans checkpoint
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+    def _attn_block(self, x, key_value=None):
+        ln_out = self.ln_1(x)
+        if key_value is not None:
+            return self.attn(ln_out, key_value=key_value)
+        return self.attn(ln_out)
+
+    def _mlp_block(self, x):
+        return self.mlp(self.ln_2(x))
+
+    def forward(self, x, key_value=None):
+        # Disable gradient checkpointing when using compiled model
+        if hasattr(self, '_compiled_forward'):
+            self.use_checkpoint = False
+        
+        if self.use_checkpoint and self.training:
+            # Modified wrapper for gradient checkpointing
+            def create_custom_forward(func):
+                def custom_forward(*inputs):
+                    # Filter out None inputs
+                    valid_inputs = [inp for inp in inputs if inp is not None]
+                    
+                    # Don't modify requires_grad dynamically
+                    return func(*valid_inputs)
+                return custom_forward
+
+            # Attention with checkpoint
+            attn_func = create_custom_forward(self._attn_block)
+            attn_out = checkpoint.checkpoint(
+                attn_func, 
+                x, 
+                key_value,
+                use_reentrant=False,
+                preserve_rng_state=True
+            )
+            x = x + attn_out
+
+            # MLP with checkpoint
+            mlp_func = create_custom_forward(self._mlp_block)
+            mlp_out = checkpoint.checkpoint(
+                mlp_func, 
+                x,
+                use_reentrant=False,
+                preserve_rng_state=True
+            )
+            x = x + mlp_out
+        else:
+            # Standard forward pass without checkpoint
+            x = x + self._attn_block(x, key_value)
+            x = x + self._mlp_block(x)
+
         return x
 
 @dataclass
@@ -513,6 +594,11 @@ class GPT(nn.Module):
             persistent_workers=True
         )
 
+    def set_gradient_checkpointing(self, value: bool):
+        """Set gradient checkpointing for all transformer blocks."""
+        for block in self.transformer.h:
+            block.use_checkpoint = value
+
 class EncoderDecoderGPT(nn.Module):
     def __init__(self, encoder_config, decoder_config):
         super().__init__()
@@ -638,7 +724,7 @@ class EncoderDecoderGPT(nn.Module):
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """
         Configure l'optimiseur pour l'ensemble du modèle encoder-decoder.
-        Utilise AdamW avec weight decay sur les paramètres appropriés.
+        Utilise AdEMAMix de pytorch_optimizer.
         """
         # Collecter tous les paramètres
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
@@ -657,13 +743,28 @@ class EncoderDecoderGPT(nn.Module):
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         
-        # Utiliser fused Adam si disponible sur CUDA
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+        try:
+            from pytorch_optimizer import AdEMAMix
+            
+            optimizer = AdEMAMix(
+                optim_groups,
+                lr=learning_rate,
+                betas=(betas[0], betas[1], betas[2] if len(betas) > 2 else 0.9999),
+                alpha=8.0,
+                beta3_warmup=256_000,
+                alpha_warmup=256_000,
+                weight_decay=weight_decay
+            )
+            print("Using AdEMAMix optimizer from pytorch_optimizer")
+            
+        except ImportError:
+            print("pytorch_optimizer not available, falling back to AdamW")
+            # Fallback sur AdamW si pytorch_optimizer n'est pas disponible
+            fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+            use_fused = fused_available and device_type == 'cuda'
+            extra_args = dict(fused=True) if use_fused else dict()
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas[:2], **extra_args)
+            print(f"using fused AdamW: {use_fused}")
         
         return optimizer
 
@@ -726,3 +827,18 @@ class EncoderDecoderGPT(nn.Module):
             decoder_idx = torch.cat((decoder_idx, idx_next), dim=1)
         
         return decoder_idx
+
+    def set_gradient_checkpointing(self, value: bool):
+        """Set gradient checkpointing for both encoder and decoder."""
+        # Set checkpointing for encoder blocks
+        for block in self.encoder.transformer.h:
+            block.use_checkpoint = value
+            
+        # Set checkpointing for decoder blocks
+        for block in self.decoder.transformer.h:
+            block.use_checkpoint = value
+            
+        # Set checkpointing for cross attention blocks
+        for block in self.cross_attention:
+            if hasattr(block, 'use_checkpoint'):
+                block.use_checkpoint = value

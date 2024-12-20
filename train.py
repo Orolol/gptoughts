@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
+
 from model import GPTConfig, GPT, EncoderDecoderGPT
 from data.openwebtext.data_loader import StreamingDataset
 from run_train import get_datasets
@@ -27,6 +28,9 @@ from rich.console import Console
 console = Console()
 
 access_token=os.getenv('HF_TOKEN')
+
+# Ajouter l'import au début du fichier
+from pytorch_optimizer import AdEMAMix
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -53,7 +57,7 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'  # Use LOCAL_RANK for DDP
-    batch_size = 16  # Réduire la taille du batch
+    batch_size = 8  # Réduire la taille du batch
     block_size = 64
     
     print(f"Using device: {device}")
@@ -73,8 +77,8 @@ if torch.cuda.is_available():
     decoder_ratio_kv = 8
     
     # Optimisations mémoire
-    # gradient_accumulation_steps = max(1, 32 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
-    gradient_accumulation_steps = 8  # Augmenter l'accumulation
+    gradient_accumulation_steps = max(1, 64 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
+    # gradient_accumulation_steps = 32  # Augmenter l'accumulation
     
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
     dtype = 'bfloat16'
@@ -105,23 +109,27 @@ else:
     decoder_n_embd = 2
     decoder_ratio_kv = 1
 
+
 # adamw optimizer
-learning_rate = 3e-4 # max learning rate
+learning_rate = 1e-3 # ajusté pour AdEMAMix
 max_iters = 600000 # total number of training iterations
 weight_decay = 0.1
 beta1 = 0.9
-beta2 = 0.95
+beta2 = 0.999
+beta3 = 0.9999  # nouveau paramètre pour AdEMAMix
+alpha = 8.0  # nouveau paramètre pour AdEMAMix
+beta3_warmup = alpha_warmup = 256_000  # périodes de warmup pour AdEMAMix
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
+warmup_iters = 2000 / gradient_accumulation_steps # how many steps to warm up for
+lr_decay_iters = 600000 / gradient_accumulation_steps # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
-compile = False # use PyTorch 2.0 to compile the model to be faster
+compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -217,7 +225,7 @@ def generate_text(model, input, max_new_tokens=50, temperature=0.8):
         dtype = next(model.parameters()).dtype
         
     # S'assurer que le modèle et les tenseurs sont dans le même dtype
-    with torch.cuda.amp.autocast(enabled=True, dtype=dtype):
+    with torch.amp.autocast(enabled=True, dtype=dtype):
         # Générer token par token
         generated_tokens = model.generate(prompt_tokens, max_new_tokens=max_new_tokens, temperature=temperature)
     
@@ -306,6 +314,42 @@ if init_from == 'scratch':
     print("Initializing a new encoder-decoder model from scratch")
     model = EncoderDecoderGPT(encoder_config, decoder_config)
 
+# Choisir manuellement dtype = "float16" si BF16 n'est pas supporté
+dtype = "float16"
+ptdtype = torch.float16
+
+device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
+ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
+# Instancier ou charger le modèle
+model = EncoderDecoderGPT(encoder_config, decoder_config)
+
+# Juste avant le model.to(device):
+if compile:
+    print("Compiling the model with reduced optimization...")
+    compile_options = {
+        "mode": "reduce-overhead",
+        "fullgraph": False,
+        "dynamic": True,
+        "backend": "inductor",
+        "options": {
+            "allow_rnn": True,
+            "allow_gradient_checkpointing": True
+        }
+    }
+    
+    # Disable gradient checkpointing before compilation
+    model.set_gradient_checkpointing(False)
+    
+    try:
+        model = torch.compile(model, **compile_options)
+        print(f"Model compiled with mode: {compile_options['mode']}")
+    except Exception as e:
+        print(f"Warning: Model compilation failed, continuing without compilation: {e}")
+        compile = False
+        # Re-enable gradient checkpointing
+        model.set_gradient_checkpointing(True)
+
 model.to(device)
 
 # Optimisations CUDA
@@ -360,7 +404,7 @@ if device_type == 'cuda':
 scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2, beta3), device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 
@@ -464,7 +508,7 @@ def cleanup_old_checkpoints(out_dir, keep_num=3):
     if len(checkpoints) <= keep_num:
         return
         
-    # Trier les checkpoints par numéro d'itération
+    # Trier les checkpoints par numéro d'it��ration
     def extract_iter_num(filename):
         try:
             return int(filename.split('iter_')[1].split('_loss')[0])
@@ -579,11 +623,12 @@ while True:
 
     # Profiling périodique (toutes les 100 itérations)
     if iter_num % 100 == 0 and master_process:
-        print("\n=== Starting profiling for iteration", iter_num, "===")
-        prof = profile_training_step(
-            model, encoder_input, decoder_input, target,
-            optimizer, scaler, ctx
-        )
+        # print("\n=== Starting profiling for iteration", iter_num, "===")
+        # prof = profile_training_step(
+        #     model, encoder_input, decoder_input, target,
+        #     optimizer, scaler, ctx
+        # )
+        prof = None
         
         if prof is not None:
             print("\nProfiling results:")
@@ -631,7 +676,7 @@ while True:
             # Ne synchroniser qu'à la dernière étape d'accumulation
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         
-        with torch.cuda.amp.autocast(enabled=True, dtype=ptdtype):
+        with torch.amp.autocast(enabled=True, dtype=ptdtype, device_type=device_type):
             with torch.cuda.stream(copy_stream):
                 try:
                     encoder_input_next, decoder_input_next, target_next = next(train_iterator)
@@ -655,12 +700,12 @@ while True:
                 # Mettre à jour loss pour le logging
                 loss = current_loss
         
-        # Préparer la prochaine itération : charger le batch suivant
-        try:
-            encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-        except StopIteration:
-            train_iterator = iter(train_dataset)
-            encoder_input_next, decoder_input_next, target_next = next(train_iterator)
+        # # Préparer la prochaine itération : charger le batch suivant
+        # try:
+        #     encoder_input_next, decoder_input_next, target_next = next(train_iterator)
+        # except StopIteration:
+        #     train_iterator = iter(train_dataset)
+        #     encoder_input_next, decoder_input_next, target_next = next(train_iterator)
 
     if not skip_optimizer_step:
         if scaler.is_enabled() and scaler._scale is not None:
@@ -680,18 +725,11 @@ while True:
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
         
-        # Print the first token of the input
-        # print(f"First token of the input: {tokenizer.decode(encoder_input[0].tolist())}")
-        
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        
-
         lossf = loss.item() * gradient_accumulation_steps
         dt = time.time() - t0
-        tokens_per_sec = batch_size * block_size / dt
-        total_tokens += batch_size * block_size
         elapsed = time.time() - train_start_time
+        total_tokens += (batch_size * block_size) * gradient_accumulation_steps
+        tokens_per_sec = total_tokens / elapsed
         
         # Afficher les métriques de manière élégante
         # console.print(
@@ -705,11 +743,8 @@ while True:
         # )
         
         # Simple print sans coloration
-        print(f"iter_num: {iter_num}, loss: {loss.item():.4f}, tps: {tokens_per_sec:.1f} t/s, tt: {total_tokens/1e6:.1f}M, lr: {lr:.2e}, time: {dt:.2f}s, total: {elapsed/60:.2f}min")
+        print(f"iter_num: {iter_num}, loss: {lossf:.4f}, tps: {tokens_per_sec:.1f} t/s, tt: {total_tokens/1e3:.1f}K, lr: {lr:.2e}, time: {dt*1000:.4f}ms, total: {elapsed/60:.2f}min")
         
-    if iter_num % generate_interval == 0 and master_process:
-        if generation_queue.empty():  # Pour éviter d'accumuler des requêtes
-            generation_queue.put(encoder_input.detach().clone())
     iter_num += 1
     local_iter_num += 1
     encoder_input, decoder_input, target = encoder_input_next, decoder_input_next, target_next

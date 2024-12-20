@@ -6,6 +6,7 @@ from transformers import AutoTokenizer
 from torch.utils.data import IterableDataset
 import numpy as np
 import pickle
+import time
 
 class TokenTracker:
     def __init__(self):
@@ -65,6 +66,8 @@ class StreamingDataset(IterableDataset):
     def get_batch(self):
         """Get a batch of token sequences of length block_size."""
         # On s'assure d'avoir assez de tokens dans le buffer
+        # tracking time to get a batch
+        start_time = time.time()
         while len(self.token_buffer) < (self.block_size * self.batch_size * 2 + 1):
             try:
                 example = next(self.dataset_iterator)
@@ -109,6 +112,9 @@ class StreamingDataset(IterableDataset):
 
         # Nettoie le buffer
         self.token_buffer = self.token_buffer[total_length*2:]
+        
+        end_time = time.time()
+        # print(f"Time to get a batch: {end_time - start_time:.4f} seconds")
 
         return encoder_input, decoder_input, target
     
