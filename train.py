@@ -58,7 +58,7 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 if torch.cuda.is_available():
     device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'  # Use LOCAL_RANK for DDP
     batch_size = 128  # Réduire la taille du batch
-    block_size = 1024
+    block_size = 512
     
     print(f"Using device: {device}")
     print(f"Batch size: {batch_size}")
