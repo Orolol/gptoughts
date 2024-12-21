@@ -373,7 +373,7 @@ if ddp:
         device_ids=[ddp_local_rank],
         output_device=ddp_local_rank,
         broadcast_buffers=False,
-        find_unused_parameters=False,  # Changed to False
+        find_unused_parameters=True,  # Changed to False
         gradient_as_bucket_view=True
     )
 
