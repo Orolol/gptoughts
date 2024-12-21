@@ -31,6 +31,15 @@ except ImportError:
     FLASH_ATTN_AVAILABLE_2 = False
     print("Flash Attention 2 not available, falling back to standard attention")
     
+# New: detect flash attention 1
+try:
+    from flash_attn.flash_attn_interface import flash_attn_func as flash_attn_func_1
+    FLASH_ATTN_AVAILABLE_1 = False
+    print("Flash Attention 1 available")
+except ImportError:
+    FLASH_ATTN_AVAILABLE_1 = False
+    print("Flash Attention 1 not available")
+    
 # Check if SDPA with CUDA backend is available
 SDPA_AVAILABLE = hasattr(F, "scaled_dot_product_attention") and torch.cuda.is_available()
 if SDPA_AVAILABLE:
@@ -119,9 +128,13 @@ class CausalSelfAttention(nn.Module):
         self.flash_version = None
         self.use_sdpa = False
         
+        # Adjust logic to detect flash-attn v2 first, then v1
         if FLASH_ATTN_AVAILABLE_2 and torch.cuda.is_available():
             self.flash = True
             self.flash_version = 2
+        elif FLASH_ATTN_AVAILABLE_1 and torch.cuda.is_available():
+            self.flash = True
+            self.flash_version = 1
         elif SDPA_AVAILABLE:
             self.use_sdpa = True
         
@@ -197,14 +210,79 @@ class CausalSelfAttention(nn.Module):
 
             if self.flash:
                 try:
-                    # S'assurer que q, k, v sont en bfloat16
-                    q = q.to(torch.bfloat16)
-                    k = k.to(torch.bfloat16)
-                    v = v.to(torch.bfloat16)
+                    # Déterminer le dtype approprié en fonction de l'architecture GPU
+                    is_sm8x_or_sm90 = torch.cuda.get_device_capability()[0] >= 8
+                    dtype_to_use = torch.bfloat16 if is_sm8x_or_sm90 else torch.float16
                     
-                    y = flash_attn_func_2(q, k, v, causal=mask is not None)
-                    # Reconvertir au dtype original
+                    # Convertir q, k, v au dtype approprié
+                    q = q.to(dtype_to_use)
+                    k = k.to(dtype_to_use)
+                    v = v.to(dtype_to_use)
+
+                    # Call flash-attn v2 or v1
+                    if self.flash_version == 2:
+                        y = flash_attn_func_2(q, k, v, causal=mask is not None)
+                    elif self.flash_version == 1:
+                        # Répéter k et v pour correspondre à la dimension de q
+                        k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                        v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                        
+                        # Stack q, k, v
+                        qkv = torch.stack([q, k, v], dim=2)  # [B, n_head, 3, T, head_dim]
+                        
+                        print("qkv")
+                        print(qkv.shape)
+                        
+                        # Réorganiser les dimensions pour Flash Attention 1
+                        qkv = qkv.permute(0, 1, 3, 2, 4).contiguous()  # [B, n_head, T, 3, head_dim]
+                        qkv = qkv.view(-1, T, 3, self.head_dim)  # [B * n_head, T, 3, head_dim]
+
+                        # Build cu_seqlens
+                        cu_seqlens = torch.arange(
+                            0, (B * self.n_head + 1) * T, step=T,
+                            dtype=torch.int32, device=q.device
+                        )
+                        
+                        print("cu_seqlens")
+                        print(cu_seqlens.shape)
+                        
+                        max_s = T
+                        attn_drop_p = self.attn_dropout.p if self.training else 0.0
+                        
+                        y = flash_attn_func_1(
+                            qkv,
+                            cu_seqlens,
+                            attn_drop_p,
+                            max_s,
+                            None,
+                            mask is not None
+                        )
+                        
+                        print("y")
+                        print(y.shape)
+                        
+                        # Reshape output back to original dimensions
+                        # y est de forme [B * n_head, T, head_dim]
+                        y = y.view(B * self.n_head, T, self.head_dim)   # [B * n_head, T, head_dim]
+                            
+                        print("y 3")
+                        print(y.shape)
+                        
+                        y = y.view(B, self.n_head, T, self.head_dim)    # [B, n_head, T, head_dim]
+                        
+                        print("y 4")
+                        print(y.shape)
+                        
+                        y = y.transpose(1, 2).contiguous()              # [B, T, n_head, head_dim]
+                        
+                        print("y 5")
+                        print(y.shape)
+                        
+                        y = y.view(B, T, -1)                           # [B, T, n_embd]
+                    
+                    # Convertir le résultat au dtype original
                     y = y.to(orig_dtype)
+                    
                 except Exception as e:
                     print(f"Flash Attention failed: {e}")
                     self.flash = False
@@ -358,7 +436,7 @@ class GPT(nn.Module):
             ln_f = RMSNorm(config.n_embd),
         ))
         
-        # Stocker les r��férences aux embeddings partagés
+        # Stocker les références aux embeddings partagés
         self.wte = embedding_layer
         self.wpe = pos_embedding_layer
         
@@ -772,7 +850,7 @@ class EncoderDecoderGPT(nn.Module):
         
         # Encoder une seule fois la séquence d'entrée
         with torch.no_grad():
-            # Préparer l'entrée de l'encodeur
+            # Préparer l'entr��e de l'encodeur
             encoder_seq_len = min(idx.size(1), self.encoder.config.block_size)
             idx = idx[:, :encoder_seq_len]
             
@@ -787,7 +865,6 @@ class EncoderDecoderGPT(nn.Module):
             x = self.encoder.transformer.drop(tok_emb + pos_emb)
             for block in self.encoder.transformer.h:
                 x = block(x)
-            encoder_hidden = self.encoder.transformer.ln_f(x)
         
         # Génération auto-régressive
         for _ in range(max_new_tokens):

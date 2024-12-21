@@ -42,7 +42,7 @@ generate_interval = 100
 eval_iters = 100
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'resume' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -57,11 +57,11 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'  # Use LOCAL_RANK for DDP
-    batch_size = 32 # Réduire la taille du batch
-    block_size = 512
+    # batch_size = 32 # Réduire la taille du batch
+    # block_size = 512
     
-    # batch_size = 16
-    # block_size = 64
+    batch_size = 16
+    block_size = 64
     
     print(f"Using device: {device}")
     print(f"Batch size: {batch_size}")
@@ -81,7 +81,7 @@ if torch.cuda.is_available():
     
     # Optimisations mémoire
     # gradient_accumulation_steps = max(1, 64 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
-    gradient_accumulation_steps = 2  # Augmenter l'accumulation
+    gradient_accumulation_steps = 8  # Augmenter l'accumulation
     
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
     dtype = 'bfloat16'
@@ -263,7 +263,7 @@ if init_from == 'resume':
                 state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
         
         model.load_state_dict(state_dict)
-        iter_num = checkpoint['iter_num']
+        iter_num = checkpoint['iter_num'] + 1
         best_val_loss = checkpoint['best_val_loss']
         print(f"Resuming from iteration {iter_num} with best val loss {best_val_loss}")
 
@@ -277,9 +277,6 @@ ptdtype = torch.float16
 
 device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
-
-# Instancier ou charger le modèle
-model = EncoderDecoderGPT(encoder_config, decoder_config)
 
 # Juste avant le model.to(device):
 if compile:
@@ -702,7 +699,7 @@ while True:
         # )
         
         # Simple print sans coloration
-        print(f"iter_num: {iter_num}, loss: {lossf:.4f}, tps: {tokens_per_sec:.1f} t/s, tt: {total_tokens/1e3:.1f}K, lr: {lr:.2e}, time: {dt*1000:.4f}ms, total: {elapsed/60:.2f}min")
+        print(f"iter_num: {iter_num}, loss: {lossf:.4f}, tps: {tokens_per_sec:.1f} t/s, tt: {total_tokens/1e3:.1f}K, lr: {lr:.2e}, time: {dt*1000:.2f}ms, total: {elapsed/60:.2f}min")
         
     iter_num += 1
     local_iter_num += 1
