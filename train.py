@@ -57,11 +57,11 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'  # Use LOCAL_RANK for DDP
-    # batch_size = 32 # Réduire la taille du batch
-    # block_size = 512
+    batch_size = 32 # Réduire la taille du batch
+    block_size = 512
     
-    batch_size = 16
-    block_size = 64
+    # batch_size = 16
+    # block_size = 64
     
     print(f"Using device: {device}")
     print(f"Batch size: {batch_size}")
@@ -81,7 +81,7 @@ if torch.cuda.is_available():
     
     # Optimisations mémoire
     # gradient_accumulation_steps = max(1, 64 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
-    gradient_accumulation_steps = 8  # Augmenter l'accumulation
+    gradient_accumulation_steps = 4  # Augmenter l'accumulation
     
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
     dtype = 'bfloat16'
