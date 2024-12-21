@@ -767,26 +767,15 @@ while True:
         if master_process:
             # Log global (tous les GPUs combinés)
             print(
-                f"\n=== Global Stats (All GPUs: {ddp_world_size}) ===\n"
                 f"iter_num: {iter_num}, "
                 f"loss: {global_loss:.4f}, "
                 f"total_tps: {global_tps:.1f} t/s, "
                 f"total_tokens: {global_tokens/1e6:.2f}M, "
                 f"time/step: {global_dt*1000:.2f}ms"
+                f"time: {elapsed/60:.2f}min"
+                f"Total GPU: {ddp_world_size}"
             )
             
-            # Log local (ce GPU)
-            if ddp:
-                print(
-                    f"\n=== Local Stats (GPU {ddp_rank}/{ddp_world_size-1}) ===\n"
-                    f"local_tps: {local_tps:.1f} t/s, "
-                    f"local_tokens: {local_tokens/1e6:.2f}M, "
-                    f"lr: {lr:.2e}, "
-                    f"time/step: {local_dt*1000:.2f}ms"
-                )
-                
-            print(f"\nTotal training time: {elapsed/60:.2f}min")
-            print("=" * 50)
 
             if wandb_log:
                 wandb.log({
