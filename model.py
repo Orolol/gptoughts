@@ -179,17 +179,20 @@ class CausalSelfAttention(nn.Module):
                 k = k.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
                 v = v.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
                 
-                # Désactiver Flash Attention pendant la génération pour la cross-attention
-                if is_generation:
-                    self.flash = False
+                # Répéter K,V pour correspondre au nombre de têtes de Q
+                # Important: faire ceci avant le calcul de l'attention
+                k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
                 
-                # Repeat K,V pour GQA seulement si pas en génération
-                if not is_generation:
-                    k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                    v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                # Calcul de l'attention
+                scale = 1.0 / math.sqrt(self.head_dim)
+                att = torch.matmul(q, k.transpose(-2, -1)) * scale
                 
                 # Pas de masque causal en cross-attention
-                mask = None
+                att = F.softmax(att, dim=-1, dtype=torch.float32)
+                att = self.attn_dropout(att)
+                
+                y = torch.matmul(att, v)
                 
             else:
                 # Self-attention standard
