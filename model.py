@@ -188,6 +188,9 @@ class CausalSelfAttention(nn.Module):
                 scale = 1.0 / math.sqrt(self.head_dim)
                 att = torch.matmul(q, k.transpose(-2, -1)) * scale
                 
+                
+                mask = None
+                
                 # Pas de masque causal en cross-attention
                 att = F.softmax(att, dim=-1, dtype=torch.float32)
                 att = self.attn_dropout(att)
