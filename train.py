@@ -57,7 +57,7 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'  # Use LOCAL_RANK for DDP
-    batch_size = 32 # Réduire la taille du batch
+    batch_size = 16 # Réduire la taille du batch
     block_size = 512
     
     # batch_size = 16
@@ -70,13 +70,13 @@ if torch.cuda.is_available():
     # Encoder config (plus petit)
     encoder_n_layer = 8
     encoder_n_head = 16  # 1024/16 = 64 par tête
-    encoder_n_embd = 1024
+    encoder_n_embd = 1024  # Doit être divisible par encoder_n_head
     encoder_ratio_kv = 4  # 16/4 = 4 têtes KV
     
     # Decoder config (plus grand)
     decoder_n_layer = 32
     decoder_n_head = 32  # 1024/32 = 32 par tête
-    decoder_n_embd = 1024 
+    decoder_n_embd = 1024  # Doit être divisible par decoder_n_head
     decoder_ratio_kv = 4  # 32/4 = 8 têtes KV
     
     # Optimisations mémoire
@@ -595,9 +595,16 @@ while True:
                         scaled_loss.backward()
                         loss = current_loss
             except RuntimeError as e:
-                print(f"Forward/backward pass failed: {e}")
+                import traceback
+                print("\n=== Error Stack Trace ===")
+                print(f"Process rank: {ddp_rank if ddp else 'N/A'}")
+                print(f"Error: {str(e)}")
+                print("\nFull stack trace:")
+                print(traceback.format_exc())
+                print("=" * 50)
                 skip_optimizer_step = True
                 break
+
             
             # Move data preparation for next iteration here
             encoder_input, decoder_input, target = (
