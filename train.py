@@ -742,10 +742,20 @@ while True:
 
         # Métriques agrégées (tous les GPUs)
         if ddp:
+            # Créer des tensors sur le GPU pour la réduction
+            global_loss = torch.tensor(lossf, device=device)
+            global_dt = torch.tensor(dt, device=device)
+            global_tokens = torch.tensor(total_tokens, device=device)
+            
             # Réduire les métriques à travers tous les processus
-            global_loss = reduce_metrics(lossf, ddp_world_size)
-            global_dt = reduce_metrics(dt, ddp_world_size)
-            global_tokens = reduce_metrics(total_tokens, ddp_world_size)
+            all_reduce(global_loss, op=ReduceOp.SUM)
+            all_reduce(global_dt, op=ReduceOp.SUM)
+            all_reduce(global_tokens, op=ReduceOp.SUM)
+            
+            # Calculer les moyennes
+            global_loss = global_loss.item() / ddp_world_size
+            global_dt = global_dt.item() / ddp_world_size
+            global_tokens = global_tokens.item()  # Ne pas diviser les tokens, on veut le total
             global_tps = global_tokens / elapsed
         else:
             global_loss = lossf
@@ -757,7 +767,7 @@ while True:
         if master_process:
             # Log global (tous les GPUs combinés)
             print(
-                f"\n=== Global Stats (All GPUs) ===\n"
+                f"\n=== Global Stats (All GPUs: {ddp_world_size}) ===\n"
                 f"iter_num: {iter_num}, "
                 f"loss: {global_loss:.4f}, "
                 f"total_tps: {global_tps:.1f} t/s, "
@@ -768,7 +778,7 @@ while True:
             # Log local (ce GPU)
             if ddp:
                 print(
-                    f"\n=== Local Stats (GPU {ddp_rank}) ===\n"
+                    f"\n=== Local Stats (GPU {ddp_rank}/{ddp_world_size-1}) ===\n"
                     f"local_tps: {local_tps:.1f} t/s, "
                     f"local_tokens: {local_tokens/1e6:.2f}M, "
                     f"lr: {lr:.2e}, "
