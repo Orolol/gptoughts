@@ -69,15 +69,15 @@ if torch.cuda.is_available():
     
     # Encoder config (plus petit)
     encoder_n_layer = 8
-    encoder_n_head = 16
+    encoder_n_head = 16  # 1024/16 = 64 par tête
     encoder_n_embd = 1024
-    encoder_ratio_kv = 8
+    encoder_ratio_kv = 4  # 16/4 = 4 têtes KV
     
     # Decoder config (plus grand)
     decoder_n_layer = 32
-    decoder_n_head = 32
+    decoder_n_head = 32  # 1024/32 = 32 par tête
     decoder_n_embd = 1024 
-    decoder_ratio_kv = 8
+    decoder_ratio_kv = 4  # 32/4 = 8 têtes KV
     
     # Optimisations mémoire
     # gradient_accumulation_steps = max(1, 64 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
