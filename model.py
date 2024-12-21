@@ -699,10 +699,18 @@ class EncoderDecoderGPT(nn.Module):
             targets = targets[:, :decoder_seq_len]
             logits = self.decoder.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            
+            # Ajouter la régularisation pour DDP si en mode training
+            if self.training:
+                reg_loss = 0
+                for name, param in self.named_parameters():
+                    if param.requires_grad:
+                        reg_loss = reg_loss + 0.0 * param.mean()
+                loss = loss + reg_loss
         else:
             logits = self.decoder.lm_head(x[:, [-1], :])
             loss = None
-            
+        
         return logits, loss
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
@@ -850,7 +858,7 @@ class EncoderDecoderGPT(nn.Module):
         
         # Encoder une seule fois la séquence d'entrée
         with torch.no_grad():
-            # Préparer l'entr��e de l'encodeur
+            # Préparer l'entrée de l'encodeur
             encoder_seq_len = min(idx.size(1), self.encoder.config.block_size)
             idx = idx[:, :encoder_seq_len]
             

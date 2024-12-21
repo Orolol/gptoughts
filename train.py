@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed import init_process_group, destroy_process_group, all_reduce, ReduceOp
 
 
 from model import GPTConfig, GPT, EncoderDecoderGPT
@@ -373,9 +373,22 @@ if ddp:
         device_ids=[ddp_local_rank],
         output_device=ddp_local_rank,
         broadcast_buffers=False,
-        find_unused_parameters=True,  # Changed to False
-        gradient_as_bucket_view=True
+        find_unused_parameters=True,  # Garder True
+        gradient_as_bucket_view=True,
+        static_graph=False  # Désactiver static_graph car nous avons des paramètres inutilisés
     )
+
+    # Ajouter un hook pour déboguer les paramètres inutilisés si nécessaire
+    if os.environ.get('TORCH_DISTRIBUTED_DEBUG', '').upper() in ('INFO', 'DETAIL'):
+        def print_unused_parameters(model):
+            for name, param in model.named_parameters():
+                if param.grad is None:
+                    print(f"Parameter without gradient: {name}")
+        
+        def hook(state):
+            print_unused_parameters(model.module)
+        
+        model.register_comm_hook(None, hook)
 
 # Initialize datasets
 train_dataset, val_dataset = get_datasets(block_size, batch_size, device)
@@ -385,13 +398,26 @@ print(f"vocab_size: {len(train_dataset.tokenizer)}")
 vocab_size = len(train_dataset.tokenizer)
 print(f"vocab_size: {vocab_size}")
 
+# Ajouter cette fonction d'aide pour l'agrégation des métriques
+def reduce_metrics(metrics, world_size):
+    """
+    Réduit les métriques à travers tous les processus.
+    Args:
+        metrics: Tensor ou float à réduire
+        world_size: Nombre total de processus
+    """
+    if not isinstance(metrics, torch.Tensor):
+        metrics = torch.tensor(metrics, device='cuda')
+    all_reduce(metrics, op=ReduceOp.SUM)
+    return metrics.item() / world_size
+
 # Update the estimate_loss function
 @torch.no_grad()
 def estimate_loss():
     out = {}
     model.eval()
     for split, dataset in [('train', train_dataset), ('val', val_dataset)]:
-        losses = torch.zeros(eval_iters)
+        losses = torch.zeros(eval_iters, device=device)
         valid_iters = 0
         for k in range(eval_iters):
             encoder_input, decoder_input, target = next(iter(dataset))
@@ -401,8 +427,16 @@ def estimate_loss():
                     losses[valid_iters] = loss.item()
                     valid_iters += 1
         
-        # Average only over valid iterations
-        out[split] = losses[:valid_iters].mean() if valid_iters > 0 else float('inf')
+        # Moyenne sur les itérations valides
+        if valid_iters > 0:
+            mean_loss = losses[:valid_iters].mean()
+            # Réduire la perte à travers tous les processus si en mode DDP
+            if ddp:
+                mean_loss = reduce_metrics(mean_loss, ddp_world_size)
+            out[split] = mean_loss
+        else:
+            out[split] = float('inf')
+            
     model.train()
     return out
 
@@ -696,27 +730,38 @@ while True:
     dt = t1 - t0
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
+        lossf = loss.item() * gradient_accumulation_steps if loss is not None else 0.0
         
-        lossf = loss.item() * gradient_accumulation_steps
-        dt = time.time() - t0
-        elapsed = time.time() - train_start_time
-        total_tokens += (batch_size * block_size) * gradient_accumulation_steps
-        tokens_per_sec = total_tokens / elapsed
+        if ddp:
+            # Réduire les métriques à travers tous les processus
+            lossf = reduce_metrics(lossf, ddp_world_size)
+            dt = reduce_metrics(dt, ddp_world_size)
+            total_tokens = reduce_metrics(total_tokens, ddp_world_size)
+            
+        tokens_per_sec = total_tokens / (time.time() - train_start_time)
         
-        # Afficher les métriques de manière élégante
-        # console.print(
-        #     f"[bold green]{iter_num}:[/bold green] "
-        #     f"loss {loss.item():.4f} | "
-        #     f"[yellow]{tokens_per_sec:.1f}[/yellow] t/s | "
-        #     f"[blue]{total_tokens/1e6:.1f}M[/blue] total t | "
-        #     f"lr {lr:.2e} | "
-        #     f"time {dt:.2f}s | "
-        #     f"total {elapsed/60:.2f}min"
-        # )
-        
-        # Simple print sans coloration
-        print(f"iter_num: {iter_num}, loss: {lossf:.4f}, tps: {tokens_per_sec:.1f} t/s, tt: {total_tokens/1e3:.1f}K, lr: {lr:.2e}, time: {dt*1000:.2f}ms, total: {elapsed/60:.2f}min")
-        
+        if master_process:
+            print(
+                f"iter_num: {iter_num}, "
+                f"loss: {lossf:.4f}, "
+                f"tps: {tokens_per_sec:.1f} t/s, "
+                f"tt: {total_tokens/1e3:.1f}K, "
+                f"lr: {lr:.2e}, "
+                f"time: {dt*1000:.2f}ms, "
+                f"total: {(time.time() - train_start_time)/60:.2f}min"
+                + (f" (rank {ddp_rank}/{ddp_world_size})" if ddp else "")
+            )
+            
+            if wandb_log:
+                wandb.log({
+                    "iter": iter_num,
+                    "loss": lossf,
+                    "tokens_per_sec": tokens_per_sec,
+                    "total_tokens": total_tokens,
+                    "learning_rate": lr,
+                    "step_time_ms": dt * 1000
+                })
+
     iter_num += 1
     local_iter_num += 1
     encoder_input, decoder_input, target = encoder_input_next, decoder_input_next, target_next
