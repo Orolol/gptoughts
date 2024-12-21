@@ -68,15 +68,15 @@ if torch.cuda.is_available():
     print(f"Block size: {block_size}")
     
     # Encoder config (plus petit)
-    encoder_n_layer = 4
-    encoder_n_head = 8
-    encoder_n_embd = 768
+    encoder_n_layer = 8
+    encoder_n_head = 16
+    encoder_n_embd = 1024
     encoder_ratio_kv = 8
     
     # Decoder config (plus grand)
-    decoder_n_layer = 12
-    decoder_n_head = 12
-    decoder_n_embd = 768 
+    decoder_n_layer = 32
+    decoder_n_head = 32
+    decoder_n_embd = 1024 
     decoder_ratio_kv = 8
     
     # Optimisations mémoire
@@ -515,57 +515,6 @@ def cleanup_old_checkpoints(out_dir, keep_num=3):
         except Exception as e:
             print(f"Error removing checkpoint {ckpt}: {e}")
 
-# Ajouter ces imports au début du fichier
-from torch.profiler import profile, record_function, ProfilerActivity
-import time
-
-# Ajouter cette fonction après la fonction estimate_loss()
-def profile_training_step(model, encoder_input, decoder_input, target, optimizer, scaler, ctx):
-    """Profile une étape d'entraînement complète"""
-    with profile(
-        activities=[
-            ProfilerActivity.CPU,
-            ProfilerActivity.CUDA,
-        ],
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True,
-        with_flops=True
-    ) as prof:
-        # Forward pass
-        with record_function("forward"):
-            with ctx:
-                try:
-                    logits, loss = model(encoder_input, decoder_input, target)
-                except Exception as e:
-                    print(f"Forward pass failed: {e}")
-                    return None
-        
-        # Backward pass
-        with record_function("backward"):
-            if loss is not None:
-                try:
-                    scaled_loss = scaler.scale(loss)
-                    scaled_loss.backward()
-                except Exception as e:
-                    print(f"Backward pass failed: {e}")
-                    return None
-        
-        # Optimizer step
-        with record_function("optimizer"):
-            try:
-                if scaler.is_enabled() and scaler._scale is not None:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-                
-                optimizer.zero_grad(set_to_none=True)
-            except Exception as e:
-                print(f"Optimizer step failed: {e}")
-                return None
-    
-    return prof
 
 while True:
     # determine and set the learning rate for this iteration
@@ -611,48 +560,6 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    # Profiling périodique (toutes les 100 itérations)
-    if iter_num % 100 == 0 and master_process:
-        # print("\n=== Starting profiling for iteration", iter_num, "===")
-        # prof = profile_training_step(
-        #     model, encoder_input, decoder_input, target,
-        #     optimizer, scaler, ctx
-        # )
-        prof = None
-        
-        if prof is not None:
-            print("\nProfiling results:")
-            print(prof.key_averages().table(
-                sort_by="cuda_time_total", row_limit=10))
-            
-            print("\nMemory stats:")
-            print(f"Allocated memory: {torch.cuda.memory_allocated() / 1024**2:.1f}MB")
-            print(f"Reserved memory: {torch.cuda.memory_reserved() / 1024**2:.1f}MB")
-            print(f"Max memory allocated: {torch.cuda.max_memory_allocated() / 1024**2:.1f}MB")
-            
-            # Temps par étape
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            
-            start_event.record()
-            # Une étape d'entraînement normale
-            with ctx:
-                try:
-                    logits, loss = model(encoder_input, decoder_input, target)
-                    if loss is not None:
-                        scaled_loss = scaler.scale(loss)
-                        scaled_loss.backward()
-                except Exception as e:
-                    print(f"Error during timing measurement: {e}")
-            end_event.record()
-            
-            torch.cuda.synchronize()
-            step_time = start_event.elapsed_time(end_event)
-            print(f"\nSingle step time: {step_time:.2f}ms")
-            print("=" * 40 + "\n")
-        else:
-            print("Profiling failed")
-        
     # Continue avec le code normal d'entraînement
     optimizer.zero_grad(set_to_none=True)
     skip_optimizer_step = False
@@ -771,8 +678,8 @@ while True:
                 f"loss: {global_loss:.4f}, "
                 f"total_tps: {global_tps:.1f} t/s, "
                 f"total_tokens: {global_tokens/1e6:.2f}M, "
-                f"time/step: {global_dt*1000:.2f}ms"
-                f"time: {elapsed/60:.2f}min"
+                f"time/step: {global_dt*1000:.2f}ms, "
+                f"time: {elapsed/60:.2f}min, "
                 f"Total GPU: {ddp_world_size}"
             )
             
