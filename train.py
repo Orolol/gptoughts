@@ -733,40 +733,59 @@ while True:
     total_tokens += (batch_size * block_size) * gradient_accumulation_steps
 
     if iter_num % log_interval == 0:
-        # Calculer les métriques locales
+        # Calculer les métriques locales (par GPU)
         lossf = loss.item() * gradient_accumulation_steps if loss is not None else 0.0
         elapsed = time.time() - train_start_time
         local_dt = dt
         local_tokens = total_tokens
+        local_tps = local_tokens / elapsed
 
+        # Métriques agrégées (tous les GPUs)
         if ddp:
             # Réduire les métriques à travers tous les processus
-            lossf = reduce_metrics(lossf, ddp_world_size)
-            local_dt = reduce_metrics(dt, ddp_world_size)
-            local_tokens = reduce_metrics(total_tokens, ddp_world_size)
-        
-        # Calculer les métriques finales
-        tokens_per_sec = local_tokens / elapsed
+            global_loss = reduce_metrics(lossf, ddp_world_size)
+            global_dt = reduce_metrics(dt, ddp_world_size)
+            global_tokens = reduce_metrics(total_tokens, ddp_world_size)
+            global_tps = global_tokens / elapsed
+        else:
+            global_loss = lossf
+            global_dt = dt
+            global_tokens = local_tokens
+            global_tps = local_tps
 
         # Afficher les logs uniquement sur le processus maître
         if master_process:
+            # Log global (tous les GPUs combinés)
             print(
+                f"\n=== Global Stats (All GPUs) ===\n"
                 f"iter_num: {iter_num}, "
-                f"loss: {lossf:.4f}, "
-                f"tps: {tokens_per_sec:.1f} t/s, "
-                f"tt: {local_tokens/1e3:.1f}K, "
-                f"lr: {lr:.2e}, "
-                f"time: {local_dt*1000:.2f}ms, "
-                f"total: {elapsed/60:.2f}min"
-                + (f" (rank {ddp_rank}/{ddp_world_size})" if ddp else "")
+                f"loss: {global_loss:.4f}, "
+                f"total_tps: {global_tps:.1f} t/s, "
+                f"total_tokens: {global_tokens/1e6:.2f}M, "
+                f"time/step: {global_dt*1000:.2f}ms"
             )
             
+            # Log local (ce GPU)
+            if ddp:
+                print(
+                    f"\n=== Local Stats (GPU {ddp_rank}) ===\n"
+                    f"local_tps: {local_tps:.1f} t/s, "
+                    f"local_tokens: {local_tokens/1e6:.2f}M, "
+                    f"lr: {lr:.2e}, "
+                    f"time/step: {local_dt*1000:.2f}ms"
+                )
+                
+            print(f"\nTotal training time: {elapsed/60:.2f}min")
+            print("=" * 50)
+
             if wandb_log:
                 wandb.log({
                     "iter": iter_num,
-                    "loss": lossf,
-                    "tokens_per_sec": tokens_per_sec,
-                    "total_tokens": local_tokens,
+                    "loss": global_loss,
+                    "tokens_per_sec/gpu": local_tps,
+                    "tokens_per_sec/total": global_tps,
+                    "tokens/gpu": local_tokens,
+                    "tokens/total": global_tokens,
                     "learning_rate": lr,
                     "step_time_ms": local_dt * 1000
                 })
