@@ -161,8 +161,10 @@ if ddp:
     ddp_world_size = int(os.environ['WORLD_SIZE'])
     device = f'cuda:{ddp_local_rank}'
     torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-    seed_offset = ddp_rank # each process gets a different seed
+    
+
+    master_process = ddp_rank == 0
+    seed_offset = ddp_rank
 else:
     master_process = True
     seed_offset = 0
@@ -369,11 +371,10 @@ if ddp:
     model = DDP(
         model, 
         device_ids=[ddp_local_rank],
-        find_unused_parameters=True,
+        output_device=ddp_local_rank,
         broadcast_buffers=False,
-        gradient_as_bucket_view=True,
-        static_graph=True,
-        bucket_cap_mb=25  # Augmenter la taille des buckets
+        find_unused_parameters=False,  # Changed to False
+        gradient_as_bucket_view=True
     )
 
 # Initialize datasets
@@ -464,7 +465,7 @@ def cleanup_old_checkpoints(out_dir, keep_num=3):
     if len(checkpoints) <= keep_num:
         return
         
-    # Trier les checkpoints par numéro d'it��ration
+    # Trier les checkpoints par numéro d'itération
     def extract_iter_num(filename):
         try:
             return int(filename.split('iter_')[1].split('_loss')[0])
@@ -627,53 +628,68 @@ while True:
     encoder_input_next, decoder_input_next, target_next = None, None, None
     loss = None
 
-    for micro_step in range(gradient_accumulation_steps):
+    try:
+        for micro_step in range(gradient_accumulation_steps):
+            if ddp:
+                # Only synchronize gradients on the last micro step
+                model.require_backward_grad_sync = (
+                    micro_step == gradient_accumulation_steps - 1
+                )
+            
+            try:
+                encoder_input_next, decoder_input_next, target_next = next(train_iterator)
+            except StopIteration:
+                train_iterator = iter(train_dataset)
+                encoder_input_next, decoder_input_next, target_next = next(train_iterator)
+            
+            # Forward pass with error handling
+            try:
+                with ctx:
+                    logits, current_loss = model(encoder_input, decoder_input, target)
+                    if current_loss is not None:
+                        # Scale loss for gradient accumulation
+                        current_loss = current_loss / gradient_accumulation_steps
+                        # Scale for mixed precision
+                        scaled_loss = scaler.scale(current_loss)
+                        # Backward pass
+                        scaled_loss.backward()
+                        loss = current_loss
+            except RuntimeError as e:
+                print(f"Forward/backward pass failed: {e}")
+                skip_optimizer_step = True
+                break
+            
+            # Move data preparation for next iteration here
+            encoder_input, decoder_input, target = (
+                encoder_input_next, 
+                decoder_input_next,
+                target_next
+            )
+            
+        # Optimizer step if no errors occurred
+        if not skip_optimizer_step and loss is not None:
+            if scaler.is_enabled() and scaler._scale is not None:
+                # Unscale gradients and clip
+                if grad_clip != 0.0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                # Step with scaler
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Normal optimizer step
+                if grad_clip != 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
+            
+            # Zero gradients after optimizer step
+            optimizer.zero_grad(set_to_none=True)
+            
+    except Exception as e:
+        print(f"Training iteration failed: {e}")
         if ddp:
-            # Ne synchroniser qu'à la dernière étape d'accumulation
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        
-        with torch.amp.autocast(enabled=True, dtype=ptdtype, device_type=device_type):
-            with torch.cuda.stream(copy_stream):
-                try:
-                    encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-                except StopIteration:
-                    train_iterator = iter(train_dataset)
-                    encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-            
-            # Attendre que les données soient prêtes
-            torch.cuda.current_stream().wait_stream(copy_stream)
-            
-            # Forward pass
-            logits, current_loss = model(encoder_input, decoder_input, target)
-            if current_loss is not None:
-                # Scale loss
-                current_loss = current_loss / gradient_accumulation_steps
-                
-                # Backward pass
-                scaled_loss = scaler.scale(current_loss)
-                scaled_loss.backward()
-                
-                # Mettre à jour loss pour le logging
-                loss = current_loss
-        
-        # # Préparer la prochaine itération : charger le batch suivant
-        # try:
-        #     encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-        # except StopIteration:
-        #     train_iterator = iter(train_dataset)
-        #     encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-
-    if not skip_optimizer_step:
-        if scaler.is_enabled() and scaler._scale is not None:
-            if grad_clip != 0.0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            if grad_clip != 0.0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            dist.barrier()  # Synchronize processes before continuing
+        continue
 
     # timing and logging
     t1 = time.time()
