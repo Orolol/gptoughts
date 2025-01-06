@@ -555,7 +555,8 @@ t0 = time.time()
 local_iter_num = 0
 running_mfu = -1.0
 train_start_time = time.time()
-total_tokens = batch_size * block_size * gradient_accumulation_steps
+tokens_per_iter = batch_size * block_size * gradient_accumulation_steps
+total_tokens = 0
 
 print(f"Starting training with {num_experts} experts and top-{expert_k} routing")
 print_memory_stats("Initial")
@@ -677,6 +678,7 @@ while True:
             try:
                 with ctx:
                     logits, loss, router_loss = model(encoder_input, decoder_input, target)
+                    total_tokens += encoder_input.numel()
                     if loss is not None:
                         # Vérifier les NaN avant de continuer
                         if torch.isnan(loss).any() or torch.isnan(router_loss).any():
@@ -719,8 +721,6 @@ while True:
         lossf = total_loss * gradient_accumulation_steps
         router_lossf = total_router_loss * gradient_accumulation_steps
         
-        tokens = total_tokens / gradient_accumulation_steps
-        
         lossf = lossf
         
         if local_iter_num >= 5:
@@ -728,10 +728,11 @@ while True:
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         
         print(f"iter {iter_num}: loss {lossf:.4f}, router_loss {router_lossf:.4f}, "
-              f"time {dt*1000:.2f}ms, lr {lr:.6f}, tokens {tokens:.2f}, tokens/s {tokens/dt:.2f}")
+              f"time {dt*1000:.2f}ms, lr {lr:.6f}, tokens {total_tokens:.2f}, tokens/s {tokens_per_iter/dt:.2f}")
 
     iter_num += 1
     local_iter_num += 1
+    
 
     if iter_num % 100 == 0:
         if device_type == 'cuda':
