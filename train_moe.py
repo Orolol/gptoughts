@@ -64,7 +64,7 @@ if torch.cuda.is_available():
     device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'
     
     # Increase batch size and reduce gradient accumulation steps
-    batch_size = 32  # Increased from 8
+    batch_size = 48  # Increased from 8
     block_size = 512
     
     # Fixed sequence lengths for padding
@@ -90,7 +90,7 @@ if torch.cuda.is_available():
     router_aux_loss_coef = 0.001
     
     # Optimize gradient accumulation for better GPU utilization
-    gradient_accumulation_steps = 2
+    gradient_accumulation_steps = 8
     
     # CUDA Optimizations
     torch.cuda.empty_cache()
@@ -609,7 +609,7 @@ while True:
                 cleanup_memory()
 
     # Generate text every 200 iterations
-    if iter_num % 100 == 0 and master_process:
+    if iter_num % 500 == 0 and master_process:
         print("\nGénération de texte :")
         prompt = random.choice(PROMPT_TEMPLATES)
         
