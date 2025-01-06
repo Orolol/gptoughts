@@ -64,7 +64,7 @@ if torch.cuda.is_available():
     device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'
     
     # Increase batch size and reduce gradient accumulation steps
-    batch_size = 64  # Increased from 8
+    batch_size = 32  # Increased from 8
     block_size = 512
     
     # Fixed sequence lengths for padding
@@ -78,8 +78,8 @@ if torch.cuda.is_available():
     encoder_ratio_kv = 4
     
     # Decoder config
-    decoder_n_layer = 4
-    decoder_n_head = 4
+    decoder_n_layer = 8
+    decoder_n_head = 8
     decoder_n_embd = 384
     decoder_ratio_kv = 4
     
@@ -555,7 +555,7 @@ t0 = time.time()
 local_iter_num = 0
 running_mfu = -1.0
 train_start_time = time.time()
-total_tokens = 0
+total_tokens = batch_size * block_size * gradient_accumulation_steps
 
 print(f"Starting training with {num_experts} experts and top-{expert_k} routing")
 print_memory_stats("Initial")
