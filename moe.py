@@ -374,8 +374,9 @@ class MoEEncoderDecoderGPT(nn.Module):
                 cross_x = self.cross_ln[i](decoder_x)
                 decoder_x = decoder_x + cross_attn(cross_x, key_value=encoder_output)
                 
-                # MLP
-                decoder_x = decoder_x + block.mlp(block.ln_2(decoder_x))
+                # MoE layer
+                moe_out, _ = block.moe(block.ln_2(decoder_x))
+                decoder_x = decoder_x + moe_out
             
             decoder_x = self.decoder.ln_f(decoder_x)
             

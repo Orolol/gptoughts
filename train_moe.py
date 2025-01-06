@@ -552,7 +552,7 @@ train_iterator = iter(train_dataset)
 
 # Initialize timing
 t0 = time.time()
-local_iter_num = 1
+local_iter_num = 0
 running_mfu = -1.0
 train_start_time = time.time()
 total_tokens = 0
@@ -626,12 +626,12 @@ while True:
         )
         
         try:
-            with torch.no_grad(), torch.cuda.amp.autocast(enabled=True):
+            with torch.no_grad(), torch.amp.autocast(enabled=True):
                 # Generate text
                 output_ids = model.generate(
                     input_tokens,
                     max_new_tokens=100,  # Increased for more context
-                    temperature=0.9,     # Slightly increased for more creativity
+                    temperature=0.2,     # Slightly increased for more creativity
                     top_k=50            # Increased for more variety
                 )
                 
