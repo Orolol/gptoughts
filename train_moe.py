@@ -728,8 +728,8 @@ while True:
     t0 = t1
     
     if iter_num % log_interval == 0:
-        lossf = total_loss * gradient_accumulation_steps
-        router_lossf = total_router_loss * gradient_accumulation_steps
+        lossf = total_loss
+        router_lossf = total_router_loss
         
         # Calculer le taux de tokens/s sur la fenêtre glissante
         if len(tokens_window) > 1:
