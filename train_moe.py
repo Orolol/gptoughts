@@ -133,7 +133,7 @@ grad_clip = 0.5
 
 # learning rate decay settings
 decay_lr = True
-warmup_iters = 2000 / gradient_accumulation_steps
+warmup_iters = 1000 / gradient_accumulation_steps
 lr_decay_iters = 600000 / gradient_accumulation_steps
 min_lr = 6e-5
 
@@ -630,7 +630,7 @@ while True:
                 # Generate text
                 output_ids = model.generate(
                     input_tokens,
-                    max_new_tokens=100,  # Increased for more context
+                    max_new_tokens=block_size,  # Increased for more context
                     temperature=0.2,     # Slightly increased for more creativity
                     top_k=50            # Increased for more variety
                 )
@@ -641,8 +641,7 @@ while True:
                     skip_special_tokens=True,
                     clean_up_tokenization_spaces=True
                 )
-                print(f"Prompt: {prompt}")
-                print(f"Texte généré: {generated_text}\n")
+                print(f"Prompt: {prompt} {generated_text}")
         except Exception as e:
             print(f"Erreur lors de la génération: {str(e)}")
             continue
@@ -720,14 +719,16 @@ while True:
         lossf = total_loss * gradient_accumulation_steps
         router_lossf = total_router_loss * gradient_accumulation_steps
         
-        lossf = lossf / expert_k
+        tokens = total_tokens / gradient_accumulation_steps
+        
+        lossf = lossf
         
         if local_iter_num >= 5:
             mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         
         print(f"iter {iter_num}: loss {lossf:.4f}, router_loss {router_lossf:.4f}, "
-              f"time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+              f"time {dt*1000:.2f}ms, lr {lr:.6f}, tokens {tokens:.2f}, tokens/s {tokens/dt:.2f}")
 
     iter_num += 1
     local_iter_num += 1
