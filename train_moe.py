@@ -9,6 +9,7 @@ import math
 import gc
 import glob
 import threading
+import argparse
 from queue import Queue
 from contextlib import nullcontext
 import random
@@ -29,6 +30,14 @@ from rich.console import Console
 console = Console()
 
 import torch._inductor.config
+
+# -----------------------------------------------------------------------------
+# Parse command line arguments
+# -----------------------------------------------------------------------------
+parser = argparse.ArgumentParser(description='Train MoE model')
+parser.add_argument('--size', type=str, choices=['small', 'medium'], default='small',
+                   help='Model size configuration (small or medium)')
+args = parser.parse_args()
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -63,35 +72,57 @@ torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
 if torch.cuda.is_available():
     device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'
     
-    # Increase batch size and reduce gradient accumulation steps
-    batch_size = 48  # Increased from 8
-    block_size = 512
+    if args.size == "small":
+        # Increase batch size and reduce gradient accumulation steps
+        batch_size = 8  
+        block_size = 64
+        
+        num_experts = 16
+        expert_k = 2
+        
+        gradient_accumulation_steps = 2
+        
+        # Encoder config
+        encoder_n_layer = 4
+        encoder_n_head = 4
+        encoder_n_embd = 384
+        encoder_ratio_kv = 4
+        
+        # Decoder config
+        decoder_n_layer = 4
+        decoder_n_head = 4
+        decoder_n_embd = 384
+        decoder_ratio_kv = 4
     
-    # Fixed sequence lengths for padding
-    encoder_seq_len = 64
-    decoder_seq_len = 64
+    elif args.size == "medium":
+        # Increase batch size and reduce gradient accumulation steps
+        batch_size = 48  
+        block_size = 512
+        
+        num_experts = 64
+        expert_k = 4
     
-    # Encoder config
-    encoder_n_layer = 4
-    encoder_n_head = 4
-    encoder_n_embd = 384
-    encoder_ratio_kv = 4
+        gradient_accumulation_steps = 8
+
+        # Encoder config
+        encoder_n_layer = 8
+        encoder_n_head = 8
+        encoder_n_embd = 768
+        encoder_ratio_kv = 4
+        
+        # Decoder config
+        decoder_n_layer = 8
+        decoder_n_head = 8
+        decoder_n_embd = 768
+        decoder_ratio_kv = 4
     
-    # Decoder config
-    decoder_n_layer = 4
-    decoder_n_head = 4
-    decoder_n_embd = 384
-    decoder_ratio_kv = 4
-    
-    # MoE specific - reduce number of experts for better GPU utilization
-    num_experts = 64
-    expert_k = 4
     router_z_loss_coef = 0.0001
     router_aux_loss_coef = 0.001
     
-    # Optimize gradient accumulation for better GPU utilization
-    gradient_accumulation_steps = 8
-    
+    # Fixed sequence lengths for padding
+    encoder_seq_len = block_size
+    decoder_seq_len = block_size
+
     # CUDA Optimizations
     torch.cuda.empty_cache()
     torch.backends.cuda.matmul.allow_tf32 = True
