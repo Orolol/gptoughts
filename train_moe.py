@@ -64,8 +64,8 @@ if torch.cuda.is_available():
     device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'
     
     # Increase batch size and reduce gradient accumulation steps
-    batch_size = 8  # Increased from 8
-    block_size = 64
+    batch_size = 32  # Increased from 8
+    block_size = 512
     
     # Fixed sequence lengths for padding
     encoder_seq_len = 64
@@ -84,13 +84,13 @@ if torch.cuda.is_available():
     decoder_ratio_kv = 4
     
     # MoE specific - reduce number of experts for better GPU utilization
-    num_experts = 16
-    expert_k = 2
+    num_experts = 64
+    expert_k = 4
     router_z_loss_coef = 0.0001
     router_aux_loss_coef = 0.001
     
     # Optimize gradient accumulation for better GPU utilization
-    gradient_accumulation_steps = 4
+    gradient_accumulation_steps = 2
     
     # CUDA Optimizations
     torch.cuda.empty_cache()
