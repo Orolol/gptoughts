@@ -107,13 +107,13 @@ if torch.cuda.is_available():
         # Encoder config
         encoder_n_layer = 4
         encoder_n_head = 4
-        encoder_n_embd = 768
+        encoder_n_embd = 384
         encoder_ratio_kv = 4
         
         # Decoder config
         decoder_n_layer = 8
         decoder_n_head = 8
-        decoder_n_embd = 768
+        decoder_n_embd = 384
         decoder_ratio_kv = 4
     
     router_z_loss_coef = 0.0001
