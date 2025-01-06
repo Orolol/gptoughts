@@ -64,7 +64,7 @@ if torch.cuda.is_available():
     device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'
     
     # Increase batch size and reduce gradient accumulation steps
-    batch_size = 32  # Increased from 8
+    batch_size = 64  # Increased from 8
     block_size = 512
     
     # Fixed sequence lengths for padding
@@ -626,7 +626,7 @@ while True:
         )
         
         try:
-            with torch.no_grad(), torch.amp.autocast(enabled=True):
+            with torch.no_grad(), torch.amp.autocast(enabled=True, device_type=device_type):
                 # Generate text
                 output_ids = model.generate(
                     input_tokens,
