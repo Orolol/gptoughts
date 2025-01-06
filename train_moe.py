@@ -96,17 +96,17 @@ if torch.cuda.is_available():
     
     elif args.size == "medium":
         # Increase batch size and reduce gradient accumulation steps
-        batch_size = 48  
+        batch_size = 32  
         block_size = 512
         
-        num_experts = 64
+        num_experts = 32
         expert_k = 4
     
-        gradient_accumulation_steps = 8
+        gradient_accumulation_steps = 2
 
         # Encoder config
-        encoder_n_layer = 8
-        encoder_n_head = 8
+        encoder_n_layer = 4
+        encoder_n_head = 4
         encoder_n_embd = 768
         encoder_ratio_kv = 4
         
