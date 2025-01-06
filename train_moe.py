@@ -434,7 +434,7 @@ iter_num = 1
 best_val_loss = float('inf')
 
 # Ajouter la définition du scaler ici
-scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'), device_type=device_type)
+scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
 
 if init_from == 'resume':
     print(f"Attempting to resume training from {out_dir}")
