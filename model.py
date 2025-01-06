@@ -1,15 +1,3 @@
-"""
-Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
-"""
-
-"""
-GPT Language Model implementation with Flash Attention 2 support.
-"""
 
 import inspect
 import math
@@ -21,30 +9,57 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.optim import AdamW
 import torch.utils.checkpoint as checkpoint
+import traceback
 
-# Try to import flash attention 2, but don't fail if not available
+# Configuration des backends d'attention
+ATTENTION_BACKENDS = {}
+
+# Try to import flash attention 2
 try:
     from flash_attn import flash_attn_func as flash_attn_func_2
+    ATTENTION_BACKENDS['flash_attn_2'] = True
     print("Flash Attention 2 available")
-    FLASH_ATTN_AVAILABLE_2 = True
 except ImportError:
-    FLASH_ATTN_AVAILABLE_2 = False
-    print("Flash Attention 2 not available, falling back to standard attention")
-    
-# New: detect flash attention 1
+    ATTENTION_BACKENDS['flash_attn_2'] = False
+    print("Flash Attention 2 not available")
+
+# Try to import xformers with better error handling
+ATTENTION_BACKENDS['xformers'] = False
 try:
-    from flash_attn.flash_attn_interface import flash_attn_func as flash_attn_func_1
-    FLASH_ATTN_AVAILABLE_1 = False
-    print("Flash Attention 1 available")
-except ImportError:
-    FLASH_ATTN_AVAILABLE_1 = False
-    print("Flash Attention 1 not available")
-    
+    import xformers
+    import xformers.ops as xops
+    # Vérifier si les opérations d'attention sont réellement disponibles
+    if hasattr(xops, 'memory_efficient_attention'):
+        ATTENTION_BACKENDS['xformers'] = True
+        print("xformers memory efficient attention available")
+    else:
+        print("xformers installed but memory efficient attention not available")
+except ImportError as e:
+    print(f"xformers not available: {e}")
+except Exception as e:
+    print(f"Error loading xformers: {e}")
+
 # Check if SDPA with CUDA backend is available
-SDPA_AVAILABLE = hasattr(F, "scaled_dot_product_attention") and torch.cuda.is_available()
-if SDPA_AVAILABLE:
+ATTENTION_BACKENDS['sdpa'] = hasattr(F, "scaled_dot_product_attention") and torch.cuda.is_available()
+if ATTENTION_BACKENDS['sdpa']:
     print("PyTorch SDPA available")
-    
+
+def get_best_attention_backend():
+    """
+    Retourne le meilleur backend d'attention disponible dans l'ordre de préférence:
+    1. Flash Attention 2
+    2. xformers
+    3. SDPA
+    4. None (attention standard)
+    """
+    if ATTENTION_BACKENDS['flash_attn_2']:
+        return 'flash_attn_2'
+    elif ATTENTION_BACKENDS['xformers']:
+        return 'xformers'
+    elif ATTENTION_BACKENDS['sdpa']:
+        return 'sdpa'
+    return None
+
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization"""
     
@@ -102,7 +117,6 @@ class AlibiPositionalBias(nn.Module):
         return self.alibi.to(device)[:, :T, :T]
 
 class CausalSelfAttention(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -123,20 +137,17 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         
-        # Flash Attention setup
-        self.flash = False
-        self.flash_version = None
-        self.use_sdpa = False
-        
-        # Adjust logic to detect flash-attn v2 first, then v1
-        if FLASH_ATTN_AVAILABLE_2 and torch.cuda.is_available():
-            self.flash = True
-            self.flash_version = 2
-        elif FLASH_ATTN_AVAILABLE_1 and torch.cuda.is_available():
-            self.flash = True
-            self.flash_version = 1
-        elif SDPA_AVAILABLE:
-            self.use_sdpa = True
+        # Attention backend setup
+        if hasattr(config, 'attention_backend') and config.attention_backend is not None:
+            if config.attention_backend not in ATTENTION_BACKENDS:
+                raise ValueError(f"Attention backend {config.attention_backend} not available. Available backends: {list(ATTENTION_BACKENDS.keys())}")
+            if not ATTENTION_BACKENDS[config.attention_backend]:
+                raise ValueError(f"Attention backend {config.attention_backend} is not installed or not working properly")
+            self.attention_backend = config.attention_backend
+        else:
+            self.attention_backend = get_best_attention_backend()
+            
+        print(f"Using attention backend: {self.attention_backend}")
         
         # ALiBi positional bias - ajusté pour GQA
         self.alibi = AlibiPositionalBias(self.n_head, config.block_size)
@@ -146,59 +157,119 @@ class CausalSelfAttention(nn.Module):
         mask = torch.triu(mask, diagonal=1)
         self.register_buffer('mask', mask)
 
-    def forward(self, x, key_value=None, is_generation=False):
+    def _memory_efficient_attention(self, q, k, v, mask=None, is_causal=True):
         """
-        Forward pass avec gestion spécifique pour la génération
+        Wrapper pour l'attention memory efficient avec gestion des erreurs
+        """
+        try:
+            # Préparer les tenseurs
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+            
+            # Gérer l'expansion pour GQA si nécessaire
+            if k.size(1) != q.size(1):  # Si les dimensions ne correspondent pas (cas GQA)
+                # Expand k et v pour correspondre au nombre de têtes de q
+                k = k.expand(-1, q.size(1), -1, -1)
+                v = v.expand(-1, q.size(1), -1, -1)
+            
+            # Reshape pour xformers [B, H, T, D] -> [B, T, H, D]
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            
+            attn_bias = xops.LowerTriangularMask() if is_causal else None
+            
+            y = xops.memory_efficient_attention(
+                q, k, v,
+                attn_bias=attn_bias,
+                p=self.attn_dropout.p if self.training else 0.0,
+                scale=1.0 / math.sqrt(self.head_dim)
+            )
+            
+            # Reshape back [B, T, H, D] -> [B, H, T, D]
+            return y.transpose(1, 2)
+            
+        except Exception as e:
+            print(f"xformers memory efficient attention failed: {e}")
+            return None
+
+    def _flash_attention(self, q, k, v, mask=None, is_causal=True):
+        """
+        Wrapper pour Flash Attention 2
+        """
+        try:
+            return flash_attn_func_2(q, k, v, causal=is_causal)
+        except Exception as e:
+            print(f"Flash Attention 2 failed: {e}")
+            return None
+
+    def _sdpa_attention(self, q, k, v, mask=None, is_causal=True):
+        """
+        Wrapper pour Scaled Dot Product Attention
+        """
+        try:
+            # Ne pas passer de masque explicite si is_causal=True
+            return F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None if is_causal else mask,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+                is_causal=is_causal
+            )
+        except Exception as e:
+            print(f"SDPA failed: {e}")
+            return None
+
+    def _standard_attention(self, q, k, v, mask=None, is_causal=True):
+        """
+        Implementation standard de l'attention avec optimisations mémoire
+        """
+        scale = 1.0 / math.sqrt(self.head_dim)
+        att = torch.matmul(q, k.transpose(-2, -1)) * scale
         
-        Args:
-            x: Tensor d'entrée
-            key_value: Tensor optionnel pour cross-attention
-            is_generation: Bool indiquant si on est en mode génération
-        """
+        # Clipping pour stabilité numérique
+        att = torch.clamp(att, min=-1e4, max=1e4)
+        
+        # Appliquer le masque et le bias
+        if is_causal:
+            if mask is not None:
+                att = att + mask
+            att = att + self.alibi.get_bias(q.size(-2), q.device)
+        
+        # Utiliser float32 pour le softmax pour plus de stabilité
+        att = F.softmax(att.float(), dim=-1).to(q.dtype)
+        att = self.attn_dropout(att)
+        
+        return torch.matmul(att, v)
+
+    def forward(self, x, key_value=None, is_generation=False):
         B, T, C = x.size()
         
-        # Sauvegarder l'état initial de flash attention
-        initial_flash_state = self.flash
-        
-        # Convertir en bfloat16 pour Flash Attention
+        # Convertir en bfloat16 si nécessaire pour Flash Attention 2
         orig_dtype = x.dtype
-        if self.flash and x.dtype not in [torch.bfloat16, torch.float16]:
+        if self.attention_backend == 'flash_attn_2' and x.dtype not in [torch.bfloat16, torch.float16]:
             x = x.to(torch.bfloat16)
         
         try:
-            # Si key_value est fourni, on fait de la cross-attention
+            # Vérification et correction des NaN/Inf
+            if torch.isnan(x).any() or torch.isinf(x).any():
+                x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+            
+            # Cross-attention
             if key_value is not None:
-                # Projeter la query depuis x
                 q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-                
-                # Projeter key et value depuis key_value
                 k = self.k_proj(key_value)
                 v = self.v_proj(key_value)
                 
-                # Reshape pour l'attention
                 k = k.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
                 v = v.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
                 
-                # Répéter K,V pour correspondre au nombre de têtes de Q
-                # Important: faire ceci avant le calcul de l'attention
+                # Répéter K,V pour GQA
                 k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
                 v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
                 
-                # Calcul de l'attention
-                scale = 1.0 / math.sqrt(self.head_dim)
-                att = torch.matmul(q, k.transpose(-2, -1)) * scale
-                
-                
-                mask = None
-                
-                # Pas de masque causal en cross-attention
-                att = F.softmax(att, dim=-1, dtype=torch.float32)
-                att = self.attn_dropout(att)
-                
-                y = torch.matmul(att, v)
-                
             else:
-                # Self-attention standard
+                # Self-attention
                 qkv = torch.cat([
                     self.q_proj(x),
                     self.k_proj(x),
@@ -211,148 +282,132 @@ class CausalSelfAttention(nn.Module):
                 k = k.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
                 v = v.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
                 
-                # Remove the repeat_interleave here since we'll handle it in the attention implementations
-                mask = self.mask[:T, :T]
-
-            if self.flash:
-                try:
-                    # Déterminer le dtype approprié en fonction de l'architecture GPU
-                    is_sm8x_or_sm90 = torch.cuda.get_device_capability()[0] >= 8
-                    dtype_to_use = torch.bfloat16 if is_sm8x_or_sm90 else torch.float16
-                    
-                    # Convertir q, k, v au dtype approprié
-                    q = q.to(dtype_to_use)
-                    k = k.to(dtype_to_use)
-                    v = v.to(dtype_to_use)
-
-                    # Call flash-attn v2 or v1
-                    if self.flash_version == 2:
-                        y = flash_attn_func_2(q, k, v, causal=mask is not None)
-                    elif self.flash_version == 1:
-                        # Répéter k et v pour correspondre à la dimension de q
-                        k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                        v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                        
-                        # Stack q, k, v
-                        qkv = torch.stack([q, k, v], dim=2)  # [B, n_head, 3, T, head_dim]
-                        
-                        print("qkv")
-                        print(qkv.shape)
-                        
-                        # Réorganiser les dimensions pour Flash Attention 1
-                        qkv = qkv.permute(0, 1, 3, 2, 4).contiguous()  # [B, n_head, T, 3, head_dim]
-                        qkv = qkv.view(-1, T, 3, self.head_dim)  # [B * n_head, T, 3, head_dim]
-
-                        # Build cu_seqlens
-                        cu_seqlens = torch.arange(
-                            0, (B * self.n_head + 1) * T, step=T,
-                            dtype=torch.int32, device=q.device
-                        )
-                        
-                        print("cu_seqlens")
-                        print(cu_seqlens.shape)
-                        
-                        max_s = T
-                        attn_drop_p = self.attn_dropout.p if self.training else 0.0
-                        
-                        y = flash_attn_func_1(
-                            qkv,
-                            cu_seqlens,
-                            attn_drop_p,
-                            max_s,
-                            None,
-                            mask is not None
-                        )
-                        
-                        print("y")
-                        print(y.shape)
-                        
-                        # Reshape output back to original dimensions
-                        # y est de forme [B * n_head, T, head_dim]
-                        y = y.view(B * self.n_head, T, self.head_dim)   # [B * n_head, T, head_dim]
-                            
-                        print("y 3")
-                        print(y.shape)
-                        
-                        y = y.view(B, self.n_head, T, self.head_dim)    # [B, n_head, T, head_dim]
-                        
-                        print("y 4")
-                        print(y.shape)
-                        
-                        y = y.transpose(1, 2).contiguous()              # [B, T, n_head, head_dim]
-                        
-                        print("y 5")
-                        print(y.shape)
-                        
-                        y = y.view(B, T, -1)                           # [B, T, n_embd]
-                    
-                    # Convertir le résultat au dtype original
-                    y = y.to(orig_dtype)
-                    
-                except Exception as e:
-                    print(f"Flash Attention failed: {e}")
-                    self.flash = False
-            
-            elif self.use_sdpa:
-                # Handle GQA for SDPA
+                # Répéter K,V pour GQA si ce n'est pas de la génération
                 if not is_generation:
                     k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
                     v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                
-                y = F.scaled_dot_product_attention(
-                    q, k, v,
-                    dropout_p=self.attn_dropout.p if self.training else 0.0,
-                    is_causal=True
-                )
             
-            if not (self.flash or self.use_sdpa):
-                # Attention standard optimisée pour la mémoire
-                scale = 1.0 / math.sqrt(self.head_dim)
-                att = torch.matmul(q, k.transpose(-2, -1)) * scale
-                
-                # Appliquer le masque et le bias si nécessaire
-                if mask is not None:
-                    att = att + self.alibi.get_bias(T, x.device).repeat_interleave(
-                        self.n_head // self.n_head_kv, dim=0
-                    )[:self.n_head]
-                    att = att + mask
-                
-                # Softmax et dropout
-                att = F.softmax(att, dim=-1, dtype=torch.float32)
-                att = self.attn_dropout(att.to(q.dtype))
-                
-                # Calcul final
-                y = torch.matmul(att, v)
+            # Déterminer si nous sommes en mode causal et préparer le masque
+            is_causal = key_value is None  # Causal seulement pour self-attention
+            attn_mask = self.mask[:T, :T] if is_causal else None
             
-            # Reshape final et reconversion au dtype original si nécessaire
+            y = None
+            if self.attention_backend == 'flash_attn_2':
+                y = self._flash_attention(q, k, v, attn_mask, is_causal)
+            
+            if y is None and self.attention_backend == 'xformers':
+                y = self._memory_efficient_attention(q, k, v, attn_mask, is_causal)
+            
+            if y is None and self.attention_backend == 'sdpa':
+                y = self._sdpa_attention(q, k, v, attn_mask, is_causal)
+            
+            if y is None:
+                y = self._standard_attention(q, k, v, attn_mask, is_causal)
+            
+            # Vérification finale des NaN/Inf
+            if torch.isnan(y).any() or torch.isinf(y).any():
+                y = torch.nan_to_num(y, nan=0.0, posinf=1e4, neginf=-1e4)
+            
+            # Reshape et projection finale
             y = y.transpose(1, 2).contiguous().view(B, T, C)
+            
+            # Reconvertir au dtype original si nécessaire
             if y.dtype != orig_dtype:
                 y = y.to(orig_dtype)
             
             return self.resid_dropout(self.o_proj(y))
             
-        finally:
-            # Restaurer l'état initial de flash attention
-            self.flash = initial_flash_state
+        except Exception as e:
+            print(f"Attention computation failed: {e}")
+            print(traceback.format_exc())
+            # Fallback sur l'attention standard en cas d'erreur
+            return self._standard_attention(q, k, v, attn_mask, is_causal)
 
 class MLP(nn.Module):
-
+    """
+    Multi-Layer Perceptron avec activation SwiGLU optimisée et gestion efficace de la mémoire.
+    """
     def __init__(self, config):
         super().__init__()
+        self.config = config
+        
+        # Utiliser 4 * n_embd comme dimension cachée par défaut
         hidden_dim = 4 * config.n_embd
-        self.w1 = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
-        self.w2 = nn.Linear(config.n_embd, hidden_dim, bias=config.bias)
-        self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
+        
+        # Projections combinées pour réduire le nombre d'opérations
+        self.gate_up_proj = nn.Linear(config.n_embd, 2 * hidden_dim, bias=config.bias)
+        self.down_proj = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
+        
         self.dropout = nn.Dropout(config.dropout)
+        
+        # Activation function setup
+        self.act_fn = self._get_optimized_activation()
+        
+        # Initialize weights with a special scale for better gradient flow
+        self._init_weights()
 
-    def forward(self, x):
-        # SwiGLU activation function
-        x1 = self.w1(x)
-        x2 = self.w2(x)
-        hidden = F.silu(x1) * x2
-        x = self.c_proj(hidden)
-        x = self.dropout(x)
-        return x
+    def _init_weights(self):
+        """
+        Initialisation spéciale des poids pour une meilleure convergence
+        """
+        # Scaled initialization for better gradient flow
+        scale = 2 / (self.config.n_embd ** 0.5)
+        
+        nn.init.normal_(self.gate_up_proj.weight, mean=0.0, std=scale)
+        if self.gate_up_proj.bias is not None:
+            nn.init.zeros_(self.gate_up_proj.bias)
+            
+        nn.init.normal_(self.down_proj.weight, mean=0.0, std=scale)
+        if self.down_proj.bias is not None:
+            nn.init.zeros_(self.down_proj.bias)
+
+    def _get_optimized_activation(self):
+        """
+        Retourne la fonction d'activation optimisée selon le device et les capacités
+        """
+        try:
+            # Vérifier si on peut utiliser une implémentation CUDA optimisée
+            if torch.cuda.is_available() and hasattr(torch.nn.functional, 'silu'):
+                def optimized_swiglu(x):
+                    # Éviter les opérations inplace sur les vues
+                    x1, x2 = x.chunk(2, dim=-1)
+                    return F.silu(x2) * x1
+                return optimized_swiglu
+        except:
+            pass
+        
+        # Fallback sur l'implémentation standard
+        def standard_swiglu(x):
+            x1, x2 = x.chunk(2, dim=-1)
+            return F.silu(x2) * x1
+        return standard_swiglu
+
+    def _fuse_operations(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Fusionne les opérations quand c'est possible pour une meilleure efficacité
+        """
+        # Combiner les projections up et gate en une seule opération
+        combined = self.gate_up_proj(x)
+        
+        # Appliquer l'activation
+        hidden = self.act_fn(combined)
+        
+        # Projection finale avec dropout
+        return self.dropout(self.down_proj(hidden))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass avec gestion optimisée de la mémoire
+        """
+        if torch.jit.is_scripting() or not self.training:
+            # Mode inference ou JIT: utiliser l'implémentation fusionnée
+            return self._fuse_operations(x)
+        
+        # Mode training: utiliser la version avec checkpointing si la séquence est longue
+        if x.shape[1] > 1024:  # Seuil arbitraire, peut être ajusté
+            return checkpoint.checkpoint(self._fuse_operations, x, use_reentrant=False)
+        
+        return self._fuse_operations(x)
 
 class Block(nn.Module):
 
@@ -428,6 +483,8 @@ class GPTConfig:
     dropout: float = 0.0    # Dropout probability
     bias: bool = True       # Whether to use bias in Linear and LayerNorm layers
     ratio_kv: int = 4      # Ratio of key/value heads
+    label_smoothing: float = 0.1  # Label smoothing factor
+    attention_backend: Optional[str] = None  # Force specific attention backend (flash_attn_2, xformers, sdpa, or None for auto)
 
 class GPT(nn.Module):
     def __init__(self, config, embedding_layer, pos_embedding_layer):
@@ -513,7 +570,36 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            
+            if self.config.label_smoothing > 0.0:
+                # Calculer la loss avec label smoothing
+                num_classes = logits.size(-1)
+                smoothing = self.config.label_smoothing
+                
+                # Créer les labels lissés
+                confidence = 1.0 - smoothing
+                smoothing_value = smoothing / (num_classes - 1)
+                
+                # One-hot avec label smoothing
+                true_dist = torch.zeros_like(logits)
+                true_dist.fill_(smoothing_value)
+                true_dist.scatter_(
+                    -1, 
+                    targets.unsqueeze(-1), 
+                    confidence
+                )
+                
+                # Calculer la KL divergence
+                log_probs = F.log_softmax(logits.view(-1, logits.size(-1)), dim=-1)
+                loss = -(true_dist.view(-1, true_dist.size(-1)) * log_probs).sum(-1)
+                
+                # Masquer les positions de padding
+                mask = (targets != -1).float()
+                loss = (loss * mask.view(-1)).sum() / mask.sum()
+            else:
+                # Loss standard sans label smoothing
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :])
@@ -623,6 +709,10 @@ class EncoderDecoderGPT(nn.Module):
             RMSNorm(decoder_config.n_embd)
             for _ in range(decoder_config.n_layer)
         ])
+        
+        # Cache pour les états de l'encodeur
+        self._cached_encoder_output = None
+        self._cached_encoder_input = None
 
     def forward(self, encoder_idx, decoder_idx, targets=None):
         """
@@ -646,6 +736,13 @@ class EncoderDecoderGPT(nn.Module):
         
         encoder_idx = encoder_idx[:, :encoder_seq_len]
         decoder_idx = decoder_idx[:, :decoder_seq_len]
+        
+        # Ajouter des vérifications de NaN après chaque étape majeure
+        def check_and_fix_nans(tensor, name):
+            if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                print(f"NaN/Inf detected in {name}")
+                return torch.nan_to_num(tensor, nan=0.0, posinf=1e4, neginf=-1e4)
+            return tensor
         
         # Encoder forward pass
         with torch.no_grad():
@@ -704,7 +801,35 @@ class EncoderDecoderGPT(nn.Module):
             # S'assurer que targets a la bonne taille
             targets = targets[:, :decoder_seq_len]
             logits = self.decoder.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            
+            if self.decoder.config.label_smoothing > 0.0:
+                # Calculer la loss avec label smoothing
+                num_classes = logits.size(-1)
+                smoothing = self.decoder.config.label_smoothing
+                
+                # Créer les labels lissés
+                confidence = 1.0 - smoothing
+                smoothing_value = smoothing / (num_classes - 1)
+                
+                # One-hot avec label smoothing
+                true_dist = torch.zeros_like(logits)
+                true_dist.fill_(smoothing_value)
+                true_dist.scatter_(
+                    -1, 
+                    targets.unsqueeze(-1), 
+                    confidence
+                )
+                
+                # Calculer la KL divergence
+                log_probs = F.log_softmax(logits.view(-1, logits.size(-1)), dim=-1)
+                loss = -(true_dist.view(-1, true_dist.size(-1)) * log_probs).sum(-1)
+                
+                # Masquer les positions de padding
+                mask = (targets != -1).float()
+                loss = (loss * mask.view(-1)).sum() / mask.sum()
+            else:
+                # Loss standard sans label smoothing
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
             
             # Ajouter la régularisation pour DDP si en mode training
             if self.training:
@@ -716,58 +841,10 @@ class EncoderDecoderGPT(nn.Module):
         else:
             logits = self.decoder.lm_head(x[:, [-1], :])
             loss = None
-        
         return logits, loss
-
+    
+    
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        """
-        Configure l'optimiseur pour l'ensemble du modèle encoder-decoder.
-        Utilise AdEMAMix de pytorch_optimizer.
-        """
-        # Collecter tous les paramètres
-        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
-        
-        # Séparer les paramètres qui doivent avoir du weight decay de ceux qui n'en ont pas
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        
-        try:
-            from pytorch_optimizer import AdEMAMix
-            
-            optimizer = AdEMAMix(
-                optim_groups,
-                lr=learning_rate,
-                betas=(betas[0], betas[1], betas[2] if len(betas) > 2 else 0.9999),
-                alpha=8.0,
-                beta3_warmup=256_000,
-                alpha_warmup=256_000,
-                weight_decay=weight_decay
-            )
-            print("Using AdEMAMix optimizer from pytorch_optimizer")
-            
-        except ImportError:
-            print("pytorch_optimizer not available, falling back to AdamW")
-            # Fallback sur AdamW si pytorch_optimizer n'est pas disponible
-            fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-            use_fused = fused_available and device_type == 'cuda'
-            extra_args = dict(fused=True) if use_fused else dict()
-            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas[:2], **extra_args)
-            print(f"using fused AdamW: {use_fused}")
-        
-        return optimizer
-    
-    
-    def configure_optimizers_adamw(self, weight_decay, learning_rate, betas, device_type):
         """
         Configure the AdamW optimizer with weight decay.
         
@@ -802,25 +879,6 @@ class EncoderDecoderGPT(nn.Module):
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
-
-        # Optimiser pour H100
-        if device_type == 'cuda':
-            # Activer TF32
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            
-            # Optimisations CUDA
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-            
-            # Compiler avec des options optimisées pour H100
-            if hasattr(torch, 'compile'):
-                self = torch.compile(
-                    self,
-                    mode='max-autotune',  # Utiliser le mode max-autotune au lieu des options détaillées
-                    fullgraph=True
-                )
-                print("Model compiled with max-autotune mode for H100")
 
         # Utiliser AdaFactor au lieu de AdamW pour une meilleure efficacité mémoire
         try:

@@ -18,7 +18,10 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group, all_reduce, ReduceOp, barrier as dist_barrier
+from torch.serialization import add_safe_globals
 
+from transformers import AutoTokenizer
+import pickle
 
 from model import GPTConfig, GPT, EncoderDecoderGPT
 from data.openwebtext.data_loader import StreamingDataset
@@ -29,8 +32,7 @@ console = Console()
 
 access_token=os.getenv('HF_TOKEN')
 
-# Ajouter l'import au début du fichier
-from pytorch_optimizer import AdEMAMix
+
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -53,15 +55,16 @@ data_dir = 'data/openwebtext'
 gradient_accumulation_steps = 1 # used to simulate larger batch sizes
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+attention_backend = "sdpa" # Force specific attention backend (flash_attn_2, xformers, sdpa, or None for auto)
 
 # Configurations pour l'encoder et le decoder
 if torch.cuda.is_available():
     device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'  # Use LOCAL_RANK for DDP
-    batch_size = 16 # Réduire la taille du batch
-    block_size = 512
+    # batch_size = 16 # Réduire la taille du batch
+    # block_size = 512
     
-    # batch_size = 16
-    # block_size = 64
+    batch_size = 16
+    block_size = 64
     
     print(f"Using device: {device}")
     print(f"Batch size: {batch_size}")
@@ -69,22 +72,22 @@ if torch.cuda.is_available():
     
     # Encoder config (plus petit)
     encoder_n_layer = 8
-    encoder_n_head = 16  # 1024/16 = 64 par tête
-    encoder_n_embd = 1024  # Doit être divisible par encoder_n_head
-    encoder_ratio_kv = 4  # 16/4 = 4 têtes KV
+    encoder_n_head = 8  # 1024/16 = 64 par tête
+    encoder_n_embd = 768  # Doit être divisible par encoder_n_head
+    encoder_ratio_kv = 8  # 16/4 = 4 têtes KV
     
     # Decoder config (plus grand)
-    decoder_n_layer = 32
-    decoder_n_head = 32  # 1024/32 = 32 par tête
-    decoder_n_embd = 1024  # Doit être divisible par decoder_n_head
-    decoder_ratio_kv = 4  # 32/4 = 8 têtes KV
+    decoder_n_layer = 12
+    decoder_n_head = 12  # 1024/32 = 32 par tête
+    decoder_n_embd = 768  # Doit être divisible par decoder_n_head
+    decoder_ratio_kv = 8  # 32/4 = 8 têtes KV
+    
     
     # Optimisations mémoire
     # gradient_accumulation_steps = max(1, 64 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
-    gradient_accumulation_steps = 4  # Augmenter l'accumulation
+    gradient_accumulation_steps = 8  # Augmenter l'accumulation
     
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
-    dtype = 'bfloat16'
     
     # Activer la gestion de mémoire optimisée
     torch.cuda.empty_cache()
@@ -125,13 +128,13 @@ beta3_warmup = alpha_warmup = 256_000  # périodes de warmup pour AdEMAMix
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 / gradient_accumulation_steps # how many steps to warm up for
+warmup_iters = 1000 / gradient_accumulation_steps # how many steps to warm up for
 lr_decay_iters = 600000 / gradient_accumulation_steps # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -178,15 +181,16 @@ if master_process:
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
 device_type = 'cuda' if 'cuda' in device else 'cpu'
+# dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+dtype = 'float16'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# Charger le décodeur de tokens
-from transformers import AutoTokenizer
-import random
-import pickle
-import os
+print(f"Device type: {device_type}")
+print(f"PT dtype: {ptdtype}")
+
 
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True, access_token=access_token)
 tokenizer.pad_token = tokenizer.eos_token
@@ -194,9 +198,8 @@ tokenizer.pad_token = tokenizer.eos_token
 decode = lambda tokens: tokenizer.decode(tokens, skip_special_tokens=True)
 
 
-
 # init these up here, can override if init_from='resume'
-iter_num = 0
+iter_num = 1
 best_val_loss = 1e9
 
 # model init
@@ -211,7 +214,8 @@ encoder_config = GPTConfig(
     ratio_kv=encoder_ratio_kv,
     bias=bias,
     vocab_size=vocab_size,
-    dropout=dropout
+    dropout=dropout,
+    attention_backend=attention_backend
 )
 
 decoder_config = GPTConfig(
@@ -222,7 +226,8 @@ decoder_config = GPTConfig(
     ratio_kv=decoder_ratio_kv,
     bias=bias,
     vocab_size=vocab_size,
-    dropout=dropout
+    dropout=dropout,
+    attention_backend=attention_backend
 )
 
 # Store model arguments for checkpointing
@@ -233,16 +238,17 @@ model_args = {
     'block_size': block_size
 }
 
+# Ajouter après les imports, avant le chargement du checkpoint
+add_safe_globals([GPTConfig])
+
 if init_from == 'resume':
     print(f"Attempting to resume training from {out_dir}")
-    # Trouver tous les checkpoints
     checkpoints = glob.glob(os.path.join(out_dir, 'ckpt_iter_*.pt'))
     if not checkpoints:
         print("No checkpoints found, initializing from scratch instead")
         init_from = 'scratch'
-        model = EncoderDecoderGPT(encoder_config, decoder_config)
     else:
-        # Extraire les numéros d'itération et trier
+        #Extraire les numéros d'itération et trier
         def extract_iter_num(filename):
             try:
                 return int(filename.split('iter_')[1].split('_loss')[0])
@@ -253,45 +259,64 @@ if init_from == 'resume':
         checkpoints.sort(key=extract_iter_num)
         ckpt_path = checkpoints[-1]
         print(f"Loading checkpoint: {ckpt_path}")
-        
-        checkpoint = torch.load(ckpt_path, map_location=device)
+        # Charger avec weights_only=True pour éviter de charger les buffers inutiles
+        checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=True)
         model = EncoderDecoderGPT(encoder_config, decoder_config)
+        
+        # Nettoyer le state dict avant chargement
         state_dict = checkpoint['model']
-        
-        # Nettoyer le state dict si nécessaire
         unwanted_prefix = '_orig_mod.'
-        for k,v in list(state_dict.items()):
-            if k.startswith(unwanted_prefix):
-                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+        cleaned_state_dict = {}
         
-        model.load_state_dict(state_dict)
+        for k, v in state_dict.items():
+            if k.startswith(unwanted_prefix):
+                cleaned_state_dict[k[len(unwanted_prefix):]] = v
+            else:
+                cleaned_state_dict[k] = v
+        
+        # Charger le state dict nettoyé
+        model.load_state_dict(cleaned_state_dict, strict=False)
+        optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+        
+        # Libérer la mémoire explicitement
+        del checkpoint['model']
+        del state_dict
+        del cleaned_state_dict
+        torch.cuda.empty_cache()
+        
+        # Charger l'optimiseur séparément et nettoyer ses états
+        if 'optimizer' in checkpoint:
+            optimizer_state = checkpoint['optimizer']
+            # Nettoyer les états de l'optimiseur qui pourraient être en float32
+            for state in optimizer_state['state'].values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(dtype=ptdtype)
+            optimizer.load_state_dict(optimizer_state)
+            del optimizer_state
+            torch.cuda.empty_cache()
+        
         iter_num = checkpoint['iter_num'] + 1
         best_val_loss = checkpoint['best_val_loss']
-        print(f"Resuming from iteration {iter_num} with best val loss {best_val_loss}")
+        
+        # Libérer le reste de la mémoire
+        del checkpoint
+        torch.cuda.empty_cache()
 
 if init_from == 'scratch':
     print("Initializing a new encoder-decoder model from scratch")
     model = EncoderDecoderGPT(encoder_config, decoder_config)
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 
-# Choisir manuellement dtype = "float16" si BF16 n'est pas supporté
-dtype = "float16"
-ptdtype = torch.float16
-
-device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # Juste avant le model.to(device):
 if compile:
     print("Compiling the model with reduced optimization...")
     compile_options = {
-        "mode": "reduce-overhead",
-        "fullgraph": False,
-        "dynamic": True,
-        "backend": "inductor",
-        "options": {
-            "allow_rnn": True,
-            "allow_gradient_checkpointing": True
-        }
+        "mode": "max-autotune",
+        # "fullgraph": False,
+        # "dynamic": True,
+        # "backend": "inductor",
     }
     
     # Disable gradient checkpointing before compilation
@@ -310,10 +335,6 @@ model.to(device)
 
 # Optimisations CUDA
 if device_type == 'cuda':
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
     
     default_stream = torch.cuda.current_stream()
     copy_stream = torch.cuda.Stream()
@@ -331,19 +352,7 @@ if device_type == 'cuda':
     # Désactiver le garbage collector automatique
     gc.disable()
     
-    # Configurer la gestion de la mémoire CUDA
-    torch.cuda.empty_cache()
-    torch.cuda.memory.empty_cache()
-    torch.backends.cudnn.benchmark = True
-    
-    # Réserver de la mémoire CUDA
-    cache_size = 24 * 1024 * 1024 * 1024  # 24GB
-    torch.cuda.empty_cache()
-    torch.cuda.memory.empty_cache()
-    torch.cuda.set_per_process_memory_fraction(0.8)  # Utiliser 80% de la mémoire disponible
-    
     # Optimisations mémoire supplémentaires
-    torch.cuda.empty_cache()
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
@@ -358,13 +367,6 @@ if device_type == 'cuda':
 
 # Configurer le gradient scaler
 scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
-
-# optimizer
-#  optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2, beta3), device_type)
-optimizer = model.configure_optimizers_adamw(weight_decay, learning_rate, (beta1, beta2), device_type)
-
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
 
 # wrap model into DDP container
 if ddp:
@@ -410,7 +412,18 @@ def reduce_metrics(metrics, world_size):
     all_reduce(metrics, op=ReduceOp.SUM)
     return metrics.item() / world_size
 
-# Update the estimate_loss function
+# Après la fonction reduce_metrics, ajoutons une fonction pour calculer la perplexité
+def calculate_perplexity(loss):
+    """
+    Calcule la perplexité à partir de la loss
+    Args:
+        loss: La valeur de la loss (cross-entropy)
+    Returns:
+        float: La valeur de la perplexité
+    """
+    return torch.exp(torch.tensor(loss)).item()
+
+# Modifier la fonction estimate_loss pour inclure la perplexité
 @torch.no_grad()
 def estimate_loss():
     out = {}
@@ -433,8 +446,11 @@ def estimate_loss():
             if ddp:
                 mean_loss = reduce_metrics(mean_loss, ddp_world_size)
             out[split] = mean_loss
+            # Calculer et stocker la perplexité
+            out[f'{split}_ppl'] = calculate_perplexity(mean_loss)
         else:
             out[split] = float('inf')
+            out[f'{split}_ppl'] = float('inf')
             
     model.train()
     return out
@@ -515,6 +531,33 @@ def cleanup_old_checkpoints(out_dir, keep_num=3):
         except Exception as e:
             print(f"Error removing checkpoint {ckpt}: {e}")
 
+def cleanup_memory():
+    """Nettoie la mémoire GPU"""
+    if device_type == 'cuda':
+        torch.cuda.empty_cache()
+        if gc.isenabled():
+            gc.collect()
+
+# Après avoir chargé le modèle, forcer le bon dtype
+def ensure_model_dtype(model, dtype):
+    """S'assure que le modèle est dans le bon dtype"""
+    for param in model.parameters():
+        param.data = param.data.to(dtype=dtype)
+    return model
+
+# Utiliser après le chargement du modèle
+if init_from == 'resume':
+    model = ensure_model_dtype(model, ptdtype)
+
+def print_memory_stats(prefix=""):
+    """Affiche les statistiques de mémoire GPU"""
+    if device_type == 'cuda':
+        print(f"{prefix} Memory stats:")
+        print(f"Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+        print(f"Reserved: {torch.cuda.memory_reserved()/1e9:.2f}GB")
+        print(f"Max allocated: {torch.cuda.max_memory_allocated()/1e9:.2f}GB")
+        
+print_memory_stats("Initial")
 
 while True:
     # determine and set the learning rate for this iteration
@@ -525,15 +568,17 @@ while True:
     if iter_num % eval_interval == 0 and master_process and iter_num > 0:
         print("Validation")
         losses = estimate_loss()
-        # print the first token of the input
-        
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, train ppl {losses['train_ppl']:.2f}, "
+              f"val loss {losses['val']:.4f}, val ppl {losses['val_ppl']:.2f}")
         print(f"Total tokens processed: {train_dataset.get_total_tokens():,}")
+        print_memory_stats("After validation")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
+                "train/perplexity": losses['train_ppl'],
                 "val/loss": losses['val'],
+                "val/perplexity": losses['val_ppl'],
                 "lr": lr,
                 "mfu": running_mfu*100,
                 "total_tokens": train_dataset.get_total_tokens()
@@ -541,22 +586,30 @@ while True:
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
+                # Sauvegarder sur CPU pour éviter la duplication en mémoire GPU
                 checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
+                    'model': {k: v.cpu() for k, v in raw_model.state_dict().items()},
+                    'optimizer': {
+                        'state': {k: {sk: sv.cpu() if isinstance(sv, torch.Tensor) else sv 
+                                     for sk, sv in v.items()}
+                                     for k, v in optimizer.state_dict()['state'].items()},
+                        'param_groups': optimizer.state_dict()['param_groups']
+                    },
                     'model_args': model_args,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
+                
                 checkpoint_path = os.path.join(
                     out_dir, 
                     f'ckpt_iter_{iter_num}_loss_{losses["val"]:.4f}.pt'
                 )
-                print(f"saving checkpoint to {checkpoint_path}")
+                
+                # Sauvegarder avec torch.save
                 torch.save(checkpoint, checkpoint_path)
-                # Nettoyer les anciens checkpoints
-                cleanup_old_checkpoints(out_dir, keep_num=3)
+                del checkpoint
+                cleanup_memory()
     if iter_num == 0 and eval_only:
         break
 
@@ -644,7 +697,8 @@ while True:
     t0 = t1
 
     # Mettre à jour total_tokens avant la réduction
-    total_tokens += (batch_size * block_size) * gradient_accumulation_steps
+    step_tokens = (batch_size * block_size) * gradient_accumulation_steps
+    total_tokens += step_tokens
 
     if iter_num % log_interval == 0:
         # Calculer les métriques locales (par GPU)
@@ -652,7 +706,7 @@ while True:
         elapsed = time.time() - train_start_time
         local_dt = dt
         local_tokens = total_tokens
-        local_tps = local_tokens / elapsed
+        local_tps = step_tokens / dt
 
         # Métriques agrégées (tous les GPUs)
         if ddp:
