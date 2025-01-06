@@ -96,10 +96,10 @@ if torch.cuda.is_available():
     
     elif args.size == "medium":
         # Increase batch size and reduce gradient accumulation steps
-        batch_size = 8  
+        batch_size = 16  
         block_size = 512
         
-        num_experts = 16
+        num_experts = 8
         expert_k = 2
     
         gradient_accumulation_steps = 2
