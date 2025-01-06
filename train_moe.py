@@ -105,10 +105,10 @@ if torch.cuda.is_available():
         gradient_accumulation_steps = 2
 
         # Encoder config
-        encoder_n_layer = 4
-        encoder_n_head = 4
+        encoder_n_layer = 8
+        encoder_n_head = 8
         encoder_n_embd = 768
-        encoder_ratio_kv = 4
+        encoder_ratio_kv = 8
         
         # Decoder config
         decoder_n_layer = 8
