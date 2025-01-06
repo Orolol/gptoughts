@@ -330,10 +330,17 @@ class MoEEncoderDecoderGPT(nn.Module):
         """
         Generate text using the MoE model.
         """
+        # Ensure input has correct shape
+        if idx.dim() == 1:
+            idx = idx.unsqueeze(0)
+        
         # Encode input sequence once
         encoder_pos = torch.arange(0, idx.size(1), device=idx.device)
         encoder_emb = self.shared_embedding(idx)
         encoder_pos_emb = self.shared_pos_embedding(encoder_pos)
+        
+        # Adjust dimensions for broadcasting
+        encoder_pos_emb = encoder_pos_emb.unsqueeze(0).expand(idx.size(0), -1, -1)
         
         x = self.encoder.drop(encoder_emb + encoder_pos_emb)
         
@@ -362,27 +369,33 @@ class MoEEncoderDecoderGPT(nn.Module):
             decoder_emb = self.shared_embedding(decoder_idx)
             decoder_pos_emb = self.shared_pos_embedding(decoder_pos)
             
+            # Adjust dimensions for broadcasting
+            decoder_pos_emb = decoder_pos_emb.unsqueeze(0).expand(decoder_idx.size(0), -1, -1)
+            
             # Process decoder input
             decoder_x = self.decoder.drop(decoder_emb + decoder_pos_emb)
             
             # Decoder layers with cross-attention
             for i, (block, cross_attn) in enumerate(zip(self.decoder.h, self.cross_attention)):
                 # Self-attention
-                decoder_x = decoder_x + block.attn(block.ln_1(decoder_x))
+                attn_output = block.attn(block.ln_1(decoder_x))
+                decoder_x = decoder_x + attn_output
                 
                 # Cross-attention with encoder output
                 cross_x = self.cross_ln[i](decoder_x)
-                decoder_x = decoder_x + cross_attn(cross_x, key_value=encoder_output)
+                cross_output = cross_attn(cross_x, key_value=encoder_output)
+                decoder_x = decoder_x + cross_output
                 
                 # MoE layer
-                moe_out, _ = block.moe(block.ln_2(decoder_x))
+                moe_input = block.ln_2(decoder_x)
+                moe_out, _ = block.moe(moe_input)
                 decoder_x = decoder_x + moe_out
             
             decoder_x = self.decoder.ln_f(decoder_x)
             
             # Get logits for next token
             logits = self.lm_head(decoder_x[:, -1:])
-            logits = logits.squeeze(1)
+            logits = logits.reshape(decoder_x.size(0), -1)  # Use reshape instead of squeeze
             
             # Apply temperature and top-k sampling
             logits = logits / temperature
