@@ -557,6 +557,8 @@ running_mfu = -1.0
 train_start_time = time.time()
 tokens_per_iter = batch_size * block_size * gradient_accumulation_steps
 total_tokens = 0
+tokens_window = []  # Pour calculer une moyenne glissante des tokens/s
+window_size = 100   # Taille de la fenêtre pour la moyenne glissante
 
 print(f"Starting training with {num_experts} experts and top-{expert_k} routing")
 print_memory_stats("Initial")
@@ -678,7 +680,15 @@ while True:
             try:
                 with ctx:
                     logits, loss, router_loss = model(encoder_input, decoder_input, target)
-                    total_tokens += encoder_input.numel()
+                    # Compter les tokens réels (entrée + sortie)
+                    batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
+                    total_tokens += batch_tokens
+                    
+                    # Mettre à jour la fenêtre glissante pour les tokens/s
+                    tokens_window.append((time.time(), batch_tokens))
+                    if len(tokens_window) > window_size:
+                        tokens_window.pop(0)
+                    
                     if loss is not None:
                         # Vérifier les NaN avant de continuer
                         if torch.isnan(loss).any() or torch.isnan(router_loss).any():
@@ -721,14 +731,27 @@ while True:
         lossf = total_loss * gradient_accumulation_steps
         router_lossf = total_router_loss * gradient_accumulation_steps
         
-        lossf = lossf
+        # Calculer le taux de tokens/s sur la fenêtre glissante
+        if len(tokens_window) > 1:
+            window_time = tokens_window[-1][0] - tokens_window[0][0]
+            window_tokens = sum(tokens for _, tokens in tokens_window)
+            current_tokens_per_sec = window_tokens / window_time if window_time > 0 else 0
+        else:
+            current_tokens_per_sec = 0
+        
+        # Calculer le temps total d'entraînement
+        total_time = time.time() - train_start_time
+        avg_tokens_per_sec = total_tokens / total_time if total_time > 0 else 0
         
         if local_iter_num >= 5:
             mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         
         print(f"iter {iter_num}: loss {lossf:.4f}, router_loss {router_lossf:.4f}, "
-              f"time {dt*1000:.2f}ms, lr {lr:.6f}, tokens {total_tokens:.2f}, tokens/s {tokens_per_iter/dt:.2f}")
+              f"time {dt*1000:.2f}ms, lr {lr:.6f}, "
+              f"total_tokens {total_tokens:,}, "
+              f"current_tokens/s {current_tokens_per_sec:.2f}, "
+              f"avg_tokens/s {avg_tokens_per_sec:.2f}")
 
     iter_num += 1
     local_iter_num += 1
