@@ -78,8 +78,8 @@ if torch.cuda.is_available():
     encoder_ratio_kv = 4
     
     # Decoder config
-    decoder_n_layer = 8
-    decoder_n_head = 8
+    decoder_n_layer = 4
+    decoder_n_head = 4
     decoder_n_embd = 384
     decoder_ratio_kv = 4
     
