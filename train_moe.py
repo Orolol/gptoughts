@@ -556,22 +556,28 @@ model.to(device)
 # CUDA optimizations
 if device_type == 'cuda':
     print("CUDA optimizations")
+    # Stream optimizations
     default_stream = torch.cuda.current_stream()
     copy_stream = torch.cuda.Stream()
     compute_stream = torch.cuda.Stream()
     
+    # Memory optimizations
     torch.multiprocessing.set_sharing_strategy('file_system')
     torch.cuda.empty_cache()
     
+    # Set device and memory settings
     device_index = 0 if isinstance(device, str) else device
     if isinstance(device, str) and ':' in device:
         device_index = int(device.split(':')[1])
     torch.cuda.set_device(device_index)
     
+    # Pin memory for faster CPU->GPU transfers
     pin_memory = True
     
+    # Disable garbage collection during training
     gc.disable()
     
+    # Optimize memory fraction
     torch.cuda.set_per_process_memory_fraction(0.95)
     
     # Additional CUDA optimizations
@@ -584,15 +590,30 @@ if device_type == 'cuda':
     torch.set_num_threads(6)  # Adjust based on CPU cores
     torch.set_num_interop_threads(6)  # Adjust based on CPU cores
     
-    # Enable channels last memory format
+    # Enable channels last memory format for better performance
     memory_format = torch.channels_last
     
-    # Set optimal CUDA launch blocking
+    # Disable CUDA launch blocking
     os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
     
-    # Optimize CUDA graphs
-    torch._inductor.config.triton.cudagraph_trees = True
-    torch._inductor.config.triton.cudagraph_branches = True
+    # Enable CUDA graph optimizations
+    torch._inductor.config.triton.cudagraphs = True
+    
+    # Additional inductor optimizations
+    torch._inductor.config.coordinate_descent_tuning = True
+    torch._inductor.config.epilogue_fusion = True
+    torch._inductor.config.pattern_matcher = True
+    
+    # Set workload-specific optimizations
+    torch._inductor.config.max_autotune = True
+    torch._inductor.config.optimize_indexing = True
+    
+    # Memory access optimizations
+    torch._inductor.config.reordering = True
+    
+    # Enable aggressive kernel fusion
+    os.environ["TORCH_COMPILE_FUSION_FORWARD_ENABLED"] = "1"
+    os.environ["TORCH_COMPILE_FUSION_BACKWARD_ENABLED"] = "1"
 
 # Configure gradient scaler
 scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
