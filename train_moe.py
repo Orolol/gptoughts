@@ -339,8 +339,44 @@ def print_memory_stats(prefix=""):
 def pad_sequences(encoder_input, decoder_input, target):
     """
     Pad sequences to fixed lengths for better CUDA Graph performance.
+    Includes dimension checks and debugging info.
     """
     B = encoder_input.size(0)
+    
+    # Check for NaN values
+    if torch.isnan(encoder_input).any():
+        raise ValueError("NaN values found in encoder_input")
+    if torch.isnan(decoder_input).any():
+        raise ValueError("NaN values found in decoder_input")
+    if target is not None and torch.isnan(target).any():
+        raise ValueError("NaN values found in target")
+    
+    # Check for invalid values
+    if (encoder_input < 0).any():
+        raise ValueError(f"Negative values found in encoder_input: min={encoder_input.min().item()}")
+    if (decoder_input < 0).any():
+        raise ValueError(f"Negative values found in decoder_input: min={decoder_input.min().item()}")
+    if target is not None and (target < -1).any():  # -1 is allowed for padding
+        raise ValueError(f"Invalid values found in target: min={target.min().item()}")
+    
+    # Check for values exceeding vocab size
+    if (encoder_input >= vocab_size).any():
+        raise ValueError(f"Values in encoder_input exceed vocab_size ({vocab_size}): max={encoder_input.max().item()}")
+    if (decoder_input >= vocab_size).any():
+        raise ValueError(f"Values in decoder_input exceed vocab_size ({vocab_size}): max={decoder_input.max().item()}")
+    
+    # Debug info
+    print(f"Input shapes - encoder: {encoder_input.shape}, decoder: {decoder_input.shape}, target: {target.shape if target is not None else None}")
+    print(f"Value ranges - encoder: [{encoder_input.min().item()}, {encoder_input.max().item()}], "
+          f"decoder: [{decoder_input.min().item()}, {decoder_input.max().item()}], "
+          f"target: [{target.min().item() if target is not None else 'N/A'}, {target.max().item() if target is not None else 'N/A'}]")
+    
+    # Dimension checks
+    if encoder_input.dim() != 2 or decoder_input.dim() != 2:
+        raise ValueError(f"Inputs must be 2D tensors. Got encoder: {encoder_input.dim()}D, decoder: {decoder_input.dim()}D")
+    
+    if target is not None and target.dim() != 2:
+        raise ValueError(f"Target must be a 2D tensor. Got {target.dim()}D")
     
     # Pad encoder input
     if encoder_input.size(1) < encoder_seq_len:
@@ -360,9 +396,23 @@ def pad_sequences(encoder_input, decoder_input, target):
     if target is not None:
         if target.size(1) < decoder_seq_len:
             pad_len = decoder_seq_len - target.size(1)
-            target = F.pad(target, (0, pad_len), value=-1)
+            target = F.pad(target, (0, pad_len), value=-1)  # Use -1 for padding in target
         else:
             target = target[:, :decoder_seq_len]
+    
+    # Final dimension check
+    if (encoder_input.size(1) != encoder_seq_len or 
+        decoder_input.size(1) != decoder_seq_len or 
+        (target is not None and target.size(1) != decoder_seq_len)):
+        raise ValueError(f"Sequence length mismatch after padding. "
+                      f"encoder: {encoder_input.size(1)}, "
+                      f"decoder: {decoder_input.size(1)}, "
+                      f"target: {target.size(1) if target is not None else None}")
+    
+    print(f"Output shapes - encoder: {encoder_input.shape}, decoder: {decoder_input.shape}, target: {target.shape if target is not None else None}")
+    print(f"Output value ranges - encoder: [{encoder_input.min().item()}, {encoder_input.max().item()}], "
+          f"decoder: [{decoder_input.min().item()}, {decoder_input.max().item()}], "
+          f"target: [{target.min().item() if target is not None else 'N/A'}, {target.max().item() if target is not None else 'N/A'}]")
     
     return encoder_input, decoder_input, target
 
@@ -718,9 +768,27 @@ while True:
             
             try:
                 encoder_input, decoder_input, target = next(train_iterator)
+                
+                # Print memory stats and device info before padding
+                if iter_num % log_interval == 0:
+                    print(f"\nStep {iter_num}, Microstep {micro_step}")
+                    print(f"Devices - encoder: {encoder_input.device}, decoder: {decoder_input.device}, target: {target.device if target is not None else None}")
+                    print(f"Memory before padding - Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+                
+                # Move tensors to device before padding
+                encoder_input = encoder_input.to(device)
+                decoder_input = decoder_input.to(device)
+                if target is not None:
+                    target = target.to(device)
+                
                 encoder_input, decoder_input, target = pad_sequences(
                     encoder_input, decoder_input, target
                 )
+                
+                # Print memory stats after padding
+                if iter_num % log_interval == 0:
+                    print(f"Memory after padding - Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+                    print_memory_stats("After padding")
             except StopIteration:
                 train_iterator = iter(train_dataset)
                 encoder_input, decoder_input, target = next(train_iterator)
