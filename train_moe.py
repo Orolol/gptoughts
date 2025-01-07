@@ -607,9 +607,6 @@ if device_type == 'cuda':
     # Set workload-specific optimizations
     torch._inductor.config.max_autotune = True
     
-    # Memory access optimizations
-    torch._inductor.config.reordering = True
-    
     # Enable aggressive kernel fusion
     os.environ["TORCH_COMPILE_FUSION_FORWARD_ENABLED"] = "1"
     os.environ["TORCH_COMPILE_FUSION_BACKWARD_ENABLED"] = "1"
