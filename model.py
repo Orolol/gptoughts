@@ -73,6 +73,45 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.weight * self._norm(x.float()).type_as(x)
 
+class RoPE(nn.Module):
+    """
+    Rotary Position Embeddings implementation.
+    Based on the paper: https://arxiv.org/abs/2104.09864
+    """
+    def __init__(self, dim: int, max_seq_len: int = 2048, base: int = 10000):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+        
+        # Cache cos and sin values
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_seq_len).type_as(inv_freq)
+        freqs = torch.einsum('i,j->ij', t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        
+        self.register_buffer('cos_cached', emb.cos()[None, None, :, :], persistent=False)
+        self.register_buffer('sin_cached', emb.sin()[None, None, :, :], persistent=False)
+
+    def forward(self, x: torch.Tensor, seq_len: Optional[int] = None) -> torch.Tensor:
+        # x: [batch, nhead, seq_len, head_dim]
+        if seq_len is None:
+            seq_len = x.shape[-2]
+            
+        return self._rotate_half(x)
+
+    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        seq_len = x.shape[-2]
+        x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+        
+        cos = self.cos_cached[:, :, :seq_len, :]
+        sin = self.sin_cached[:, :, :seq_len, :]
+        
+        return torch.cat([
+            x1 * cos - x2 * sin,
+            x2 * cos + x1 * sin
+        ], dim=-1)
+
 class AlibiPositionalBias(nn.Module):
     """
     ALiBi (Attention with Linear Biases) implementation.
@@ -139,17 +178,17 @@ class CausalSelfAttention(nn.Module):
         # Attention backend setup
         if hasattr(config, 'attention_backend') and config.attention_backend is not None:
             if config.attention_backend not in ATTENTION_BACKENDS:
-                raise ValueError(f"Attention backend {config.attention_backend} not available. Available backends: {list(ATTENTION_BACKENDS.keys())}")
+                raise ValueError(f"Attention backend {config.attention_backend} not available")
             if not ATTENTION_BACKENDS[config.attention_backend]:
-                raise ValueError(f"Attention backend {config.attention_backend} is not installed or not working properly")
+                raise ValueError(f"Attention backend {config.attention_backend} not working properly")
             self.attention_backend = config.attention_backend
         else:
             self.attention_backend = get_best_attention_backend()
             
         print(f"Using attention backend: {self.attention_backend}")
         
-        # ALiBi positional bias - ajusté pour GQA
-        self.alibi = AlibiPositionalBias(self.n_head, config.block_size)
+        # Replace ALiBi with RoPE
+        self.rope = RoPE(self.head_dim, config.block_size)
         
         # Préallouer le masque causal
         mask = torch.full((config.block_size, config.block_size), float('-inf'))
@@ -161,7 +200,7 @@ class CausalSelfAttention(nn.Module):
         Wrapper pour l'attention memory efficient avec gestion des erreurs
         """
         try:
-            # Préparer les tenseurs
+            # Préparer les tenseurs avec memory pinning pour un transfert plus rapide
             q = q.contiguous()
             k = k.contiguous()
             v = v.contiguous()
@@ -177,13 +216,26 @@ class CausalSelfAttention(nn.Module):
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
             
-            attn_bias = xops.LowerTriangularMask() if is_causal else None
+            # Utiliser un masque optimisé pour xformers
+            if is_causal:
+                attn_bias = xops.LowerTriangularMask()
+            else:
+                # Convertir le masque en bias d'attention pour xformers si nécessaire
+                attn_bias = xops.AttentionBias.from_mask(mask) if mask is not None else None
+            
+            # Utiliser la mise en cache des KV pour la génération
+            if hasattr(self, '_cached_k') and hasattr(self, '_cached_v'):
+                k = torch.cat([self._cached_k, k], dim=1)
+                v = torch.cat([self._cached_v, v], dim=1)
+                self._cached_k = k
+                self._cached_v = v
             
             y = xops.memory_efficient_attention(
                 q, k, v,
                 attn_bias=attn_bias,
                 p=self.attn_dropout.p if self.training else 0.0,
-                scale=1.0 / math.sqrt(self.head_dim)
+                scale=1.0 / math.sqrt(self.head_dim),
+                op=None  # Let xformers choose the best operator
             )
             
             # Reshape back [B, T, H, D] -> [B, H, T, D]
@@ -195,25 +247,48 @@ class CausalSelfAttention(nn.Module):
 
     def _flash_attention(self, q, k, v, mask=None, is_causal=True):
         """
-        Wrapper pour Flash Attention 2
+        Wrapper pour Flash Attention 2 avec optimisations
         """
         try:
-            return flash_attn_func_2(q, k, v, causal=is_causal)
+            # Utiliser la mise en cache des KV pour la génération
+            if hasattr(self, '_cached_k') and hasattr(self, '_cached_v'):
+                k = torch.cat([self._cached_k, k], dim=2)  # dim=2 car Flash Attention utilise [B, H, T, D]
+                v = torch.cat([self._cached_v, v], dim=2)
+                self._cached_k = k
+                self._cached_v = v
+            
+            # Appliquer Flash Attention avec les optimisations
+            output = flash_attn_func_2(
+                q, k, v,
+                causal=is_causal,
+                softmax_scale=1.0 / math.sqrt(self.head_dim)
+            )
+            
+            return output
+            
         except Exception as e:
             print(f"Flash Attention 2 failed: {e}")
             return None
 
     def _sdpa_attention(self, q, k, v, mask=None, is_causal=True):
         """
-        Wrapper pour Scaled Dot Product Attention
+        Wrapper pour Scaled Dot Product Attention avec optimisations
         """
         try:
-            # Ne pas passer de masque explicite si is_causal=True
+            # Utiliser la mise en cache des KV pour la génération
+            if hasattr(self, '_cached_k') and hasattr(self, '_cached_v'):
+                k = torch.cat([self._cached_k, k], dim=2)
+                v = torch.cat([self._cached_v, v], dim=2)
+                self._cached_k = k
+                self._cached_v = v
+            
+            # Utiliser SDPA avec optimisations
             return F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=None if is_causal else mask,
                 dropout_p=self.attn_dropout.p if self.training else 0.0,
-                is_causal=is_causal
+                is_causal=is_causal,
+                scale=1.0 / math.sqrt(self.head_dim)
             )
         except Exception as e:
             print(f"SDPA failed: {e}")
@@ -223,23 +298,42 @@ class CausalSelfAttention(nn.Module):
         """
         Implementation standard de l'attention avec optimisations mémoire
         """
+        # Utiliser la mise en cache des KV pour la génération
+        if hasattr(self, '_cached_k') and hasattr(self, '_cached_v'):
+            k = torch.cat([self._cached_k, k], dim=2)
+            v = torch.cat([self._cached_v, v], dim=2)
+            self._cached_k = k
+            self._cached_v = v
+        
+        # Calculer l'attention avec optimisations mémoire
         scale = 1.0 / math.sqrt(self.head_dim)
-        att = torch.matmul(q, k.transpose(-2, -1)) * scale
+        
+        # Utiliser torch.baddbmm pour une multiplication matricielle plus efficace
+        att = torch.empty(q.shape[:-2] + (q.shape[-2], k.shape[-2]), 
+                         dtype=q.dtype, device=q.device)
+        att = torch.baddbmm(
+            att, q, k.transpose(-2, -1),
+            beta=0, alpha=scale
+        )
         
         # Clipping pour stabilité numérique
         att = torch.clamp(att, min=-1e4, max=1e4)
         
-        # Appliquer le masque et le bias
+        # Appliquer le masque causal si nécessaire
         if is_causal:
             if mask is not None:
                 att = att + mask
-            att = att + self.alibi.get_bias(q.size(-2), q.device)
         
         # Utiliser float32 pour le softmax pour plus de stabilité
         att = F.softmax(att.float(), dim=-1).to(q.dtype)
         att = self.attn_dropout(att)
         
-        return torch.matmul(att, v)
+        # Utiliser torch.baddbmm pour le produit final
+        out = torch.empty(att.shape[:-2] + (att.shape[-2], v.shape[-1]), 
+                         dtype=q.dtype, device=q.device)
+        out = torch.bmm(att, v)
+        
+        return out
 
     def forward(self, x, key_value=None, is_generation=False):
         B, T, C = x.size()
@@ -267,16 +361,10 @@ class CausalSelfAttention(nn.Module):
                 k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
                 v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
                 
-                # Pendant la génération, augmenter l'influence de la cross-attention
-                if is_generation:
-                    # Augmenter l'importance des requêtes et des clés
-                    q = q * 2.0
-                    k = k * 2.0
-                    
-                    # Ajouter un biais positif pour favoriser l'attention sur le prompt
-                    prompt_bias = torch.zeros((B, self.n_head, T, key_value.size(1)), device=x.device)
-                    prompt_bias = prompt_bias + 0.5  # Biais positif
-                    
+                # Apply RoPE to queries and keys
+                q = self.rope(q)
+                k = self.rope(k)
+                
             else:
                 # Self-attention
                 qkv = torch.cat([
@@ -295,10 +383,11 @@ class CausalSelfAttention(nn.Module):
                 if not is_generation:
                     k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
                     v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                    prompt_bias = None
-                else:
-                    prompt_bias = None
-            
+                
+                # Apply RoPE to queries and keys
+                q = self.rope(q)
+                k = self.rope(k)
+
             # Déterminer si nous sommes en mode causal et préparer le masque
             is_causal = key_value is None  # Causal seulement pour self-attention
             attn_mask = self.mask[:T, :T] if is_causal else None
