@@ -345,7 +345,9 @@ def validate_tokens(tensor, name, vocab_size):
     if invalid_tokens > 0:
         print(f"WARNING: Found {invalid_tokens} invalid tokens in {name} (>= vocab_size {vocab_size})")
         print(f"Token value range before fixing: [{tensor.min().item()}, {tensor.max().item()}]")
-        tensor = torch.clamp(tensor, max=vocab_size-1)
+        tensor = torch.where(tensor >= vocab_size, 
+                           torch.tensor(tokenizer.eos_token_id, device=tensor.device),
+                           tensor)
         print(f"Token value range after fixing: [{tensor.min().item()}, {tensor.max().item()}]")
     
     return tensor
@@ -491,7 +493,7 @@ encoder_config = GPTConfig(
     block_size=block_size,
     ratio_kv=encoder_ratio_kv,
     bias=bias,
-    vocab_size=vocab_size,
+    vocab_size=vocab_size,  # Using actual tokenizer vocab size
     dropout=dropout,
     attention_backend=attention_backend
 )
@@ -503,7 +505,7 @@ decoder_config = GPTConfig(
     block_size=block_size,
     ratio_kv=decoder_ratio_kv,
     bias=bias,
-    vocab_size=vocab_size,
+    vocab_size=vocab_size,  # Using actual tokenizer vocab size
     dropout=dropout,
     attention_backend=attention_backend
 )
