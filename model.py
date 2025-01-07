@@ -210,6 +210,12 @@ class CausalSelfAttention(nn.Module):
         Wrapper pour l'attention memory efficient avec gestion des erreurs
         """
         try:
+            # Ensure all tensors have the same dtype
+            working_dtype = torch.float16 if q.device.type == 'cuda' else torch.float32
+            q = q.to(working_dtype)
+            k = k.to(working_dtype)
+            v = v.to(working_dtype)
+            
             # Préparer les tenseurs avec memory pinning pour un transfert plus rapide
             q = q.contiguous()
             k = k.contiguous()
@@ -237,6 +243,9 @@ class CausalSelfAttention(nn.Module):
             if hasattr(self, '_cached_k') and hasattr(self, '_cached_v'):
                 k = torch.cat([self._cached_k, k], dim=1)
                 v = torch.cat([self._cached_v, v], dim=1)
+                # Ensure cached tensors have the same dtype
+                k = k.to(working_dtype)
+                v = v.to(working_dtype)
                 self._cached_k = k
                 self._cached_v = v
             
@@ -253,6 +262,7 @@ class CausalSelfAttention(nn.Module):
             
         except Exception as e:
             print(f"xformers memory efficient attention failed: {e}")
+            print(f"Tensor dtypes - q: {q.dtype}, k: {k.dtype}, v: {v.dtype}")
             return None
 
     def _flash_attention(self, q, k, v, mask=None, is_causal=True):
