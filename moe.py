@@ -388,8 +388,8 @@ class MoEEncoderDecoderGPT(nn.Module):
             dtype=torch.long,
             device=idx.device
         )
-        # Feed the entire prompt to decoder except its last token
-        decoder_idx = torch.cat([bos_token, idx[:, :-1]], dim=1)
+        # Feed the entire prompt to decoder 
+        decoder_idx = torch.cat([bos_token, idx], dim=1)
         
         # Track generated tokens for repetition detection
         last_tokens = []
