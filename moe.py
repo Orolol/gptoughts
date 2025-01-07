@@ -81,9 +81,12 @@ class Router(nn.Module):
             dispatch_mask[unrouted, least_loaded] = 1.0
         
         # Renormalize dispatch mask (in-place)
-        dispatch_mask.div_(dispatch_mask.sum(dim=-1, keepdim=True) + 1e-8)
+        dispatch_mask = dispatch_mask / (dispatch_mask.sum(dim=-1, keepdim=True) + 1e-8)
         
-        # Compute losses efficiently
+        # Store routing weights for loss computation
+        routing_weights_detached = routing_weights.detach()
+        
+        # Compute losses efficiently using detached tensors to avoid double backward
         router_z_loss = torch.mean(torch.square(router_logits))
         expert_counts = dispatch_mask.sum(0)
         target_count = combined_batch_size * self.k / self.num_experts
@@ -91,7 +94,7 @@ class Router(nn.Module):
         
         router_loss = 0.001 * router_z_loss + 0.001 * load_balance_loss
         
-        return routing_weights, dispatch_mask, router_loss
+        return routing_weights_detached, dispatch_mask, router_loss
 
 class ExpertMLP(nn.Module):
     """
