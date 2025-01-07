@@ -80,21 +80,24 @@ class Router(nn.Module):
             least_loaded = (capacity - expert_counts).argmax()
             dispatch_mask[unrouted, least_loaded] = 1.0
         
-        # Renormalize dispatch mask (in-place)
-        dispatch_mask = dispatch_mask / (dispatch_mask.sum(dim=-1, keepdim=True) + 1e-8)
+        # Create a new tensor for the normalized dispatch mask
+        dispatch_mask_sum = dispatch_mask.sum(dim=-1, keepdim=True) + 1e-8
+        normalized_dispatch_mask = dispatch_mask / dispatch_mask_sum
         
-        # Store routing weights for loss computation
-        routing_weights_detached = routing_weights.detach()
+        # Compute router z-loss (using original logits)
+        router_z_loss = 0.001 * torch.mean(torch.square(router_logits))
         
-        # Compute losses efficiently using detached tensors to avoid double backward
-        router_z_loss = torch.mean(torch.square(router_logits))
-        expert_counts = dispatch_mask.sum(0)
-        target_count = combined_batch_size * self.k / self.num_experts
-        load_balance_loss = torch.mean(torch.square(expert_counts / combined_batch_size - target_count / combined_batch_size))
+        # Compute load balancing loss using a separate tensor
+        expert_counts = normalized_dispatch_mask.detach().sum(0)
+        target_count = float(combined_batch_size * self.k / self.num_experts)
+        counts_scaled = expert_counts / float(combined_batch_size)
+        target_scaled = target_count / float(combined_batch_size)
+        load_balance_loss = 0.001 * torch.mean(torch.square(counts_scaled - target_scaled))
         
-        router_loss = 0.001 * router_z_loss + 0.001 * load_balance_loss
+        # Combine losses
+        router_loss = router_z_loss + load_balance_loss
         
-        return routing_weights_detached, dispatch_mask, router_loss
+        return routing_weights.detach(), normalized_dispatch_mask, router_loss
 
 class ExpertMLP(nn.Module):
     """
