@@ -90,27 +90,37 @@ class RoPE(nn.Module):
         freqs = torch.einsum('i,j->ij', t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         
-        self.register_buffer('cos_cached', emb.cos()[None, None, :, :], persistent=False)
-        self.register_buffer('sin_cached', emb.sin()[None, None, :, :], persistent=False)
+        # Reshape for broadcasting: [1, 1, seq_len, dim]
+        self.register_buffer('cos_cached', emb.cos().view(1, 1, max_seq_len, dim), persistent=False)
+        self.register_buffer('sin_cached', emb.sin().view(1, 1, max_seq_len, dim), persistent=False)
 
     def forward(self, x: torch.Tensor, seq_len: Optional[int] = None) -> torch.Tensor:
         # x: [batch, nhead, seq_len, head_dim]
         if seq_len is None:
             seq_len = x.shape[-2]
             
-        return self._rotate_half(x)
+        return self._rotate_half(x, seq_len)
 
-    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
-        seq_len = x.shape[-2]
-        x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+    def _rotate_half(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
+        # Ensure x is the right shape: [batch, nhead, seq_len, head_dim]
+        x = x.view(*x.shape[:-1], -1, 2)  # Split last dim into pairs
         
-        cos = self.cos_cached[:, :, :seq_len, :]
-        sin = self.sin_cached[:, :, :seq_len, :]
+        # Get the cos and sin values for the current sequence length
+        cos = self.cos_cached[..., :seq_len, :x.shape[-2]]
+        sin = self.sin_cached[..., :seq_len, :x.shape[-2]]
         
-        return torch.cat([
+        # Ensure broadcasting works correctly
+        cos = cos.expand(x.shape[0], x.shape[1], -1, -1)  # [batch, nhead, seq_len, dim/2]
+        sin = sin.expand(x.shape[0], x.shape[1], -1, -1)
+        
+        # Apply rotation
+        x1, x2 = x[..., 0], x[..., 1]
+        rotated = torch.stack([
             x1 * cos - x2 * sin,
-            x2 * cos + x1 * sin
+            x2 * cos + x1 * sin,
         ], dim=-1)
+        
+        return rotated.flatten(-2)  # Combine the rotated pairs
 
 class AlibiPositionalBias(nn.Module):
     """
@@ -407,9 +417,6 @@ class CausalSelfAttention(nn.Module):
                 scale = 1.0 / math.sqrt(self.head_dim)
                 att = torch.matmul(q, k.transpose(-2, -1)) * scale
                 
-                # Ajouter le biais de prompt si présent
-                if prompt_bias is not None:
-                    att = att + prompt_bias
                 
                 # Clipping pour stabilité numérique
                 att = torch.clamp(att, min=-1e4, max=1e4)
