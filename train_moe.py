@@ -389,24 +389,50 @@ def training_step(model, batch, optimizer, scaler):
     encoder_input, decoder_input, target = batch
     
     try:
+        # Vérifier les entrées
+        if torch.isnan(encoder_input).any() or torch.isnan(decoder_input).any():
+            print("NaN detected in input tensors")
+            return None, None, True
+            
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            # Forward pass avec vérification des gradients
             logits, loss, router_loss = model(encoder_input, decoder_input, target)
             
             if loss is not None:
-                # Vérification des NaN et Inf
-                if (torch.isnan(loss).any() or torch.isnan(router_loss).any() or
-                    torch.isinf(loss).any() or torch.isinf(router_loss).any()):
-                    print("NaN/Inf detected in loss calculation")
+                # Vérification détaillée des valeurs
+                if torch.isnan(loss).any():
+                    print("NaN detected in loss")
                     return None, None, True
+                if torch.isnan(router_loss).any():
+                    print("NaN detected in router_loss")
+                    return None, None, True
+                if torch.isinf(loss).any():
+                    print("Inf detected in loss")
+                    return None, None, True
+                if torch.isinf(router_loss).any():
+                    print("Inf detected in router_loss")
+                    return None, None, True
+                
+                loss_val = loss.item()
+                router_loss_val = router_loss.item()
                 
                 # Vérification des valeurs aberrantes
-                if loss.item() > 100 or router_loss.item() > 100:
-                    print(f"Abnormal loss values: loss={loss.item()}, router_loss={router_loss.item()}")
+                if loss_val > 100 or loss_val < 0:
+                    print(f"Abnormal loss value: {loss_val}")
+                    return None, None, True
+                if router_loss_val > 100 or router_loss_val < 0:
+                    print(f"Abnormal router loss value: {router_loss_val}")
                     return None, None, True
                 
+                # Scale losses
                 loss = loss / gradient_accumulation_steps
                 router_loss = router_loss / gradient_accumulation_steps
                 combined_loss = loss + router_aux_loss_coef * router_loss
+                
+                # Vérifier le combined loss
+                if torch.isnan(combined_loss).any() or torch.isinf(combined_loss).any():
+                    print("NaN/Inf detected in combined loss")
+                    return None, None, True
                 
                 # Scale loss and backward pass
                 scaled_loss = scaler.scale(combined_loss)
@@ -414,16 +440,32 @@ def training_step(model, batch, optimizer, scaler):
                 # Backward pass avec gestion d'erreur
                 try:
                     scaled_loss.backward()
+                    
+                    # Vérifier les gradients après backward
+                    for name, param in model.named_parameters():
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any():
+                                print(f"NaN detected in gradients of {name}")
+                                return None, None, True
+                            if torch.isinf(param.grad).any():
+                                print(f"Inf detected in gradients of {name}")
+                                return None, None, True
+                    
                 except RuntimeError as e:
                     print(f"Backward pass failed: {e}")
                     return None, None, True
                 
-                return loss.item(), router_loss.item(), False
+                return loss_val, router_loss_val, False
             
+            print("Loss is None")
             return None, None, True
             
     except RuntimeError as e:
         print(f"Forward pass failed: {e}")
+        if "out of memory" in str(e):
+            print("OOM detected, cleaning memory...")
+            if hasattr(torch.cuda, 'empty_cache'):
+                torch.cuda.empty_cache()
         return None, None, True
     except Exception as e:
         print(f"Unexpected error in training step: {e}")
