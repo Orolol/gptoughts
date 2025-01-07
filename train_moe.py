@@ -65,6 +65,9 @@ dropout = 0.0
 bias = False
 attention_backend = "sdpa"
 
+# Configure CUDA memory management
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:512'
+
 # Configure CUDA Graph behavior
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
 
@@ -365,6 +368,38 @@ def pad_sequences(encoder_input, decoder_input, target):
             target = target[:, :decoder_seq_len]
     
     return encoder_input, decoder_input, target
+
+def aggressive_memory_cleanup():
+    """Performs aggressive memory cleanup"""
+    if device_type == 'cuda':
+        # Clear GPU cache
+        torch.cuda.empty_cache()
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Clear CUDA graphs
+        torch.cuda.synchronize()
+        torch._dynamo.reset()
+        
+        # Clear autograd graph
+        for obj in gc.get_objects():
+            if torch.is_tensor(obj):
+                obj.detach_()
+            elif hasattr(obj, 'grad') and obj.grad is not None:
+                obj.grad.detach_()
+                obj.grad = None
+
+        # Additional CUDA cleanup
+        if hasattr(torch.cuda, 'reset_peak_memory_stats'):
+            torch.cuda.reset_peak_memory_stats()
+            
+        # Reset memory allocator
+        if hasattr(torch.cuda, 'reset_accumulated_memory_stats'):
+            torch.cuda.reset_accumulated_memory_stats()
+            
+        # Final cache clear
+        torch.cuda.empty_cache()
 
 # -----------------------------------------------------------------------------
 # Init
@@ -803,22 +838,12 @@ while True:
                 try:
                     with ctx:
                         logits, loss, router_loss = model(encoder_input, decoder_input, target)
-                        # Count real tokens (input + output)
-                        batch_tokens = (
-                            encoder_input.ne(tokenizer.pad_token_id).sum().item() +
-                            decoder_input.ne(tokenizer.pad_token_id).sum().item()
-                        )
-                        total_tokens += batch_tokens
-                        
-                        # Update sliding window for tokens/s
-                        tokens_window.append((time.time(), batch_tokens))
-                        if len(tokens_window) > window_size:
-                            tokens_window.pop(0)
                         
                         if loss is not None:
                             # Check for NaN before continuing
                             if torch.isnan(loss).any() or torch.isnan(router_loss).any():
                                 print("NaN detected in loss calculation, skipping batch")
+                                aggressive_memory_cleanup()
                                 skip_optimizer_step = True
                                 break
                             
@@ -829,13 +854,37 @@ while True:
                             scaled_loss.backward()
                             total_loss += loss.item()
                             total_router_loss += router_loss.item()
+                            
+                            # Count real tokens (input + output)
+                            batch_tokens = (
+                                encoder_input.ne(tokenizer.pad_token_id).sum().item() +
+                                decoder_input.ne(tokenizer.pad_token_id).sum().item()
+                            )
+                            total_tokens += batch_tokens
+                            
+                            # Update sliding window for tokens/s
+                            tokens_window.append((time.time(), batch_tokens))
+                            if len(tokens_window) > window_size:
+                                tokens_window.pop(0)
+                            
+                            # Clean up intermediate tensors
+                            del logits, scaled_loss, combined_loss
+                            
                 except RuntimeError as e:
-                    print(f"Error during forward/backward pass: {e}")
-                    skip_optimizer_step = True
-                    break
+                    if "out of memory" in str(e):
+                        print(f"OOM error during forward/backward pass: {e}")
+                        aggressive_memory_cleanup()
+                        skip_optimizer_step = True
+                        break
+                    else:
+                        print(f"Error during forward/backward pass: {e}")
+                        skip_optimizer_step = True
+                        break
 
-            # Synchronize streams
+            # Synchronize streams and clean up
             torch.cuda.current_stream().wait_stream(compute_stream)
+            if device_type == 'cuda':
+                torch.cuda.empty_cache()
             
         if not skip_optimizer_step:
             if grad_clip != 0.0:
@@ -844,12 +893,22 @@ while True:
             
             scaler.step(optimizer)
             scaler.update()
+            
+            # Clean up after optimizer step
+            optimizer.zero_grad(set_to_none=True)
+            if device_type == 'cuda':
+                torch.cuda.empty_cache()
 
     except Exception as e:
         print(f"Training iteration failed: {e}")
+        aggressive_memory_cleanup()
         if ddp:
             dist_barrier()
         continue
+        
+    # Periodic cleanup every 100 iterations
+    if iter_num % 100 == 0:
+        aggressive_memory_cleanup()
 
     # timing and logging
     t1 = time.time()
