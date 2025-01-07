@@ -26,68 +26,72 @@ class Router(nn.Module):
         
         # Initialize with smaller weights for better stability
         nn.init.normal_(self.router.weight, mean=0.0, std=0.001)
+        
+        # Register buffers for reuse
+        self.register_buffer('_indices_buffer', None, persistent=False)
+        self.register_buffer('_zeros_buffer', None, persistent=False)
+        self.register_buffer('_dispatch_buffer', None, persistent=False)
+
+    @torch.jit.export
+    def _create_or_update_buffers(self, batch_size: int, seq_len: int, device: torch.device):
+        combined_batch_size = batch_size * seq_len
+        
+        if (self._indices_buffer is None or 
+            self._indices_buffer.size(0) != combined_batch_size):
+            self._indices_buffer = torch.arange(combined_batch_size, device=device).unsqueeze(1).expand(-1, self.k)
+            self._zeros_buffer = torch.zeros((self.num_experts,), device=device)
+            self._dispatch_buffer = torch.zeros((combined_batch_size, self.num_experts), device=device)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        device = x.device
         batch_size, seq_len, _ = x.shape
         combined_batch_size = batch_size * seq_len
+        device = x.device
+        
+        # Update buffers if needed
+        self._create_or_update_buffers(batch_size, seq_len, device)
         
         # Calculate expert capacity
         capacity = int(self.capacity_factor * combined_batch_size * self.k / self.num_experts)
         
-        # Reshape input and compute router logits
-        x_reshaped = x.view(combined_batch_size, -1)
-        router_logits = self.router(x_reshaped)
-        
-        # Calculate routing probabilities with softmax
+        # Compute router logits and probabilities in one go
+        router_logits = self.router(x.view(combined_batch_size, -1))
         routing_weights = F.softmax(router_logits, dim=-1)
         
-        # Get top-k experts and weights
+        # Get and normalize top-k in one operation
         top_k_weights, top_k_indices = torch.topk(routing_weights, self.k, dim=-1)
+        top_k_weights = top_k_weights / (top_k_weights.sum(dim=-1, keepdim=True) + 1e-8)
         
-        # Normalize top-k weights
-        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+        # Reuse dispatch buffer and zero it
+        dispatch_mask = self._dispatch_buffer
+        dispatch_mask.zero_()
         
-        # Create dispatch mask
-        dispatch_mask = torch.zeros_like(routing_weights)
+        # Reuse expert counts buffer and zero it
+        expert_counts = self._zeros_buffer
+        expert_counts.zero_()
         
-        # Create indices for scatter operation
-        batch_indices = torch.arange(combined_batch_size, device=device).unsqueeze(1).expand(-1, self.k)
-        
-        # Count tokens per expert using one-hot encoding and cumsum
-        expert_counts = torch.zeros((self.num_experts,), device=device)
+        # Fused routing operation
         for k_idx in range(self.k):
             expert_idx = top_k_indices[:, k_idx]
             mask = expert_counts[expert_idx] < capacity
-            expert_counts.scatter_add_(0, expert_idx[mask], torch.ones_like(expert_idx[mask], dtype=torch.float))
-            dispatch_mask[batch_indices[mask, k_idx], expert_idx[mask]] = top_k_weights[mask, k_idx]
+            expert_counts.scatter_add_(0, expert_idx[mask], torch.ones_like(expert_idx[mask], dtype=torch.float32))
+            dispatch_mask[self._indices_buffer[mask, k_idx], expert_idx[mask]] = top_k_weights[mask, k_idx]
         
-        # Handle unrouted tokens (if any) - vectorized version
+        # Handle unrouted tokens efficiently
         unrouted = dispatch_mask.sum(dim=-1) == 0
-        if unrouted.any():
-            available_capacity = capacity - expert_counts
-            # Find least loaded expert for all unrouted tokens at once
-            least_loaded = available_capacity.argmax()
+        if torch.any(unrouted):
+            # Find least loaded expert and route all unrouted tokens there
+            least_loaded = (capacity - expert_counts).argmax()
             dispatch_mask[unrouted, least_loaded] = 1.0
         
-        # Renormalize dispatch mask
-        dispatch_mask = dispatch_mask / (dispatch_mask.sum(dim=-1, keepdim=True) + 1e-8)
+        # Renormalize dispatch mask (in-place where possible)
+        dispatch_mask.div_(dispatch_mask.sum(dim=-1, keepdim=True) + 1e-8)
         
-        # Calculate load balancing loss
-        expert_counts = dispatch_mask.sum(0)
-        target_count = torch.ones_like(expert_counts) * (combined_batch_size * self.k / self.num_experts)
-        
-        # Normalize counts
-        expert_counts_norm = expert_counts / combined_batch_size
-        target_count_norm = target_count / combined_batch_size
-        
-        # Calculate router z-loss to encourage exploration
+        # Compute losses efficiently
         router_z_loss = torch.mean(torch.square(router_logits))
+        expert_counts = dispatch_mask.sum(0)
+        target_count = combined_batch_size * self.k / self.num_experts
+        load_balance_loss = torch.mean(torch.square(expert_counts / combined_batch_size - target_count / combined_batch_size))
         
-        # Calculate load balancing loss
-        load_balance_loss = torch.mean(torch.square(expert_counts_norm - target_count_norm))
-        
-        # Combine losses with smaller coefficients
         router_loss = 0.001 * router_z_loss + 0.001 * load_balance_loss
         
         return routing_weights, dispatch_mask, router_loss
