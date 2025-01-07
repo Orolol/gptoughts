@@ -808,6 +808,9 @@ while True:
                     print_memory_stats("After padding")
             except StopIteration:
                 print("StopIteration error encountered. Resetting train_iterator.")
+                # On imprime la stack trace
+                import traceback
+                traceback.print_exc()
                 train_iterator = iter(train_dataset)
                 encoder_input, decoder_input, target = next(train_iterator)
                 encoder_input, decoder_input, target = pad_sequences(
