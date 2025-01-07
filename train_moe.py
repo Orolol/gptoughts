@@ -46,7 +46,7 @@ args = parser.parse_args()
 # I/O
 out_dir = 'out_moe'
 eval_interval = 1000
-log_interval = 1
+log_interval = 10
 eval_iters = 100
 eval_only = False
 always_save_checkpoint = True
@@ -96,13 +96,13 @@ if torch.cuda.is_available():
     
     elif args.size == "medium":
         # Increase batch size and reduce gradient accumulation steps
-        batch_size = 8  
+        batch_size = 16  
         block_size = 128
         
         num_experts = 32
         expert_k = 4
     
-        gradient_accumulation_steps = 8
+        gradient_accumulation_steps = 4
 
         # Encoder config
         encoder_n_layer = 4
