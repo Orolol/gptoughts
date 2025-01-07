@@ -27,28 +27,34 @@ class Router(nn.Module):
         # Initialize with smaller weights for better stability
         nn.init.normal_(self.router.weight, mean=0.0, std=0.001)
         
-        # Register buffers for reuse
-        self.register_buffer('_indices_buffer', None, persistent=False)
-        self.register_buffer('_zeros_buffer', None, persistent=False)
-        self.register_buffer('_dispatch_buffer', None, persistent=False)
-
-    @torch.jit.export
-    def _create_or_update_buffers(self, batch_size: int, seq_len: int, device: torch.device):
-        combined_batch_size = batch_size * seq_len
-        
-        if (self._indices_buffer is None or 
-            self._indices_buffer.size(0) != combined_batch_size):
-            self._indices_buffer = torch.arange(combined_batch_size, device=device).unsqueeze(1).expand(-1, self.k)
-            self._zeros_buffer = torch.zeros((self.num_experts,), device=device)
-            self._dispatch_buffer = torch.zeros((combined_batch_size, self.num_experts), device=device)
+        # Pre-register buffers with fixed size
+        max_batch_size = 32  # Adjust this based on your needs
+        max_seq_len = 256
+        self.register_buffer('_indices_buffer', 
+            torch.arange(max_batch_size * max_seq_len).unsqueeze(1).expand(-1, self.k),
+            persistent=False)
+        self.register_buffer('_zeros_buffer', 
+            torch.zeros((self.num_experts,)),
+            persistent=False)
+        self.register_buffer('_dispatch_buffer', 
+            torch.zeros((max_batch_size * max_seq_len, self.num_experts)),
+            persistent=False)
+        self.register_buffer('_ones_buffer',
+            torch.ones((max_batch_size * max_seq_len,), dtype=torch.float32),
+            persistent=False)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
         combined_batch_size = batch_size * seq_len
         device = x.device
         
-        # Update buffers if needed
-        self._create_or_update_buffers(batch_size, seq_len, device)
+        # Use slices of pre-allocated buffers
+        indices = self._indices_buffer[:combined_batch_size]
+        dispatch_mask = self._dispatch_buffer[:combined_batch_size]
+        dispatch_mask.zero_()
+        expert_counts = self._zeros_buffer
+        expert_counts.zero_()
+        ones = self._ones_buffer[:combined_batch_size]
         
         # Calculate expert capacity
         capacity = int(self.capacity_factor * combined_batch_size * self.k / self.num_experts)
@@ -61,29 +67,20 @@ class Router(nn.Module):
         top_k_weights, top_k_indices = torch.topk(routing_weights, self.k, dim=-1)
         top_k_weights = top_k_weights / (top_k_weights.sum(dim=-1, keepdim=True) + 1e-8)
         
-        # Reuse dispatch buffer and zero it
-        dispatch_mask = self._dispatch_buffer
-        dispatch_mask.zero_()
-        
-        # Reuse expert counts buffer and zero it
-        expert_counts = self._zeros_buffer
-        expert_counts.zero_()
-        
         # Fused routing operation
         for k_idx in range(self.k):
             expert_idx = top_k_indices[:, k_idx]
             mask = expert_counts[expert_idx] < capacity
-            expert_counts.scatter_add_(0, expert_idx[mask], torch.ones_like(expert_idx[mask], dtype=torch.float32))
-            dispatch_mask[self._indices_buffer[mask, k_idx], expert_idx[mask]] = top_k_weights[mask, k_idx]
+            expert_counts.scatter_add_(0, expert_idx[mask], ones[mask])
+            dispatch_mask[indices[mask, k_idx], expert_idx[mask]] = top_k_weights[mask, k_idx]
         
         # Handle unrouted tokens efficiently
         unrouted = dispatch_mask.sum(dim=-1) == 0
         if torch.any(unrouted):
-            # Find least loaded expert and route all unrouted tokens there
             least_loaded = (capacity - expert_counts).argmax()
             dispatch_mask[unrouted, least_loaded] = 1.0
         
-        # Renormalize dispatch mask (in-place where possible)
+        # Renormalize dispatch mask (in-place)
         dispatch_mask.div_(dispatch_mask.sum(dim=-1, keepdim=True) + 1e-8)
         
         # Compute losses efficiently
