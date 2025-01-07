@@ -117,7 +117,7 @@ if torch.cuda.is_available():
         decoder_ratio_kv = 4
     elif args.size == "large":
         # Increase batch size and reduce gradient accumulation steps
-        batch_size = 16  
+        batch_size = 20  
         block_size = 512
         
         num_experts = 64
@@ -798,8 +798,8 @@ while True:
             mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
 
-        print(f"iter {iter_num}: loss {lossf:.4f}, r_loss {router_lossf:.4f}, " 
-              f"time {dt*1000:.2f}ms, lr {lr:.6e}, "
+        print(f"iter {iter_num}: loss {lossf:.4f}, " 
+              f"time {dt*1000:.2f}ms, lr {lr:.2e}, "
               f"tt {total_tokens:,}, "
               f"t/s {current_tokens_per_sec:.2f}, "
               f"avgt/s {avg_tokens_per_sec:.2f}")
