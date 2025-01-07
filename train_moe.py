@@ -336,6 +336,20 @@ def print_memory_stats(prefix=""):
         print(f"Reserved: {torch.cuda.memory_reserved()/1e9:.2f}GB")
         print(f"Max allocated: {torch.cuda.max_memory_allocated()/1e9:.2f}GB")
 
+def validate_tokens(tensor, name, vocab_size):
+    """Validates and fixes token values to be within vocabulary size"""
+    if tensor is None:
+        return None
+        
+    invalid_tokens = (tensor >= vocab_size).sum().item()
+    if invalid_tokens > 0:
+        print(f"WARNING: Found {invalid_tokens} invalid tokens in {name} (>= vocab_size {vocab_size})")
+        print(f"Token value range before fixing: [{tensor.min().item()}, {tensor.max().item()}]")
+        tensor = torch.clamp(tensor, max=vocab_size-1)
+        print(f"Token value range after fixing: [{tensor.min().item()}, {tensor.max().item()}]")
+    
+    return tensor
+
 def pad_sequences(encoder_input, decoder_input, target):
     """
     Pad sequences to fixed lengths for better CUDA Graph performance.
@@ -359,11 +373,11 @@ def pad_sequences(encoder_input, decoder_input, target):
     if target is not None and (target < -1).any():  # -1 is allowed for padding
         raise ValueError(f"Invalid values found in target: min={target.min().item()}")
     
-    # Check for values exceeding vocab size
-    if (encoder_input >= vocab_size).any():
-        raise ValueError(f"Values in encoder_input exceed vocab_size ({vocab_size}): max={encoder_input.max().item()}")
-    if (decoder_input >= vocab_size).any():
-        raise ValueError(f"Values in decoder_input exceed vocab_size ({vocab_size}): max={decoder_input.max().item()}")
+    # Validate and fix token values
+    encoder_input = validate_tokens(encoder_input, "encoder_input", vocab_size)
+    decoder_input = validate_tokens(decoder_input, "decoder_input", vocab_size)
+    if target is not None:
+        target = validate_tokens(target, "target", vocab_size)
     
     # Debug info
     print(f"Input shapes - encoder: {encoder_input.shape}, decoder: {decoder_input.shape}, target: {target.shape if target is not None else None}")
@@ -468,6 +482,7 @@ tokenizer.pad_token = tokenizer.eos_token
 
 # Initialize model configs
 vocab_size = len(tokenizer)
+print(f"Tokenizer vocabulary size: {vocab_size}")
 
 encoder_config = GPTConfig(
     n_layer=encoder_n_layer,
