@@ -99,7 +99,7 @@ if torch.cuda.is_available():
         batch_size = 16  
         block_size = 128
         
-        num_experts = 32
+        num_experts = 36
         expert_k = 4
     
         gradient_accumulation_steps = 4
@@ -797,12 +797,12 @@ while True:
         if local_iter_num >= 5:
             mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        
-        print(f"iter {iter_num}: loss {lossf:.4f}, router_loss {router_lossf:.4f}, "
-              f"time {dt*1000:.2f}ms, lr {lr:.6f}, "
-              f"total_tokens {total_tokens:,}, "
-              f"current_tokens/s {current_tokens_per_sec:.2f}, "
-              f"avg_tokens/s {avg_tokens_per_sec:.2f}")
+
+        print(f"iter {iter_num}: loss {lossf:.4f}, r_loss {router_lossf:.4f}, " 
+              f"time {dt*1000:.2f}ms, lr {lr:.6e}, "
+              f"tt {total_tokens:,}, "
+              f"t/s {current_tokens_per_sec:.2f}, "
+              f"avgt/s {avg_tokens_per_sec:.2f}")
 
     iter_num += 1
     local_iter_num += 1
