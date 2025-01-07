@@ -687,9 +687,10 @@ window_size = 100   # Taille de la fenêtre pour la moyenne glissante
 
 print(f"Starting training with {num_experts} experts and top-{expert_k} routing")
 print_memory_stats("Initial")
-
+x = 0
 # training loop
-while True:
+while x < 10:
+    x += 1
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
