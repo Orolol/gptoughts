@@ -798,6 +798,7 @@ while True:
                 traceback.print_exc()
                 train_iterator = get_train_iterator()
                 encoder_input, decoder_input, target = next(train_iterator)
+                print("Reinitialized train_iterator and fetched new batch.")
             
             # Print memory stats and device info before padding
             if iter_num % log_interval == 0:
