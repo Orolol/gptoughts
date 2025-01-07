@@ -667,7 +667,13 @@ if ddp:
 
 # Initialize datasets
 train_dataset, val_dataset = get_datasets(block_size, batch_size, device)
-train_iterator = iter(train_dataset)
+
+def get_train_iterator():
+    """Helper function to get a fresh iterator"""
+    return iter(train_dataset)
+
+# Initialize training iterator
+train_iterator = get_train_iterator()
 
 # Initialize timing
 t0 = time.time()
@@ -785,37 +791,34 @@ while True:
             
             try:
                 encoder_input, decoder_input, target = next(train_iterator)
-                
-                # Print memory stats and device info before padding
-                if iter_num % log_interval == 0:
-                    print(f"\nStep {iter_num}, Microstep {micro_step}")
-                    print(f"Devices - encoder: {encoder_input.device}, decoder: {decoder_input.device}, target: {target.device if target is not None else None}")
-                    print(f"Memory before padding - Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-                
-                # Move tensors to device before padding
-                encoder_input = encoder_input.to(device)
-                decoder_input = decoder_input.to(device)
-                if target is not None:
-                    target = target.to(device)
-                
-                encoder_input, decoder_input, target = pad_sequences(
-                    encoder_input, decoder_input, target
-                )
-                
-                # Print memory stats after padding
-                if iter_num % log_interval == 0:
-                    print(f"Memory after padding - Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-                    print_memory_stats("After padding")
             except StopIteration:
-                print("StopIteration error encountered. Resetting train_iterator.")
-                # On imprime la stack trace
+                print("Reached end of dataset, reinitializing iterator...")
+                # printing stack trace
                 import traceback
                 traceback.print_exc()
-                train_iterator = iter(train_dataset)
+                train_iterator = get_train_iterator()
                 encoder_input, decoder_input, target = next(train_iterator)
-                encoder_input, decoder_input, target = pad_sequences(
-                    encoder_input, decoder_input, target
-                )
+            
+            # Print memory stats and device info before padding
+            if iter_num % log_interval == 0:
+                print(f"\nStep {iter_num}, Microstep {micro_step}")
+                print(f"Devices - encoder: {encoder_input.device}, decoder: {decoder_input.device}, target: {target.device if target is not None else None}")
+                print(f"Memory before padding - Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+            
+            # Move tensors to device before padding
+            encoder_input = encoder_input.to(device)
+            decoder_input = decoder_input.to(device)
+            if target is not None:
+                target = target.to(device)
+            
+            encoder_input, decoder_input, target = pad_sequences(
+                encoder_input, decoder_input, target
+            )
+            
+            # Print memory stats after padding
+            if iter_num % log_interval == 0:
+                print(f"Memory after padding - Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+                print_memory_stats("After padding")
             
             try:
                 with ctx:
