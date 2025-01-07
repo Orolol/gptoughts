@@ -606,7 +606,6 @@ if device_type == 'cuda':
     
     # Set workload-specific optimizations
     torch._inductor.config.max_autotune = True
-    torch._inductor.config.optimize_indexing = True
     
     # Memory access optimizations
     torch._inductor.config.reordering = True
