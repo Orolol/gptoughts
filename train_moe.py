@@ -97,6 +97,27 @@ if torch.cuda.is_available():
     elif args.size == "medium":
         # Increase batch size and reduce gradient accumulation steps
         batch_size = 16  
+        block_size = 128
+        
+        num_experts = 64
+        expert_k = 4
+    
+        gradient_accumulation_steps = 2
+
+        # Encoder config
+        encoder_n_layer = 4
+        encoder_n_head = 4
+        encoder_n_embd = 384
+        encoder_ratio_kv = 4
+        
+        # Decoder config
+        decoder_n_layer = 4
+        decoder_n_head = 4
+        decoder_n_embd = 384
+        decoder_ratio_kv = 4
+    elif args.size == "large":
+        # Increase batch size and reduce gradient accumulation steps
+        batch_size = 16  
         block_size = 512
         
         num_experts = 64
@@ -640,7 +661,7 @@ while True:
                 cleanup_memory()
 
     # Generate text every 200 iterations
-    if iter_num % 500 == 0 and master_process:
+    if iter_num % 100 == 0 and master_process:
         print("\nGénération de texte :")
         prompt = random.choice(PROMPT_TEMPLATES)
         
@@ -648,25 +669,24 @@ while True:
         input_tokens = tokenizer.encode(
             prompt,
             add_special_tokens=True,
+            truncation=False,  # Ne pas tronquer le prompt
+            padding=False,     # Ne pas ajouter de padding
             return_tensors='pt'
         ).to(device)
         
-        # Initialize decoder input with BOS token
-        decoder_input = torch.full(
-            (1, 1),
-            tokenizer.bos_token_id,
-            dtype=torch.long,
-            device=device
-        )
+        # Vérifier que nous avons bien tout le prompt
+        decoded_prompt = tokenizer.decode(input_tokens[0], skip_special_tokens=True)
+        print(f"Prompt original: {prompt}")
+        print(f"Prompt décodé: {decoded_prompt}")
         
         try:
             with torch.no_grad(), torch.amp.autocast(enabled=True, device_type=device_type):
                 # Generate text
                 output_ids = model.generate(
                     input_tokens,
-                    max_new_tokens=block_size,  # Increased for more context
-                    temperature=0.2,     # Slightly increased for more creativity
-                    top_k=50            # Increased for more variety
+                    max_new_tokens=block_size - 10,  # Slightly reduced for better focus
+                    temperature=0.7,     # Reduced for more coherence
+                    top_k=40            # Reduced for more focused sampling
                 )
                 
                 # Decode only the generated part
@@ -675,7 +695,7 @@ while True:
                     skip_special_tokens=True,
                     clean_up_tokenization_spaces=True
                 )
-                print(f"Prompt: {prompt} {generated_text}")
+                print(f"Generated text: {generated_text}")
         except Exception as e:
             print(f"Erreur lors de la génération: {str(e)}")
             continue

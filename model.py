@@ -1,4 +1,3 @@
-
 import inspect
 import math
 from dataclasses import dataclass
@@ -268,6 +267,16 @@ class CausalSelfAttention(nn.Module):
                 k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
                 v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
                 
+                # Pendant la génération, augmenter l'influence de la cross-attention
+                if is_generation:
+                    # Augmenter l'importance des requêtes et des clés
+                    q = q * 2.0
+                    k = k * 2.0
+                    
+                    # Ajouter un biais positif pour favoriser l'attention sur le prompt
+                    prompt_bias = torch.zeros((B, self.n_head, T, key_value.size(1)), device=x.device)
+                    prompt_bias = prompt_bias + 0.5  # Biais positif
+                    
             else:
                 # Self-attention
                 qkv = torch.cat([
@@ -286,6 +295,9 @@ class CausalSelfAttention(nn.Module):
                 if not is_generation:
                     k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
                     v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                    prompt_bias = None
+                else:
+                    prompt_bias = None
             
             # Déterminer si nous sommes en mode causal et préparer le masque
             is_causal = key_value is None  # Causal seulement pour self-attention
@@ -302,7 +314,28 @@ class CausalSelfAttention(nn.Module):
                 y = self._sdpa_attention(q, k, v, attn_mask, is_causal)
             
             if y is None:
-                y = self._standard_attention(q, k, v, attn_mask, is_causal)
+                # Attention standard avec biais de prompt
+                scale = 1.0 / math.sqrt(self.head_dim)
+                att = torch.matmul(q, k.transpose(-2, -1)) * scale
+                
+                # Ajouter le biais de prompt si présent
+                if prompt_bias is not None:
+                    att = att + prompt_bias
+                
+                # Clipping pour stabilité numérique
+                att = torch.clamp(att, min=-1e4, max=1e4)
+                
+                # Appliquer le masque et le bias
+                if is_causal:
+                    if attn_mask is not None:
+                        att = att + attn_mask
+                    att = att + self.alibi.get_bias(q.size(-2), q.device)
+                
+                # Utiliser float32 pour le softmax pour plus de stabilité
+                att = F.softmax(att.float(), dim=-1).to(q.dtype)
+                att = self.attn_dropout(att)
+                
+                y = torch.matmul(att, v)
             
             # Vérification finale des NaN/Inf
             if torch.isnan(y).any() or torch.isinf(y).any():

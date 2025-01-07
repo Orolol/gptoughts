@@ -77,9 +77,10 @@ class StreamingDataset(IterableDataset):
             except StopIteration:
                 # Quand on arrive à la fin du dataset, on crée un nouvel itérateur
                 self.dataset = load_dataset("HuggingFaceFW/fineweb-2", 
+                                         num_proc=4,
                                          name=self.dataset_config,
                                          split=self.split,
-                                         streaming=True)
+                                         streaming=True).shuffle()
                 self.dataset_iterator = iter(self.dataset)
                 # Si le buffer est vide après avoir atteint la fin du dataset,
                 # on continue à charger des données

@@ -356,6 +356,9 @@ class MoEEncoderDecoderGPT(nn.Module):
         Generate text using the MoE model.
         """
         # Ensure input has correct shape
+        
+        print(idx)
+        
         if idx.dim() == 1:
             idx = idx.unsqueeze(0)
         
@@ -375,13 +378,23 @@ class MoEEncoderDecoderGPT(nn.Module):
             
         encoder_output = self.encoder.ln_f(x)
         
-        # Initialize decoder input with start token
-        decoder_idx = torch.full(
+        # Create prompt-aware initial state for decoder
+        prompt_summary = torch.mean(encoder_output, dim=1, keepdim=True)  # [B, 1, C]
+        
+        # Initialize decoder input with BOS token + prompt
+        bos_token = torch.full(
             (idx.size(0), 1),
-            self.shared_embedding.weight.size(0)-1,  # EOS token as start
+            self.shared_embedding.weight.size(0)-2,  # BOS token
             dtype=torch.long,
             device=idx.device
         )
+        # Feed the entire prompt to decoder except its last token
+        decoder_idx = torch.cat([bos_token, idx[:, :-1]], dim=1)
+        
+        # Track generated tokens for repetition detection
+        last_tokens = []
+        repetition_penalty = 1.5  # Increased from 1.2
+        min_tokens_before_repetition = 5  # Increased from 3
         
         # Generate tokens autoregressively
         for _ in range(max_new_tokens):
@@ -393,6 +406,9 @@ class MoEEncoderDecoderGPT(nn.Module):
             decoder_pos = torch.arange(0, decoder_idx.size(1), device=decoder_idx.device)
             decoder_emb = self.shared_embedding(decoder_idx)
             decoder_pos_emb = self.shared_pos_embedding(decoder_pos)
+            
+            # Add prompt context to decoder embeddings
+            decoder_emb = decoder_emb + 0.3 * prompt_summary.expand(-1, decoder_emb.size(1), -1)
             
             # Adjust dimensions for broadcasting
             decoder_pos_emb = decoder_pos_emb.unsqueeze(0).expand(decoder_idx.size(0), -1, -1)
@@ -408,7 +424,12 @@ class MoEEncoderDecoderGPT(nn.Module):
                 
                 # Cross-attention with encoder output
                 cross_x = self.cross_ln[i](decoder_x)
-                cross_output = cross_attn(cross_x, key_value=encoder_output)
+                # Explicitly use encoder output in cross-attention
+                cross_output = cross_attn(
+                    cross_x, 
+                    key_value=encoder_output,
+                    is_generation=True
+                )
                 decoder_x = decoder_x + cross_output
                 
                 # MoE layer
@@ -422,15 +443,30 @@ class MoEEncoderDecoderGPT(nn.Module):
             logits = self.lm_head(decoder_x[:, -1:])
             logits = logits.reshape(decoder_x.size(0), -1)  # Use reshape instead of squeeze
             
+            # Apply repetition penalty
+            if len(last_tokens) >= min_tokens_before_repetition:
+                for token in set(last_tokens[-min_tokens_before_repetition:]):
+                    logits[:, token] = logits[:, token] / repetition_penalty
+            
             # Apply temperature and top-k sampling
-            logits = logits / temperature
+            logits = logits / (temperature + 1e-5)  # Add small epsilon for stability
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float('-inf')
             
+            # Add length penalty to discourage very short sequences
+            if decoder_idx.size(1) < 10:  # Minimum desired length
+                length_penalty = torch.ones_like(logits) * -0.5
+                logits = logits + length_penalty
+            
             # Sample next token
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
+            
+            # Update last tokens
+            last_tokens.append(next_token.item())
+            if len(last_tokens) > min_tokens_before_repetition * 2:
+                last_tokens.pop(0)
             
             # Stop if we generate an EOS token
             if (next_token == self.shared_embedding.weight.size(0)-1).any():
