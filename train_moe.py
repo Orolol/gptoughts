@@ -177,7 +177,7 @@ else:
 
 # adamw optimizer
 learning_rate = 5e-4
-max_iters = 5
+max_iters = 5000000
 weight_decay = 0.1
 beta1 = 0.9
 beta2 = 0.999

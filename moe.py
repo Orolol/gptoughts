@@ -32,6 +32,9 @@ class Router(nn.Module):
         batch_size, seq_len, _ = x.shape
         combined_batch_size = batch_size * seq_len
         
+        # Calculate expert capacity
+        capacity = int(self.capacity_factor * combined_batch_size * self.k / self.num_experts)
+        
         # Reshape input and compute router logits
         x_reshaped = x.view(combined_batch_size, -1)
         router_logits = self.router(x_reshaped)
@@ -45,11 +48,37 @@ class Router(nn.Module):
         # Normalize top-k weights
         top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
         
-        # Create dispatch mask
+        # Create dispatch mask with capacity limit
         dispatch_mask = torch.zeros_like(routing_weights, device=device)
-        dispatch_mask.scatter_(-1, top_k_indices, top_k_weights)
         
-        # Calculate load balancing loss efficiently
+        # Count tokens per expert
+        token_counts = torch.zeros(self.num_experts, device=device)
+        
+        # Sort tokens by their maximum routing probability
+        sorted_indices = torch.argsort(top_k_weights.max(dim=-1)[0], descending=True)
+        
+        for idx in sorted_indices:
+            for expert_idx, weight in zip(top_k_indices[idx], top_k_weights[idx]):
+                if token_counts[expert_idx] < capacity:
+                    dispatch_mask[idx, expert_idx] = weight
+                    token_counts[expert_idx] += 1
+        
+        # Ensure all tokens are routed somewhere
+        unrouted = (dispatch_mask.sum(dim=-1) == 0)
+        if unrouted.any():
+            # Route unrouted tokens to least loaded experts
+            available_experts = token_counts < capacity
+            if available_experts.any():
+                least_loaded = available_experts.nonzero(as_tuple=True)[0]
+                for idx in unrouted.nonzero(as_tuple=True)[0]:
+                    expert_idx = least_loaded[token_counts[least_loaded].argmin()]
+                    dispatch_mask[idx, expert_idx] = 1.0
+                    token_counts[expert_idx] += 1
+        
+        # Renormalize dispatch mask
+        dispatch_mask = dispatch_mask / (dispatch_mask.sum(dim=-1, keepdim=True) + 1e-8)
+        
+        # Calculate load balancing loss
         expert_counts = dispatch_mask.sum(0)
         target_count = torch.ones_like(expert_counts) * (combined_batch_size * self.k / self.num_experts)
         
