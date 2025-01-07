@@ -348,10 +348,9 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x, key_value=None, is_generation=False):
         B, T, C = x.size()
         
-        # Convertir en bfloat16 si nécessaire pour Flash Attention 2
-        orig_dtype = x.dtype
-        if self.attention_backend == 'flash_attn_2' and x.dtype not in [torch.bfloat16, torch.float16]:
-            x = x.to(torch.bfloat16)
+        # Ensure consistent dtype for all tensors
+        working_dtype = torch.float16 if x.device.type == 'cuda' else torch.float32
+        x = x.to(working_dtype)
         
         try:
             # Vérification et correction des NaN/Inf
@@ -366,6 +365,10 @@ class CausalSelfAttention(nn.Module):
                 
                 k = k.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
                 v = v.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
+                
+                # Convert k and v to the same dtype as q
+                k = k.to(working_dtype)
+                v = v.to(working_dtype)
                 
                 # Répéter K,V pour GQA
                 k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
@@ -382,6 +385,9 @@ class CausalSelfAttention(nn.Module):
                     self.k_proj(x),
                     self.v_proj(x)
                 ], dim=-1)
+                
+                # Ensure consistent dtype
+                qkv = qkv.to(working_dtype)
                 
                 q, k, v = qkv.split([self.n_embd, self.n_head_kv * self.head_dim, self.n_head_kv * self.head_dim], dim=-1)
                 
@@ -413,22 +419,19 @@ class CausalSelfAttention(nn.Module):
                 y = self._sdpa_attention(q, k, v, attn_mask, is_causal)
             
             if y is None:
-                # Attention standard avec biais de prompt
+                # Standard attention
                 scale = 1.0 / math.sqrt(self.head_dim)
                 att = torch.matmul(q, k.transpose(-2, -1)) * scale
-                
                 
                 # Clipping pour stabilité numérique
                 att = torch.clamp(att, min=-1e4, max=1e4)
                 
-                # Appliquer le masque et le bias
-                if is_causal:
-                    if attn_mask is not None:
-                        att = att + attn_mask
-                    att = att + self.alibi.get_bias(q.size(-2), q.device)
+                # Appliquer le masque causal si nécessaire
+                if is_causal and attn_mask is not None:
+                    att = att + attn_mask
                 
                 # Utiliser float32 pour le softmax pour plus de stabilité
-                att = F.softmax(att.float(), dim=-1).to(q.dtype)
+                att = F.softmax(att.float(), dim=-1).to(working_dtype)
                 att = self.attn_dropout(att)
                 
                 y = torch.matmul(att, v)
@@ -440,17 +443,15 @@ class CausalSelfAttention(nn.Module):
             # Reshape et projection finale
             y = y.transpose(1, 2).contiguous().view(B, T, C)
             
-            # Reconvertir au dtype original si nécessaire
-            if y.dtype != orig_dtype:
-                y = y.to(orig_dtype)
+            # Projection finale
+            output = self.resid_dropout(self.o_proj(y))
             
-            return self.resid_dropout(self.o_proj(y))
+            return output
             
         except Exception as e:
             print(f"Attention computation failed: {e}")
             print(traceback.format_exc())
-            # Fallback sur l'attention standard en cas d'erreur
-            return self._standard_attention(q, k, v, attn_mask, is_causal)
+            raise  # Re-raise the exception after printing the traceback
 
 class MLP(nn.Module):
     """
