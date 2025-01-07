@@ -388,24 +388,46 @@ def aggressive_memory_cleanup():
 def training_step(model, batch, optimizer, scaler):
     encoder_input, decoder_input, target = batch
     
-    with torch.cuda.amp.autocast():
-        logits, loss, router_loss = model(encoder_input, decoder_input, target)
-        
-        if loss is not None:
-            if torch.isnan(loss).any() or torch.isnan(router_loss).any():
-                return None, None, True
+    try:
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            logits, loss, router_loss = model(encoder_input, decoder_input, target)
             
-            loss = loss / gradient_accumulation_steps
-            router_loss = router_loss / gradient_accumulation_steps
-            combined_loss = loss + router_aux_loss_coef * router_loss
+            if loss is not None:
+                # Vérification des NaN et Inf
+                if (torch.isnan(loss).any() or torch.isnan(router_loss).any() or
+                    torch.isinf(loss).any() or torch.isinf(router_loss).any()):
+                    print("NaN/Inf detected in loss calculation")
+                    return None, None, True
+                
+                # Vérification des valeurs aberrantes
+                if loss.item() > 100 or router_loss.item() > 100:
+                    print(f"Abnormal loss values: loss={loss.item()}, router_loss={router_loss.item()}")
+                    return None, None, True
+                
+                loss = loss / gradient_accumulation_steps
+                router_loss = router_loss / gradient_accumulation_steps
+                combined_loss = loss + router_aux_loss_coef * router_loss
+                
+                # Scale loss and backward pass
+                scaled_loss = scaler.scale(combined_loss)
+                
+                # Backward pass avec gestion d'erreur
+                try:
+                    scaled_loss.backward()
+                except RuntimeError as e:
+                    print(f"Backward pass failed: {e}")
+                    return None, None, True
+                
+                return loss.item(), router_loss.item(), False
             
-            # Scale loss and backward pass
-            scaled_loss = scaler.scale(combined_loss)
-            scaled_loss.backward()
+            return None, None, True
             
-            return loss.item(), router_loss.item(), False
-    
-    return None, None, True
+    except RuntimeError as e:
+        print(f"Forward pass failed: {e}")
+        return None, None, True
+    except Exception as e:
+        print(f"Unexpected error in training step: {e}")
+        return None, None, True
 
 # -----------------------------------------------------------------------------
 # Init
@@ -832,14 +854,17 @@ while True:
                     batch = next(train_iterator)
                     batch = pad_sequences(*batch)
             
-            # Training step
+            # Training step avec gestion des erreurs
             with torch.cuda.stream(compute_stream):
                 loss_val, router_loss_val, skip_step = training_step(
                     model, batch, optimizer, scaler
                 )
                 
                 if skip_step:
+                    print("Skipping step due to error in training_step")
                     skip_optimizer_step = True
+                    # Réinitialiser les gradients en cas d'erreur
+                    optimizer.zero_grad(set_to_none=True)
                     break
                 
                 total_loss += loss_val
@@ -860,20 +885,32 @@ while True:
                 torch.cuda.current_stream().wait_stream(compute_stream)
         
         if not skip_optimizer_step:
+            # Gradient clipping avec gestion d'erreur
             if grad_clip != 0.0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                try:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                except RuntimeError as e:
+                    print(f"Gradient clipping failed: {e}")
+                    skip_optimizer_step = True
             
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-            
-            # Cleanup seulement si nécessaire
-            if torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory > 0.95:
-                torch.cuda.empty_cache()
+            if not skip_optimizer_step:
+                try:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                except RuntimeError as e:
+                    print(f"Optimizer step failed: {e}")
+                    optimizer.zero_grad(set_to_none=True)
+                
+                # Cleanup seulement si nécessaire
+                if torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory > 0.95:
+                    torch.cuda.empty_cache()
 
     except Exception as e:
         print(f"Training iteration failed: {e}")
+        print(f"Current memory usage: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+        print(f"Max memory usage: {torch.cuda.max_memory_allocated()/1e9:.2f}GB")
         aggressive_memory_cleanup()
         if ddp:
             dist_barrier()
