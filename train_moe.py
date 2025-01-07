@@ -102,7 +102,7 @@ if torch.cuda.is_available():
         num_experts = 32
         expert_k = 4
     
-        gradient_accumulation_steps = 4
+        gradient_accumulation_steps = 2
 
         # Encoder config
         encoder_n_layer = 4
