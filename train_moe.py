@@ -99,7 +99,7 @@ if torch.cuda.is_available():
     
     elif args.size == "medium":
         # Optimize for 24GB VRAM with better throughput
-        batch_size = 24  
+        batch_size = 20  
         block_size = 128
         
         num_experts = 32
