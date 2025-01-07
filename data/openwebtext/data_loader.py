@@ -33,6 +33,7 @@ class StreamingDataset(IterableDataset):
         
         # Initialize dataset
         self.dataset = load_dataset(dataset_name, name=dataset_config, split=split, streaming=True)
+        self.dataset = self.dataset.shuffle(buffer_size=10_000)
         
         # Initialize token tracker
         tracker_dir = os.path.join('data', 'token_tracking')
@@ -80,7 +81,8 @@ class StreamingDataset(IterableDataset):
                                          num_proc=4,
                                          name=self.dataset_config,
                                          split=self.split,
-                                         streaming=True).shuffle()
+                                         streaming=True)
+                self.dataset = self.dataset.shuffle(buffer_size=10_000)
                 self.dataset_iterator = iter(self.dataset)
                 # Si le buffer est vide après avoir atteint la fin du dataset,
                 # on continue à charger des données
