@@ -754,11 +754,19 @@ while True:
             for _ in range(gradient_accumulation_steps):
                 try:
                     batch = next(train_iterator)
-                    next_batch.append([t.pin_memory() for t in batch])
+                    # Check if tensors are already on CUDA
+                    if batch[0].device.type != 'cuda':
+                        next_batch.append([t.pin_memory() for t in batch])
+                    else:
+                        next_batch.append(batch)
                 except StopIteration:
                     train_iterator = iter(train_dataset)
                     batch = next(train_iterator)
-                    next_batch.append([t.pin_memory() for t in batch])
+                    # Check if tensors are already on CUDA
+                    if batch[0].device.type != 'cuda':
+                        next_batch.append([t.pin_memory() for t in batch])
+                    else:
+                        next_batch.append(batch)
 
         for micro_step in range(gradient_accumulation_steps):
             if ddp:
@@ -769,9 +777,11 @@ while True:
             # Get pre-fetched data
             if micro_step < len(next_batch):
                 encoder_input, decoder_input, target = next_batch[micro_step]
-                encoder_input = encoder_input.to(device, non_blocking=True)
-                decoder_input = decoder_input.to(device, non_blocking=True)
-                target = target.to(device, non_blocking=True)
+                # Move to device only if not already on CUDA
+                if encoder_input.device.type != 'cuda':
+                    encoder_input = encoder_input.to(device, non_blocking=True)
+                    decoder_input = decoder_input.to(device, non_blocking=True)
+                    target = target.to(device, non_blocking=True)
                 encoder_input, decoder_input, target = pad_sequences(
                     encoder_input, decoder_input, target
                 )
