@@ -294,7 +294,7 @@ def estimate_loss():
     model.train()
     return out
 
-def cleanup_old_checkpoints(out_dir, keep_num=3):
+def cleanup_old_checkpoints(out_dir, keep_num=2):
     """Keeps only the 'keep_num' most recent checkpoints."""
     checkpoints = glob.glob(os.path.join(out_dir, 'ckpt_iter_*.pt'))
     if len(checkpoints) <= keep_num:
