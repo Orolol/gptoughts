@@ -48,32 +48,27 @@ class Router(nn.Module):
         # Normalize top-k weights
         top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
         
-        # Create dispatch mask with capacity limit
-        dispatch_mask = torch.zeros_like(routing_weights, device=device)
+        # Create dispatch mask
+        dispatch_mask = torch.zeros_like(routing_weights)
         
-        # Count tokens per expert
-        token_counts = torch.zeros(self.num_experts, device=device)
+        # Create indices for scatter operation
+        batch_indices = torch.arange(combined_batch_size, device=device).unsqueeze(1).expand(-1, self.k)
         
-        # Sort tokens by their maximum routing probability
-        sorted_indices = torch.argsort(top_k_weights.max(dim=-1)[0], descending=True)
+        # Count tokens per expert using one-hot encoding and cumsum
+        expert_counts = torch.zeros((self.num_experts,), device=device)
+        for k_idx in range(self.k):
+            expert_idx = top_k_indices[:, k_idx]
+            mask = expert_counts[expert_idx] < capacity
+            expert_counts.scatter_add_(0, expert_idx[mask], torch.ones_like(expert_idx[mask], dtype=torch.float))
+            dispatch_mask[batch_indices[mask, k_idx], expert_idx[mask]] = top_k_weights[mask, k_idx]
         
-        for idx in sorted_indices:
-            for expert_idx, weight in zip(top_k_indices[idx], top_k_weights[idx]):
-                if token_counts[expert_idx] < capacity:
-                    dispatch_mask[idx, expert_idx] = weight
-                    token_counts[expert_idx] += 1
-        
-        # Ensure all tokens are routed somewhere
-        unrouted = (dispatch_mask.sum(dim=-1) == 0)
+        # Handle unrouted tokens (if any) - vectorized version
+        unrouted = dispatch_mask.sum(dim=-1) == 0
         if unrouted.any():
-            # Route unrouted tokens to least loaded experts
-            available_experts = token_counts < capacity
-            if available_experts.any():
-                least_loaded = available_experts.nonzero(as_tuple=True)[0]
-                for idx in unrouted.nonzero(as_tuple=True)[0]:
-                    expert_idx = least_loaded[token_counts[least_loaded].argmin()]
-                    dispatch_mask[idx, expert_idx] = 1.0
-                    token_counts[expert_idx] += 1
+            available_capacity = capacity - expert_counts
+            # Find least loaded expert for all unrouted tokens at once
+            least_loaded = available_capacity.argmax()
+            dispatch_mask[unrouted, least_loaded] = 1.0
         
         # Renormalize dispatch mask
         dispatch_mask = dispatch_mask / (dispatch_mask.sum(dim=-1, keepdim=True) + 1e-8)

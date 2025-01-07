@@ -46,7 +46,7 @@ args = parser.parse_args()
 # I/O
 out_dir = 'out_moe'
 eval_interval = 1000
-log_interval = 10
+log_interval = 1
 eval_iters = 100
 eval_only = False
 always_save_checkpoint = True
@@ -519,7 +519,7 @@ if init_from == 'resume':
             optimizer.load_state_dict(optimizer_state)
         
         # Réinitialiser complètement le scaler
-        scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
+        scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
         
         iter_num = checkpoint['iter_num'] + 1
         best_val_loss = checkpoint['best_val_loss']
