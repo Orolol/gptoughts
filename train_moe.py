@@ -177,7 +177,7 @@ else:
 
 # adamw optimizer
 learning_rate = 5e-4
-max_iters = 600000
+max_iters = 5
 weight_decay = 0.1
 beta1 = 0.9
 beta2 = 0.999
@@ -569,7 +569,7 @@ if init_from == 'resume':
             optimizer.load_state_dict(optimizer_state)
         
         # Réinitialiser complètement le scaler
-        scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
+        scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
         
         iter_num = checkpoint['iter_num'] + 1
         best_val_loss = checkpoint['best_val_loss']
