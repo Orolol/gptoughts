@@ -807,6 +807,7 @@ while True:
                     print(f"Memory after padding - Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB")
                     print_memory_stats("After padding")
             except StopIteration:
+                print("StopIteration error encountered. Resetting train_iterator.")
                 train_iterator = iter(train_dataset)
                 encoder_input, decoder_input, target = next(train_iterator)
                 encoder_input, decoder_input, target = pad_sequences(
