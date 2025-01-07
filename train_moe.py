@@ -558,20 +558,41 @@ if device_type == 'cuda':
     print("CUDA optimizations")
     default_stream = torch.cuda.current_stream()
     copy_stream = torch.cuda.Stream()
+    compute_stream = torch.cuda.Stream()
     
     torch.multiprocessing.set_sharing_strategy('file_system')
+    torch.cuda.empty_cache()
     
     device_index = 0 if isinstance(device, str) else device
     if isinstance(device, str) and ':' in device:
         device_index = int(device.split(':')[1])
     torch.cuda.set_device(device_index)
-    torch.cuda.empty_cache()
     
     pin_memory = True
     
     gc.disable()
     
     torch.cuda.set_per_process_memory_fraction(0.95)
+    
+    # Additional CUDA optimizations
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.enabled = True
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    
+    # Set optimal thread settings
+    torch.set_num_threads(6)  # Adjust based on CPU cores
+    torch.set_num_interop_threads(6)  # Adjust based on CPU cores
+    
+    # Enable channels last memory format
+    memory_format = torch.channels_last
+    
+    # Set optimal CUDA launch blocking
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
+    
+    # Optimize CUDA graphs
+    torch._inductor.config.triton.cudagraph_trees = True
+    torch._inductor.config.triton.cudagraph_branches = True
 
 # Configure gradient scaler
 scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
@@ -710,55 +731,85 @@ while True:
     skip_optimizer_step = False
 
     try:
+        # Prefetch data for next iteration
+        next_batch = []
+        with torch.cuda.stream(copy_stream):
+            for _ in range(gradient_accumulation_steps):
+                try:
+                    batch = next(train_iterator)
+                    next_batch.append([t.pin_memory() for t in batch])
+                except StopIteration:
+                    train_iterator = iter(train_dataset)
+                    batch = next(train_iterator)
+                    next_batch.append([t.pin_memory() for t in batch])
+
         for micro_step in range(gradient_accumulation_steps):
             if ddp:
                 model.require_backward_grad_sync = (
                     micro_step == gradient_accumulation_steps - 1
                 )
             
-            try:
-                encoder_input, decoder_input, target = next(train_iterator)
+            # Get pre-fetched data
+            if micro_step < len(next_batch):
+                encoder_input, decoder_input, target = next_batch[micro_step]
+                encoder_input = encoder_input.to(device, non_blocking=True)
+                decoder_input = decoder_input.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
                 encoder_input, decoder_input, target = pad_sequences(
                     encoder_input, decoder_input, target
                 )
-            except StopIteration:
-                train_iterator = iter(train_dataset)
-                encoder_input, decoder_input, target = next(train_iterator)
-                encoder_input, decoder_input, target = pad_sequences(
-                    encoder_input, decoder_input, target
-                )
+            else:
+                try:
+                    encoder_input, decoder_input, target = next(train_iterator)
+                    encoder_input, decoder_input, target = pad_sequences(
+                        encoder_input, decoder_input, target
+                    )
+                except StopIteration:
+                    train_iterator = iter(train_dataset)
+                    encoder_input, decoder_input, target = next(train_iterator)
+                    encoder_input, decoder_input, target = pad_sequences(
+                        encoder_input, decoder_input, target
+                    )
             
-            try:
-                with ctx:
-                    logits, loss, router_loss = model(encoder_input, decoder_input, target)
-                    # Compter les tokens réels (entrée + sortie)
-                    batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
-                    total_tokens += batch_tokens
-                    
-                    # Mettre à jour la fenêtre glissante pour les tokens/s
-                    tokens_window.append((time.time(), batch_tokens))
-                    if len(tokens_window) > window_size:
-                        tokens_window.pop(0)
-                    
-                    if loss is not None:
-                        # Vérifier les NaN avant de continuer
-                        if torch.isnan(loss).any() or torch.isnan(router_loss).any():
-                            print("NaN detected in loss calculation, skipping batch")
-                            skip_optimizer_step = True
-                            break
+            # Compute stream for forward/backward pass
+            with torch.cuda.stream(compute_stream):
+                try:
+                    with ctx:
+                        logits, loss, router_loss = model(encoder_input, decoder_input, target)
+                        # Count real tokens (input + output)
+                        batch_tokens = (
+                            encoder_input.ne(tokenizer.pad_token_id).sum().item() +
+                            decoder_input.ne(tokenizer.pad_token_id).sum().item()
+                        )
+                        total_tokens += batch_tokens
                         
-                        loss = loss / gradient_accumulation_steps
-                        router_loss = router_loss / gradient_accumulation_steps
-                        combined_loss = loss + router_aux_loss_coef * router_loss
-                        scaled_loss = scaler.scale(combined_loss)
-                        scaled_loss.backward()
-                        total_loss += loss.item()
-                        total_router_loss += router_loss.item()
-            except RuntimeError as e:
-                print(f"Error during forward/backward pass: {e}")
-                skip_optimizer_step = True
-                break
+                        # Update sliding window for tokens/s
+                        tokens_window.append((time.time(), batch_tokens))
+                        if len(tokens_window) > window_size:
+                            tokens_window.pop(0)
+                        
+                        if loss is not None:
+                            # Check for NaN before continuing
+                            if torch.isnan(loss).any() or torch.isnan(router_loss).any():
+                                print("NaN detected in loss calculation, skipping batch")
+                                skip_optimizer_step = True
+                                break
+                            
+                            loss = loss / gradient_accumulation_steps
+                            router_loss = router_loss / gradient_accumulation_steps
+                            combined_loss = loss + router_aux_loss_coef * router_loss
+                            scaled_loss = scaler.scale(combined_loss)
+                            scaled_loss.backward()
+                            total_loss += loss.item()
+                            total_router_loss += router_loss.item()
+                except RuntimeError as e:
+                    print(f"Error during forward/backward pass: {e}")
+                    skip_optimizer_step = True
+                    break
 
+            # Synchronize streams
+            torch.cuda.current_stream().wait_stream(compute_stream)
+            
         if not skip_optimizer_step:
             if grad_clip != 0.0:
                 scaler.unscale_(optimizer)
