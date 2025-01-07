@@ -50,52 +50,57 @@ class Router(nn.Module):
         
         # Use slices of pre-allocated buffers
         indices = self._indices_buffer[:combined_batch_size]
-        dispatch_mask = self._dispatch_buffer[:combined_batch_size]
+        dispatch_mask = self._dispatch_buffer[:combined_batch_size].clone()  # Clone to avoid in-place ops
         dispatch_mask.zero_()
-        expert_counts = self._zeros_buffer
+        expert_counts = self._zeros_buffer.clone()  # Clone to avoid in-place ops
         expert_counts.zero_()
         ones = self._ones_buffer[:combined_batch_size]
         
         # Calculate expert capacity
         capacity = int(self.capacity_factor * combined_batch_size * self.k / self.num_experts)
         
-        # Compute router logits and probabilities in one go
-        router_logits = self.router(x.view(combined_batch_size, -1))
+        # Compute router logits and probabilities
+        x_reshaped = x.view(combined_batch_size, -1)
+        router_logits = self.router(x_reshaped)
         routing_weights = F.softmax(router_logits, dim=-1)
         
-        # Get and normalize top-k in one operation
+        # Get top-k experts and weights
         top_k_weights, top_k_indices = torch.topk(routing_weights, self.k, dim=-1)
-        top_k_weights = top_k_weights / (top_k_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        top_k_weights_sum = top_k_weights.sum(dim=-1, keepdim=True)
+        top_k_weights = top_k_weights / (top_k_weights_sum + 1e-8)
         
-        # Fused routing operation
+        # Create routing tensor
         for k_idx in range(self.k):
             expert_idx = top_k_indices[:, k_idx]
             mask = expert_counts[expert_idx] < capacity
+            expert_counts = expert_counts.clone()  # Clone before in-place op
             expert_counts.scatter_add_(0, expert_idx[mask], ones[mask])
             dispatch_mask[indices[mask, k_idx], expert_idx[mask]] = top_k_weights[mask, k_idx]
         
-        # Handle unrouted tokens efficiently
+        # Handle unrouted tokens
         unrouted = dispatch_mask.sum(dim=-1) == 0
         if torch.any(unrouted):
             least_loaded = (capacity - expert_counts).argmax()
+            dispatch_mask = dispatch_mask.clone()  # Clone before modification
             dispatch_mask[unrouted, least_loaded] = 1.0
         
-        # Create a new tensor for the normalized dispatch mask
-        dispatch_mask_sum = dispatch_mask.sum(dim=-1, keepdim=True) + 1e-8
-        normalized_dispatch_mask = dispatch_mask / dispatch_mask_sum
+        # Normalize dispatch mask
+        dispatch_mask_sum = dispatch_mask.sum(dim=-1, keepdim=True)
+        normalized_dispatch_mask = dispatch_mask / (dispatch_mask_sum + 1e-8)
         
-        # Compute router z-loss (using original logits)
-        router_z_loss = 0.001 * torch.mean(torch.square(router_logits))
+        # Compute auxiliary losses
+        router_z_loss = torch.mean(torch.square(router_logits))
         
-        # Compute load balancing loss using a separate tensor
-        expert_counts = normalized_dispatch_mask.detach().sum(0)
+        # Compute load balancing loss
+        expert_counts = normalized_dispatch_mask.sum(0)
         target_count = float(combined_batch_size * self.k / self.num_experts)
         counts_scaled = expert_counts / float(combined_batch_size)
         target_scaled = target_count / float(combined_batch_size)
-        load_balance_loss = 0.001 * torch.mean(torch.square(counts_scaled - target_scaled))
+        load_balance_loss = torch.mean(torch.square(counts_scaled - target_scaled))
         
-        # Combine losses
-        router_loss = router_z_loss + load_balance_loss
+        # Combine losses with detached tensors where needed
+        router_loss = (0.001 * router_z_loss.detach() + 
+                      0.001 * load_balance_loss.detach())
         
         return routing_weights.detach(), normalized_dispatch_mask, router_loss
 
