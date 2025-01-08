@@ -798,11 +798,11 @@ while True:
             mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
 
-        print(f"iter {iter_num}: loss {lossf:.4f}, " 
+        print(f"iter {iter_num}: loss {lossf:.4f}, router_loss {router_lossf:.4f}, " 
               f"time {dt*1000:.2f}ms, lr {lr:.2e}, "
               f"tt {total_tokens:,}, "
               f"t/s {current_tokens_per_sec:.2f}, "
-              f"avgt/s {avg_tokens_per_sec:.2f}")
+            #   f"avgt/s {avg_tokens_per_sec:.2f}")
 
     iter_num += 1
     local_iter_num += 1
