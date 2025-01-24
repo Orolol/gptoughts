@@ -190,8 +190,10 @@ class CausalSelfAttention(nn.Module):
             if config.attention_backend not in ATTENTION_BACKENDS:
                 raise ValueError(f"Attention backend {config.attention_backend} not available")
             if not ATTENTION_BACKENDS[config.attention_backend]:
-                raise ValueError(f"Attention backend {config.attention_backend} not working properly")
-            self.attention_backend = config.attention_backend
+                print(f"Warning: {config.attention_backend} not available, falling back to best available backend")
+                self.attention_backend = get_best_attention_backend()
+            else:
+                self.attention_backend = config.attention_backend
         else:
             self.attention_backend = get_best_attention_backend()
             
@@ -275,6 +277,12 @@ class CausalSelfAttention(nn.Module):
             k = k.to(torch.bfloat16)
             v = v.to(torch.bfloat16)
             
+            # Handle GQA by expanding k and v heads
+            if k.size(1) != q.size(1):  # If number of heads don't match (GQA case)
+                # Repeat k and v heads to match q heads
+                k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+                v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
+            
             # Utiliser la mise en cache des KV pour la génération
             if hasattr(self, '_cached_k') and hasattr(self, '_cached_v'):
                 k = torch.cat([self._cached_k, k], dim=2)  # dim=2 car Flash Attention utilise [B, H, T, D]
@@ -294,6 +302,7 @@ class CausalSelfAttention(nn.Module):
         except Exception as e:
             print(f"Flash Attention 2 failed: {e}")
             print(f"Input dtypes - q: {q.dtype}, k: {k.dtype}, v: {v.dtype}")
+            print(f"Input shapes - q: {q.shape}, k: {k.shape}, v: {v.shape}")
             return None
 
     def _sdpa_attention(self, q, k, v, mask=None, is_causal=True):
