@@ -25,7 +25,7 @@ class Router(nn.Module):
         self.router = nn.Linear(input_dim, num_experts, bias=False)
         
         # Initialize with smaller weights for better stability
-        nn.init.normal_(self.router.weight, mean=0.0, std=0.001)
+        nn.init.normal_(self.router.weight, mean=0.0, std=0.0001)
         
         # Pre-register buffers with fixed size
         max_batch_size = 32  # Adjust this based on your needs
@@ -42,6 +42,9 @@ class Router(nn.Module):
         self.register_buffer('_ones_buffer',
             torch.ones((max_batch_size * max_seq_len,), dtype=torch.float32),
             persistent=False)
+        
+        # Ajouter un coefficient de température pour le softmax
+        self.temperature = nn.Parameter(torch.ones(1) * 0.1)  # Température plus basse
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
@@ -59,13 +62,16 @@ class Router(nn.Module):
         # Calculate expert capacity
         capacity = int(self.capacity_factor * combined_batch_size * self.k / self.num_experts)
         
-        # Compute router logits and probabilities
+        # Compute router logits and probabilities avec température
         x_reshaped = x.view(combined_batch_size, -1)
         router_logits = self.router(x_reshaped)
-        routing_weights = F.softmax(router_logits, dim=-1)
+        # Appliquer la température au softmax
+        routing_weights = F.softmax(router_logits / (self.temperature + 1e-7), dim=-1)
         
-        # Get top-k experts and weights
+        # Get top-k experts and weights avec clipping
         top_k_weights, top_k_indices = torch.topk(routing_weights, self.k, dim=-1)
+        # Clipper les poids pour éviter des valeurs extrêmes
+        top_k_weights = torch.clamp(top_k_weights, min=1e-3, max=0.99)
         top_k_weights_sum = top_k_weights.sum(dim=-1, keepdim=True)
         top_k_weights = top_k_weights / (top_k_weights_sum + 1e-8)
         
@@ -89,18 +95,19 @@ class Router(nn.Module):
         normalized_dispatch_mask = dispatch_mask / (dispatch_mask_sum + 1e-8)
         
         # Compute auxiliary losses
-        router_z_loss = torch.mean(torch.square(router_logits))
+        router_z_loss = 0.0001 * torch.mean(torch.square(router_logits))  # Coefficient plus petit
         
         # Compute load balancing loss
         expert_counts = normalized_dispatch_mask.sum(0)
-        target_count = float(combined_batch_size * self.k / self.num_experts)
-        counts_scaled = expert_counts / float(combined_batch_size)
-        target_scaled = target_count / float(combined_batch_size)
-        load_balance_loss = torch.mean(torch.square(counts_scaled - target_scaled))
+        target_count = combined_batch_size * self.k / self.num_experts
+        # Utiliser une version plus stable de la load balancing loss
+        counts_scaled = expert_counts / (combined_batch_size * self.k + 1e-8)
+        target_scaled = 1.0 / self.num_experts
+        load_balance_loss = torch.sum(torch.square(counts_scaled - target_scaled))
         
         # Combine losses with detached tensors where needed
-        router_loss = (0.001 * router_z_loss.detach() + 
-                      0.001 * load_balance_loss.detach())
+        router_loss = (0.0001 * router_z_loss.detach() + 
+                      0.0001 * load_balance_loss.detach())
         
         return routing_weights.detach(), normalized_dispatch_mask, router_loss
 
