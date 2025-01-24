@@ -59,7 +59,7 @@ log_interval = 1
 eval_iters = 100
 eval_only = False
 always_save_checkpoint = True
-init_from = 'resume'  # 'scratch' or 'resume'
+init_from = 'scratch'  # 'scratch' or 'resume'
 
 # wandb logging
 wandb_log = False
