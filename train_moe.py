@@ -105,7 +105,7 @@ if torch.cuda.is_available():
     
     elif args.size == "medium":
         # Increase batch size and reduce gradient accumulation steps
-        batch_size = 16  
+        batch_size = 18  
         block_size = 256
         
         num_experts = 32
@@ -203,7 +203,7 @@ min_lr = 6e-5
 
 # DDP settings
 backend = 'nccl'
-compile = False
+compile = True
 
 # Prompts for generation
 PROMPT_TEMPLATES = [
