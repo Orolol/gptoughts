@@ -117,7 +117,7 @@ class StreamingDataset(IterableDataset):
         self.token_buffer = self.token_buffer[total_length*2:]
         
         end_time = time.time()
-        print(f"Time to get a batch: {end_time - start_time:.4f} seconds")
+        # print(f"Time to get a batch: {end_time - start_time:.4f} seconds")
 
         return encoder_input, decoder_input, target
     
