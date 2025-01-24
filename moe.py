@@ -87,12 +87,18 @@ class EnhancedRouter(nn.Module):
             weight = top_k_weights[:, i]
             
             # Check capacity constraints
-            can_assign = expert_counts[expert_idx] < capacity
-            expert_counts.scatter_add_(0, expert_idx[can_assign], 
-                                    torch.ones_like(expert_counts)[can_assign])
+            counts = torch.bincount(expert_idx, minlength=self.num_experts)
+            can_assign = counts[expert_idx] < capacity
+            
+            # Update expert counts
+            expert_counts += counts
+            
+            # Create mask for assignment
+            assign_mask = torch.zeros(combined_batch_size, device=device, dtype=torch.bool)
+            assign_mask[torch.arange(combined_batch_size)[can_assign]] = True
             
             # Assign tokens that fit within capacity
-            dispatch_mask[torch.arange(combined_batch_size)[can_assign], expert_idx[can_assign]] = weight[can_assign]
+            dispatch_mask[assign_mask, expert_idx[can_assign]] = weight[can_assign]
         
         # Normalize dispatch mask
         dispatch_mask_sum = dispatch_mask.sum(dim=-1, keepdim=True)
