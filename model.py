@@ -434,8 +434,13 @@ class CausalSelfAttention(nn.Module):
             attn_mask = self.mask[:T, :T] if is_causal else None
             
             y = None
-            if self.attention_backend == 'flash_attn_2':
-                y = self._flash_attention(q, k, v, attn_mask, is_causal)
+            # During generation or cross-attention, use SDPA instead of Flash Attention
+            if is_generation or key_value is not None:
+                y = self._sdpa_attention(q, k, v, attn_mask, is_causal)
+            else:
+                # Try Flash Attention first
+                if self.attention_backend == 'flash_attn_2':
+                    y = self._flash_attention(q, k, v, attn_mask, is_causal)
             
             if y is None and self.attention_backend == 'xformers':
                 y = self._memory_efficient_attention(q, k, v, attn_mask, is_causal)
