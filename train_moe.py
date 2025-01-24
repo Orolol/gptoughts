@@ -39,10 +39,6 @@ torch._dynamo.config.suppress_errors = True
 torch._dynamo.config.cache_size_limit = 16384  # Augmenté pour gérer plus de cas
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = False  # Permettre les graphes dynamiques
 torch._inductor.config.debug = False
-torch._inductor.config.triton.autotune_pointwise = True  # Activer l'autotuning
-torch._inductor.config.triton.unique_kernel_names = True  # Optimisation des noms de kernel
-torch._inductor.config.coordinate_descent_tuning = True  # Optimisation des tuning
-torch._inductor.config.triton.cudagraphs = True  # Activer CUDA graphs quand possible
 
 # -----------------------------------------------------------------------------
 # Parse command line arguments
@@ -76,7 +72,7 @@ data_dir = 'data/openwebtext'
 gradient_accumulation_steps = 1
 dropout = 0.0
 bias = False
-attention_backend = "sdpa"  # Utiliser le meilleur backend disponible
+attention_backend = "xformers" # "sdpa"
 
 # Configure CUDA Graph behavior
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
@@ -600,17 +596,8 @@ if compile:
                 "triton.cudagraphs": False,  # Désactivé pour plus de stabilité
                 "trace.enabled": True,
                 "trace.graph_diagram": False,
-                "triton.autotune_pointwise": True,
-                "triton.unique_kernel_names": True,
-                "triton.persistent_reductions": True,
-                "triton.divisible_by_16": True,  # Optimisation pour les tailles de tenseurs
-                "triton.use_block_ptr": True,  # Utilisation des pointeurs de bloc pour plus de performance
-                "max_autotune_gemm": True,  # Optimisation des opérations GEMM
-                "aggressive_fusion": True,  # Fusion agressive des opérations
-                "coordinate_descent_tuning": True,  # Optimisation par descente de coordonnées
-                "layout_optimization": True,  # Optimisation des layouts mémoire
-            },
-            fullgraph=True  # Activer la compilation du graphe complet
+                "triton.cudagraphs": True,
+            }
         )
     except Exception as e:
         print(f"Compilation failed: {e}")
