@@ -34,10 +34,10 @@ console = Console()
 import torch._inductor.config
 import torch._dynamo.config
 
-# Configuration pour plus de stabilité
+# Configuration optimisée pour les modèles avec dimensions dynamiques
 torch._dynamo.config.suppress_errors = True
-torch._dynamo.config.cache_size_limit = 4096
-torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
+torch._dynamo.config.cache_size_limit = 8192  # Augmenté pour gérer plus de cas
+torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = False  # Permettre les graphes dynamiques
 torch._inductor.config.debug = False
 
 # -----------------------------------------------------------------------------
@@ -590,13 +590,18 @@ if compile:
     try:
         model = torch.compile(
             model,
-            # mode="reduce-overhead",
+            # mode="max-autotune",
+            fullgraph=False,  # Important pour les dimensions dynamiques
+            dynamic=True,
             options={
                 "max_autotune": True,
                 "epilogue_fusion": True,
+                "triton.cudagraphs": False,  # Désactivé pour plus de stabilité
                 "trace.enabled": True,
                 "trace.graph_diagram": False,
-                "triton.cudagraphs": True,
+                "max_cooperative_grid_size": 256,  # Optimisation pour les grands modèles
+                "max_block_size": 256,
+                "profile_bandwidth": True,
             }
         )
     except Exception as e:
@@ -607,25 +612,26 @@ if compile:
 
 model.to(device)
 
-# CUDA optimizations
-if device_type == 'cuda':
-    print("CUDA optimizations")
-    default_stream = torch.cuda.current_stream()
-    copy_stream = torch.cuda.Stream()
+# Optimisations CUDA supplémentaires
+if torch.cuda.is_available():
+    # Optimisations de base
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
     
-    torch.multiprocessing.set_sharing_strategy('file_system')
+    # Optimisations avancées
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    torch.backends.cudnn.enabled = True
     
-    device_index = 0 if isinstance(device, str) else device
-    if isinstance(device, str) and ':' in device:
-        device_index = int(device.split(':')[1])
-    torch.cuda.set_device(device_index)
+    # Gestion de la mémoire
+    torch.cuda.set_per_process_memory_fraction(0.95)
     torch.cuda.empty_cache()
     
-    pin_memory = True
-    
-    gc.disable()
-    
-    torch.cuda.set_per_process_memory_fraction(0.95)
+    # Optimisations pour les opérations de matmul
+    if hasattr(torch.backends.cuda, 'enable_math_sdp'):
+        torch.backends.cuda.enable_math_sdp(True)
+    if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+        torch.backends.cuda.enable_flash_sdp(True)
 
 # Configure gradient scaler
 scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
