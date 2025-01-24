@@ -21,86 +21,96 @@ class Router(nn.Module):
         self.k = k
         self.capacity_factor = capacity_factor
         
-        # Router projection
+        # Router projection with memory-efficient initialization
         self.router = nn.Linear(input_dim, num_experts, bias=False)
-        
-        # Initialize with smaller weights for better stability
-        nn.init.normal_(self.router.weight, mean=0.0, std=0.001)
-        
-        # Pre-register buffers with fixed size
-        max_batch_size = 32  # Adjust this based on your needs
-        max_seq_len = 256
-        self.register_buffer('_indices_buffer', 
-            torch.arange(max_batch_size * max_seq_len).unsqueeze(1).expand(-1, self.k),
-            persistent=False)
-        self.register_buffer('_zeros_buffer', 
-            torch.zeros((self.num_experts,)),
-            persistent=False)
-        self.register_buffer('_dispatch_buffer', 
-            torch.zeros((max_batch_size * max_seq_len, self.num_experts)),
-            persistent=False)
-        self.register_buffer('_ones_buffer',
-            torch.ones((max_batch_size * max_seq_len,), dtype=torch.float32),
-            persistent=False)
+        with torch.no_grad():
+            nn.init.normal_(self.router.weight, mean=0.0, std=0.001)
+
+        # Pre-register buffers with fixed size and pin memory for faster transfer
+        self.register_buffer('_indices_buffer', torch.empty(0), persistent=False)
+        self.register_buffer('_zeros_buffer', torch.empty(0), persistent=False)
+        self.register_buffer('_dispatch_buffer', torch.empty(0), persistent=False)
+        self.register_buffer('_ones_buffer', torch.empty(0), persistent=False)
+
+    def _ensure_buffer_size(self, batch_size, seq_len):
+        """Ensure buffers are correctly sized"""
+        combined_size = batch_size * seq_len
+        device = self.router.weight.device
+
+        if self._indices_buffer.numel() < combined_size * self.k:
+            self._indices_buffer = torch.arange(combined_size, device=device).unsqueeze(1).expand(-1, self.k)
+        if self._zeros_buffer.numel() < self.num_experts:
+            self._zeros_buffer = torch.zeros((self.num_experts,), device=device)
+        if self._dispatch_buffer.numel() < combined_size * self.num_experts:
+            self._dispatch_buffer = torch.zeros((combined_size, self.num_experts), device=device)
+        if self._ones_buffer.numel() < combined_size:
+            self._ones_buffer = torch.ones((combined_size,), dtype=torch.float32, device=device)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
         combined_batch_size = batch_size * seq_len
         device = x.device
         
-        # Use slices of pre-allocated buffers
+        # Ensure buffers are correctly sized
+        self._ensure_buffer_size(batch_size, seq_len)
+        
+        # Get buffer slices
         indices = self._indices_buffer[:combined_batch_size]
-        dispatch_mask = self._dispatch_buffer[:combined_batch_size].clone()  # Clone to avoid in-place ops
-        dispatch_mask.zero_()
-        expert_counts = self._zeros_buffer.clone()  # Clone to avoid in-place ops
-        expert_counts.zero_()
+        dispatch_mask = self._dispatch_buffer[:combined_batch_size]
+        expert_counts = self._zeros_buffer.clone()
         ones = self._ones_buffer[:combined_batch_size]
+        
+        # Clear dispatch mask
+        dispatch_mask.zero_()
         
         # Calculate expert capacity
         capacity = int(self.capacity_factor * combined_batch_size * self.k / self.num_experts)
         
-        # Compute router logits and probabilities
-        x_reshaped = x.view(combined_batch_size, -1)
-        router_logits = self.router(x_reshaped)
-        routing_weights = F.softmax(router_logits, dim=-1)
+        # Compute router logits and probabilities using memory-efficient operations
+        x_reshaped = x.view(-1, x.size(-1))
+        with torch.cuda.amp.autocast(enabled=True):
+            router_logits = self.router(x_reshaped)
+            routing_weights = F.softmax(router_logits, dim=-1)
         
         # Get top-k experts and weights
         top_k_weights, top_k_indices = torch.topk(routing_weights, self.k, dim=-1)
+        
+        # Normalize weights
         top_k_weights_sum = top_k_weights.sum(dim=-1, keepdim=True)
         top_k_weights = top_k_weights / (top_k_weights_sum + 1e-8)
         
-        # Create routing tensor
+        # Create routing tensor using optimized scatter operations
         for k_idx in range(self.k):
             expert_idx = top_k_indices[:, k_idx]
             mask = expert_counts[expert_idx] < capacity
-            expert_counts = expert_counts.clone()  # Clone before in-place op
             expert_counts.scatter_add_(0, expert_idx[mask], ones[mask])
             dispatch_mask[indices[mask, k_idx], expert_idx[mask]] = top_k_weights[mask, k_idx]
         
-        # Handle unrouted tokens
+        # Handle unrouted tokens efficiently
         unrouted = dispatch_mask.sum(dim=-1) == 0
         if torch.any(unrouted):
             least_loaded = (capacity - expert_counts).argmax()
-            dispatch_mask = dispatch_mask.clone()  # Clone before modification
             dispatch_mask[unrouted, least_loaded] = 1.0
         
         # Normalize dispatch mask
         dispatch_mask_sum = dispatch_mask.sum(dim=-1, keepdim=True)
         normalized_dispatch_mask = dispatch_mask / (dispatch_mask_sum + 1e-8)
         
-        # Compute auxiliary losses
+        # Compute auxiliary losses efficiently
         router_z_loss = torch.mean(torch.square(router_logits))
-        
-        # Compute load balancing loss
         expert_counts = normalized_dispatch_mask.sum(0)
         target_count = float(combined_batch_size * self.k / self.num_experts)
         counts_scaled = expert_counts / float(combined_batch_size)
         target_scaled = target_count / float(combined_batch_size)
         load_balance_loss = torch.mean(torch.square(counts_scaled - target_scaled))
         
-        # Combine losses with detached tensors where needed
+        # Combine losses with detached tensors
         router_loss = (0.001 * router_z_loss.detach() + 
                       0.001 * load_balance_loss.detach())
+        
+        # Clean up any remaining references
+        del router_logits, routing_weights, top_k_weights, top_k_indices
+        torch.cuda.empty_cache()
         
         return routing_weights.detach(), normalized_dispatch_mask, router_loss
 

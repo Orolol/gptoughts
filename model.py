@@ -175,37 +175,57 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
         
-        # Projections
+        # Projections with memory-efficient initialization
         self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.k_proj = nn.Linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias)
         self.v_proj = nn.Linear(config.n_embd, self.n_head_kv * self.head_dim, bias=config.bias)
         self.o_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         
-        # Regularization
+        with torch.no_grad():
+            # Initialize with scaled normal distribution
+            scale = 1.0 / math.sqrt(self.head_dim)
+            for proj in [self.q_proj, self.k_proj, self.v_proj, self.o_proj]:
+                nn.init.normal_(proj.weight, mean=0.0, std=scale)
+                if proj.bias is not None:
+                    nn.init.zeros_(proj.bias)
+        
+        # Regularization with optimized dropout
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         
-        # Attention backend setup
-        if hasattr(config, 'attention_backend') and config.attention_backend is not None:
-            if config.attention_backend not in ATTENTION_BACKENDS:
-                raise ValueError(f"Attention backend {config.attention_backend} not available")
-            if not ATTENTION_BACKENDS[config.attention_backend]:
-                print(f"Warning: {config.attention_backend} not available, falling back to best available backend")
-                self.attention_backend = get_best_attention_backend()
-            else:
-                self.attention_backend = config.attention_backend
-        else:
-            self.attention_backend = get_best_attention_backend()
-            
-        print(f"Using attention backend: {self.attention_backend}")
+        # Attention backend setup with better error handling
+        self.attention_backend = self._setup_attention_backend(config)
         
         # Replace ALiBi with RoPE
         self.rope = RoPE(self.head_dim, config.block_size)
         
-        # Préallouer le masque causal
+        # Pre-allocate attention mask with pinned memory
         mask = torch.full((config.block_size, config.block_size), float('-inf'))
         mask = torch.triu(mask, diagonal=1)
-        self.register_buffer('mask', mask)
+        self.register_buffer('mask', mask, persistent=False)
+        
+        # Create separate CUDA streams for parallel computation
+        self.streams = None
+        if torch.cuda.is_available():
+            self.streams = {
+                'qkv': torch.cuda.Stream(),
+                'attn': torch.cuda.Stream(),
+                'out': torch.cuda.Stream()
+            }
+
+    def _setup_attention_backend(self, config):
+        if not hasattr(config, 'attention_backend') or config.attention_backend is None:
+            return get_best_attention_backend()
+            
+        if config.attention_backend not in ATTENTION_BACKENDS:
+            print(f"Warning: {config.attention_backend} not available")
+            return get_best_attention_backend()
+            
+        if not ATTENTION_BACKENDS[config.attention_backend]:
+            print(f"Warning: {config.attention_backend} not available")
+            return get_best_attention_backend()
+            
+        return config.attention_backend
 
     def _memory_efficient_attention(self, q, k, v, mask=None, is_causal=True):
         """
@@ -268,41 +288,36 @@ class CausalSelfAttention(nn.Module):
             return None
 
     def _flash_attention(self, q, k, v, mask=None, is_causal=True):
-        """
-        Wrapper pour Flash Attention 2 avec optimisations
-        """
+        """Optimized Flash Attention implementation"""
         try:
-            # Convert inputs to bfloat16
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
-            v = v.to(torch.bfloat16)
-            
-            # Handle GQA by expanding k and v heads
-            if k.size(1) != q.size(1):  # If number of heads don't match (GQA case)
-                # Repeat k and v heads to match q heads
+            # Use streams for parallel computation
+            if self.streams is not None:
+                with torch.cuda.stream(self.streams['qkv']):
+                    q = q.to(torch.bfloat16)
+                    k = k.to(torch.bfloat16)
+                    v = v.to(torch.bfloat16)
+
+            # Handle GQA expansion
+            if k.size(1) != q.size(1):
                 k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
                 v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-            
-            # Utiliser la mise en cache des KV pour la génération
-            if hasattr(self, '_cached_k') and hasattr(self, '_cached_v'):
-                k = torch.cat([self._cached_k, k], dim=2)  # dim=2 car Flash Attention utilise [B, H, T, D]
-                v = torch.cat([self._cached_v, v], dim=2)
-                self._cached_k = k
-                self._cached_v = v
-            
-            # Appliquer Flash Attention avec les optimisations
-            output = flash_attn_func_2(
-                q, k, v,
-                causal=is_causal,
-                softmax_scale=1.0 / math.sqrt(self.head_dim)
-            )
-            
+
+            # Use flash attention with optimal settings
+            with torch.cuda.stream(self.streams['attn']):
+                output = flash_attn_func_2(
+                    q, k, v,
+                    causal=is_causal,
+                    softmax_scale=1.0 / math.sqrt(self.head_dim)
+                )
+
+            # Synchronize streams
+            if self.streams is not None:
+                torch.cuda.current_stream().wait_stream(self.streams['attn'])
+
             return output
-            
+
         except Exception as e:
             print(f"Flash Attention 2 failed: {e}")
-            print(f"Input dtypes - q: {q.dtype}, k: {k.dtype}, v: {v.dtype}")
-            print(f"Input shapes - q: {q.shape}, k: {k.shape}, v: {v.shape}")
             return None
 
     def _sdpa_attention(self, q, k, v, mask=None, is_causal=True):
@@ -373,115 +388,88 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x, key_value=None, is_generation=False):
         B, T, C = x.size()
         
-        # Ensure consistent dtype for all tensors
-        working_dtype = torch.float16 if x.device.type == 'cuda' else torch.float32
-        x = x.to(working_dtype)
+        # Ensure consistent dtype and handle NaN/Inf
+        working_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        x = torch.nan_to_num(x.to(working_dtype), nan=0.0, posinf=1e4, neginf=-1e4)
         
         try:
-            # Vérification et correction des NaN/Inf
-            if torch.isnan(x).any() or torch.isinf(x).any():
-                x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
-            
-            # Cross-attention
-            if key_value is not None:
-                q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-                k = self.k_proj(key_value)
-                v = self.v_proj(key_value)
-                
-                k = k.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
-                v = v.view(B, key_value.size(1), self.n_head_kv, self.head_dim).transpose(1, 2)
-                
-                # Convert k and v to the same dtype as q
-                k = k.to(working_dtype)
-                v = v.to(working_dtype)
-                
-                # Répéter K,V pour GQA
-                k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                
-                # Apply RoPE to queries and keys
-                q = self.rope(q)
-                k = self.rope(k)
-                
+            # Use streams for parallel computation of Q, K, V
+            if self.streams is not None and not is_generation:
+                with torch.cuda.stream(self.streams['qkv']):
+                    if key_value is not None:
+                        q = self.q_proj(x)
+                        k = self.k_proj(key_value)
+                        v = self.v_proj(key_value)
+                    else:
+                        qkv = torch.cat([
+                            self.q_proj(x),
+                            self.k_proj(x),
+                            self.v_proj(x)
+                        ], dim=-1)
+                        q, k, v = qkv.split([self.n_embd, self.n_head_kv * self.head_dim, self.n_head_kv * self.head_dim], dim=-1)
             else:
-                # Self-attention
-                qkv = torch.cat([
-                    self.q_proj(x),
-                    self.k_proj(x),
-                    self.v_proj(x)
-                ], dim=-1)
-                
-                # Ensure consistent dtype
-                qkv = qkv.to(working_dtype)
-                
-                q, k, v = qkv.split([self.n_embd, self.n_head_kv * self.head_dim, self.n_head_kv * self.head_dim], dim=-1)
-                
-                q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-                k = k.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
-                v = v.view(B, T, self.n_head_kv, self.head_dim).transpose(1, 2)
-                
-                # Répéter K,V pour GQA si ce n'est pas de la génération
-                if not is_generation:
-                    k = k.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                    v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
-                
-                # Apply RoPE to queries and keys
-                q = self.rope(q)
-                k = self.rope(k)
+                # Sequential computation for generation
+                if key_value is not None:
+                    q = self.q_proj(x)
+                    k = self.k_proj(key_value)
+                    v = self.v_proj(key_value)
+                else:
+                    qkv = torch.cat([
+                        self.q_proj(x),
+                        self.k_proj(x),
+                        self.v_proj(x)
+                    ], dim=-1)
+                    q, k, v = qkv.split([self.n_embd, self.n_head_kv * self.head_dim, self.n_head_kv * self.head_dim], dim=-1)
 
-            # Déterminer si nous sommes en mode causal et préparer le masque
-            is_causal = key_value is None  # Causal seulement pour self-attention
+            # Reshape and apply RoPE
+            q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+            k = k.view(B, -1, self.n_head_kv, self.head_dim).transpose(1, 2)
+            v = v.view(B, -1, self.n_head_kv, self.head_dim).transpose(1, 2)
+
+            # Apply RoPE
+            q = self.rope(q)
+            k = self.rope(k)
+
+            # Determine attention implementation
+            is_causal = key_value is None
             attn_mask = self.mask[:T, :T] if is_causal else None
-            
-            y = None
-            # During generation or cross-attention, use SDPA instead of Flash Attention
+
+            # Choose attention implementation
             if is_generation or key_value is not None:
                 y = self._sdpa_attention(q, k, v, attn_mask, is_causal)
             else:
-                # Try Flash Attention first
                 if self.attention_backend == 'flash_attn_2':
                     y = self._flash_attention(q, k, v, attn_mask, is_causal)
-            
-            if y is None and self.attention_backend == 'xformers':
-                y = self._memory_efficient_attention(q, k, v, attn_mask, is_causal)
-            
-            if y is None and self.attention_backend == 'sdpa':
-                y = self._sdpa_attention(q, k, v, attn_mask, is_causal)
-            
-            if y is None:
-                # Standard attention
-                scale = 1.0 / math.sqrt(self.head_dim)
-                att = torch.matmul(q, k.transpose(-2, -1)) * scale
-                
-                # Clipping pour stabilité numérique
-                att = torch.clamp(att, min=-1e4, max=1e4)
-                
-                # Appliquer le masque causal si nécessaire
-                if is_causal and attn_mask is not None:
-                    att = att + attn_mask
-                
-                # Utiliser float32 pour le softmax pour plus de stabilité
-                att = F.softmax(att.float(), dim=-1).to(working_dtype)
-                att = self.attn_dropout(att)
-                
-                y = torch.matmul(att, v)
-            
-            # Vérification finale des NaN/Inf
-            if torch.isnan(y).any() or torch.isinf(y).any():
-                y = torch.nan_to_num(y, nan=0.0, posinf=1e4, neginf=-1e4)
-            
-            # Reshape et projection finale
-            y = y.transpose(1, 2).contiguous().view(B, T, C)
-            
-            # Projection finale
-            output = self.resid_dropout(self.o_proj(y))
-            
+                if y is None and self.attention_backend == 'xformers':
+                    y = self._memory_efficient_attention(q, k, v, attn_mask, is_causal)
+                if y is None and self.attention_backend == 'sdpa':
+                    y = self._sdpa_attention(q, k, v, attn_mask, is_causal)
+                if y is None:
+                    y = self._standard_attention(q, k, v, attn_mask, is_causal)
+
+            # Final projection with stream
+            if self.streams is not None and not is_generation:
+                with torch.cuda.stream(self.streams['out']):
+                    y = y.transpose(1, 2).contiguous().view(B, T, C)
+                    output = self.resid_dropout(self.o_proj(y))
+                    
+                # Synchronize streams
+                torch.cuda.current_stream().wait_stream(self.streams['out'])
+            else:
+                y = y.transpose(1, 2).contiguous().view(B, T, C)
+                output = self.resid_dropout(self.o_proj(y))
+
+            # Clean up
+            del q, k, v, y
+            if 'qkv' in locals(): del qkv
+            torch.cuda.empty_cache()
+
             return output
-            
+
         except Exception as e:
             print(f"Attention computation failed: {e}")
             print(traceback.format_exc())
-            raise  # Re-raise the exception after printing the traceback
+            raise
 
 class MLP(nn.Module):
     """
