@@ -788,6 +788,9 @@ while True:
                 logits, loss, router_loss = model(encoder_input, decoder_input, target)
                 batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
                 total_tokens += batch_tokens
+                tokens_window.append((time.time(), batch_tokens))
+                if len(tokens_window) > window_size:
+                    tokens_window.pop(0)
                 del logits  # Libérer immédiatement
                 
                 if loss is not None:
@@ -870,8 +873,8 @@ while True:
             # Réinitialiser les caches de compilation si nécessaire
             if hasattr(torch, '_dynamo'):
                 torch._dynamo.reset()
-            if hasattr(torch, '_inductor'):
-                torch._inductor.codecache.reset()
+            if hasattr(torch, '_inductor') and hasattr(torch._inductor, 'clear_cache'):
+                torch._inductor.clear_cache()
 
     # termination conditions
     if iter_num > max_iters:
