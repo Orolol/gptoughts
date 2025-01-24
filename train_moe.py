@@ -146,7 +146,7 @@ if torch.cuda.is_available():
         decoder_n_embd = 384
         decoder_ratio_kv = 4
     
-    router_z_loss_coef = 0.0001
+    router_z_loss_coef = 0.001
     router_aux_loss_coef = 0.001
     
     # Fixed sequence lengths for padding
