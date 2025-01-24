@@ -369,35 +369,36 @@ class MoELayer(nn.Module):
         self.norm = nn.LayerNorm(config.n_embd)
         
         # Ajouter des buffers pour réutiliser la mémoire
-        self.register_buffer('dispatch_mask', None, persistent=False)
-        self.register_buffer('combine_weights', None, persistent=False)
+        self.register_buffer('_dispatch_mask', None, persistent=False)
+        self.register_buffer('_combine_weights', None, persistent=False)
+
+    def get_dispatch_mask(self, batch_size, seq_len, device, dtype):
+        """Get dispatch mask buffer, cloning if needed for CUDA graphs"""
+        if (self._dispatch_mask is None or 
+            self._dispatch_mask.size(0) != batch_size * seq_len):
+            self._dispatch_mask = torch.zeros(
+                batch_size * seq_len, 
+                self.num_experts,
+                device=device,
+                dtype=dtype
+            )
+        return self._dispatch_mask.clone()  # Clone pour CUDA graphs
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, hidden_dim = x.shape
         
-        # Réutiliser les buffers existants ou en créer de nouveaux si nécessaire
-        if (self.dispatch_mask is None or 
-            self.dispatch_mask.size(0) != batch_size * seq_len):
-            self.dispatch_mask = torch.zeros(
-                batch_size * seq_len, 
-                self.num_experts,
-                device=x.device,
-                dtype=x.dtype
-            )
-        else:
-            self.dispatch_mask.zero_()
-            
-        # Utiliser torch.no_grad() pour les opérations qui n'ont pas besoin de gradients
+        # Obtenir un buffer cloné pour CUDA graphs
+        dispatch_mask = self.get_dispatch_mask(batch_size, seq_len, x.device, x.dtype)
+        dispatch_mask.zero_()
+        
+        # Normalize input
         with torch.no_grad():
             normalized = self.norm(x)
-            
-        # Optimiser le routage
+        
+        # Get routing weights and dispatch mask
         combine_weights, dispatch_mask, router_loss = self.router(normalized)
         
-        # Libérer la mémoire immédiatement après utilisation
-        del normalized
-        
-        # Process through expert group with memory optimization
+        # Process through expert group
         output = self.expert_group(x, dispatch_mask)
         
         return output, router_loss
