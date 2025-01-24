@@ -59,6 +59,9 @@ class Router(nn.Module):
         # Scaling factors pour les pertes
         self.router_z_loss_coef = 0.001
         self.load_balance_coef = 0.001
+        
+        # Flag pour le mode d'entraînement
+        self.training_mode = True
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
@@ -89,10 +92,11 @@ class Router(nn.Module):
         routing_weights = F.softmax(router_logits / self.temperature, dim=-1)
         
         # Top-k avec meilleur clipping
-        top_k_weights, top_k_indices = torch.topk(routing_weights, self.k, dim=-1)
-        top_k_weights = torch.clamp(top_k_weights, min=1e-4, max=0.9)
-        top_k_weights_sum = top_k_weights.sum(dim=-1, keepdim=True)
-        top_k_weights = top_k_weights / top_k_weights_sum.clamp(min=1e-12)
+        with torch.no_grad():
+            top_k_weights, top_k_indices = torch.topk(routing_weights, self.k, dim=-1)
+            top_k_weights = torch.clamp(top_k_weights, min=1e-4, max=0.9)
+            top_k_weights_sum = top_k_weights.sum(dim=-1, keepdim=True)
+            top_k_weights = top_k_weights / top_k_weights_sum.clamp(min=1e-12)
         
         # Utiliser seulement la partie nécessaire des buffers
         indices = self._indices_buffer[:combined_batch_size]
@@ -100,45 +104,46 @@ class Router(nn.Module):
         ones = self._ones_buffer[:combined_batch_size]
         
         # Create routing tensor
-        for k_idx in range(self.k):
-            expert_idx = top_k_indices[:, k_idx]
-            mask = self._zeros_buffer[expert_idx] < self.capacity_factor * combined_batch_size * self.k / self.num_experts
-            self._zeros_buffer.scatter_add_(0, expert_idx[mask], ones[mask])
-            dispatch_mask[indices[mask, k_idx], expert_idx[mask]] = top_k_weights[mask, k_idx]
+        with torch.no_grad():
+            for k_idx in range(self.k):
+                expert_idx = top_k_indices[:, k_idx]
+                mask = self._zeros_buffer[expert_idx] < self.capacity_factor * combined_batch_size * self.k / self.num_experts
+                self._zeros_buffer.scatter_add_(0, expert_idx[mask], ones[mask])
+                dispatch_mask[indices[mask, k_idx], expert_idx[mask]] = top_k_weights[mask, k_idx]
+            
+            # Handle unrouted tokens
+            unrouted = dispatch_mask.sum(dim=-1) == 0
+            if torch.any(unrouted):
+                least_loaded = (self.capacity_factor * combined_batch_size * self.k / self.num_experts - self._zeros_buffer).argmax()
+                dispatch_mask[unrouted, least_loaded] = 1.0
+            
+            # Normalize dispatch mask
+            dispatch_mask_sum = dispatch_mask.sum(dim=-1, keepdim=True)
+            normalized_dispatch_mask = dispatch_mask / (dispatch_mask_sum.clamp(min=1e-12))
         
-        # Handle unrouted tokens
-        unrouted = dispatch_mask.sum(dim=-1) == 0
-        if torch.any(unrouted):
-            least_loaded = (self.capacity_factor * combined_batch_size * self.k / self.num_experts - self._zeros_buffer).argmax()
-            dispatch_mask = dispatch_mask.clone()  # Clone before modification
-            dispatch_mask[unrouted, least_loaded] = 1.0
-        
-        # Normalize dispatch mask
-        dispatch_mask_sum = dispatch_mask.sum(dim=-1, keepdim=True)
-        normalized_dispatch_mask = dispatch_mask / (dispatch_mask_sum + 1e-8)
-        
-        # Pertes auxiliaires recalibrées
-        # Z-loss sur les logits normalisés
-        router_z_loss = torch.mean(torch.square(F.log_softmax(router_logits, dim=-1)))
-        
-        # Load balancing avec meilleure normalisation
-        # Calculer les ratios d'utilisation des experts
-        expert_usage = normalized_dispatch_mask.sum(0)  # [num_experts]
-        expert_usage = expert_usage / expert_usage.sum().clamp(min=1e-12)
-        
-        # Pénaliser l'écart par rapport à une distribution uniforme
-        target_usage = torch.ones_like(expert_usage) / self.num_experts
-        load_balance_loss = F.kl_div(
-            expert_usage.log(),
-            target_usage,
-            reduction='batchmean'
-        )
-        
-        # Combiner les pertes avec des coefficients fixes
-        router_loss = (
-            self.router_z_loss_coef * router_z_loss +
-            self.load_balance_coef * load_balance_loss
-        )
+        if self.training:
+            # Calculer les pertes seulement en mode training
+            # Z-loss sur les logits normalisés
+            router_z_loss = torch.mean(torch.square(F.log_softmax(router_logits, dim=-1)))
+            
+            # Load balancing avec meilleure normalisation
+            expert_usage = normalized_dispatch_mask.sum(0)
+            expert_usage = expert_usage / expert_usage.sum().clamp(min=1e-12)
+            
+            target_usage = torch.ones_like(expert_usage) / self.num_experts
+            load_balance_loss = F.kl_div(
+                expert_usage.log(),
+                target_usage,
+                reduction='batchmean'
+            )
+            
+            # Combiner les pertes
+            router_loss = (
+                self.router_z_loss_coef * router_z_loss +
+                self.load_balance_coef * load_balance_loss
+            )
+        else:
+            router_loss = torch.tensor(0.0, device=x.device)
         
         # Time the forward pass
         end_time = time.time()
