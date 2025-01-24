@@ -34,6 +34,10 @@ class EnhancedRouter(nn.Module):
         self.temperature = nn.Parameter(torch.ones(1) * 0.1)
         self.noise_scale = 0.1
         
+        # Token clustering
+        self.cluster_size = 4  # Group similar tokens together
+        self.cluster_proj = nn.Linear(self.routing_dim, self.routing_dim, bias=False)
+        
         # Expert importance weighting
         self.expert_weights = nn.Parameter(torch.ones(num_experts))
         
@@ -44,6 +48,7 @@ class EnhancedRouter(nn.Module):
                 if layer.bias is not None:
                     nn.init.zeros_(layer.bias)
         nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
+        nn.init.normal_(self.cluster_proj.weight, mean=0.0, std=0.01)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
@@ -53,6 +58,30 @@ class EnhancedRouter(nn.Module):
         # Reduce dimensionality for routing computation
         route_features = self.route_reduction(x)
         x_flat = route_features.view(combined_batch_size, -1)
+        
+        # Token clustering for similar routing decisions
+        if self.training:
+            # Group similar tokens
+            similarity = torch.matmul(
+                self.cluster_proj(route_features.view(-1, self.routing_dim)),
+                route_features.view(-1, self.routing_dim).transpose(-1, -2)
+            )
+            # Apply clustering only within each sequence
+            similarity = similarity.view(batch_size, seq_len, batch_size, seq_len)
+            similarity = similarity * torch.eye(batch_size, device=device)[:, None, :, None]
+            similarity = similarity.view(combined_batch_size, combined_batch_size)
+            
+            # Create clusters
+            clusters = torch.argmax(similarity, dim=-1).view(-1)
+            unique_clusters = torch.unique(clusters)
+            
+            # Average features within clusters
+            clustered_features = torch.zeros_like(x_flat)
+            for cluster in unique_clusters:
+                mask = (clusters == cluster)
+                if mask.any():
+                    clustered_features[mask] = x_flat[mask].mean(0)
+            x_flat = x_flat * 0.7 + clustered_features * 0.3  # Soft clustering
         
         # Compute router logits with noise during training
         router_logits = self.router(x_flat)
@@ -70,9 +99,14 @@ class EnhancedRouter(nn.Module):
         # Get top-k experts and weights
         top_k_probs, top_k_indices = torch.topk(routing_probs, self.k, dim=-1)
         
-        # Normalize weights
+        # Normalize weights and apply confidence scaling
         prob_sum = top_k_probs.sum(dim=-1, keepdim=True)
         top_k_weights = top_k_probs / (prob_sum + 1e-9)
+        
+        # Confidence-based routing: reduce weight of uncertain assignments
+        confidence = (top_k_probs.max(dim=-1)[0] / prob_sum.squeeze(-1))
+        confidence = confidence.unsqueeze(-1)
+        top_k_weights = top_k_weights * confidence
         
         # Create dispatch mask with capacity limit
         capacity = int(self.capacity_factor * combined_batch_size * self.k / self.num_experts)
@@ -87,18 +121,12 @@ class EnhancedRouter(nn.Module):
             weight = top_k_weights[:, i]
             
             # Check capacity constraints
-            counts = torch.bincount(expert_idx, minlength=self.num_experts)
-            can_assign = counts[expert_idx] < capacity
-            
-            # Update expert counts
-            expert_counts += counts
-            
-            # Create indices tensor on the correct device
-            indices = torch.arange(combined_batch_size, device=device)
-            valid_indices = indices[can_assign]
+            can_assign = expert_counts[expert_idx] < capacity
+            expert_counts.scatter_add_(0, expert_idx[can_assign], 
+                                    torch.ones_like(expert_counts)[can_assign])
             
             # Assign tokens that fit within capacity
-            dispatch_mask[valid_indices, expert_idx[can_assign]] = weight[can_assign]
+            dispatch_mask[torch.arange(combined_batch_size)[can_assign], expert_idx[can_assign]] = weight[can_assign]
         
         # Normalize dispatch mask
         dispatch_mask_sum = dispatch_mask.sum(dim=-1, keepdim=True)
@@ -367,39 +395,19 @@ class MoELayer(nn.Module):
         self.expert_group = ExpertGroup(config, num_experts)
         
         self.norm = nn.LayerNorm(config.n_embd)
-        
-        # Ajouter des buffers pour réutiliser la mémoire
-        self.register_buffer('_dispatch_mask', None, persistent=False)
-        self.register_buffer('_combine_weights', None, persistent=False)
-
-    def get_dispatch_mask(self, batch_size, seq_len, device, dtype):
-        """Get dispatch mask buffer, cloning if needed for CUDA graphs"""
-        if (self._dispatch_mask is None or 
-            self._dispatch_mask.size(0) != batch_size * seq_len):
-            self._dispatch_mask = torch.zeros(
-                batch_size * seq_len, 
-                self.num_experts,
-                device=device,
-                dtype=dtype
-            )
-        return self._dispatch_mask.clone()  # Clone pour CUDA graphs
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        device = x.device
         batch_size, seq_len, hidden_dim = x.shape
         
-        # Obtenir un buffer cloné pour CUDA graphs
-        dispatch_mask = self.get_dispatch_mask(batch_size, seq_len, x.device, x.dtype)
-        dispatch_mask.zero_()
-        
         # Normalize input
-        with torch.no_grad():
-            normalized = self.norm(x)
+        normalized = self.norm(x)
         
         # Get routing weights and dispatch mask
         combine_weights, dispatch_mask, router_loss = self.router(normalized)
         
         # Process through expert group
-        output = self.expert_group(x, dispatch_mask)
+        output = self.expert_group(normalized, dispatch_mask)
         
         return output, router_loss
 

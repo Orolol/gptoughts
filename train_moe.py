@@ -59,7 +59,7 @@ log_interval = 1
 eval_iters = 100
 eval_only = False
 always_save_checkpoint = True
-init_from = 'scratch'  # 'scratch' or 'resume'
+init_from = 'resume'  # 'scratch' or 'resume'
 
 # wandb logging
 wandb_log = False
@@ -72,7 +72,7 @@ data_dir = 'data/openwebtext'
 gradient_accumulation_steps = 1
 dropout = 0.0
 bias = False
-attention_backend = "sdpa" # "xformers"
+attention_backend = "xformers" # "sdpa"
 
 # Configure CUDA Graph behavior
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
@@ -378,13 +378,6 @@ def pad_sequences(encoder_input, decoder_input, target):
             target = target[:, :decoder_seq_len]
     
     return encoder_input, decoder_input, target
-
-def reset_cuda_cache():
-    """Reset CUDA cache and garbage collection"""
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-    gc.collect()
 
 # -----------------------------------------------------------------------------
 # Init
@@ -802,7 +795,6 @@ while True:
 
     except Exception as e:
         print(f"Training iteration failed: {e}")
-        print(traceback.format_exc())
         if ddp:
             dist_barrier()
         continue
@@ -852,35 +844,6 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
-
-    # Nettoyage périodique de la mémoire
-    if iter_num > 0 and iter_num % 100 == 0:
-        reset_cuda_cache()
-        
-    # Monitoring de la mémoire et du temps
-    if iter_num > 0 and iter_num % 10 == 0 and master_process:
-        torch.cuda.synchronize()
-        current_memory = torch.cuda.memory_allocated() / 1e9
-        max_memory = torch.cuda.max_memory_allocated() / 1e9
-        print(f"Memory usage: {current_memory:.2f}GB (max: {max_memory:.2f}GB)")
-        
-        # Calcul du temps moyen par batch sur les dernières itérations
-        if len(tokens_window) >= 2:
-            time_diff = tokens_window[-1][0] - tokens_window[0][0]
-            tokens_sum = sum(tokens for _, tokens in tokens_window)
-            tokens_per_sec = tokens_sum / time_diff
-            print(f"Processing speed: {tokens_per_sec:.2f} tokens/s")
-
-    # Modifier la gestion des streams CUDA
-    if device_type == 'cuda':
-        # Utiliser des streams séparés pour le calcul et les transferts
-        with torch.cuda.stream(copy_stream):
-            encoder_input = encoder_input.to(device, non_blocking=True)
-            decoder_input = decoder_input.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
-        
-        # Synchroniser les streams avant le calcul
-        copy_stream.synchronize()
 
 if ddp:
     destroy_process_group()
