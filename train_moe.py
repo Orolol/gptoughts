@@ -26,6 +26,8 @@ from moe import MoEEncoderDecoderGPT
 from data.openwebtext.data_loader import StreamingDataset
 from run_train import get_datasets
 
+import traceback
+
 from rich.console import Console
 console = Console()
 
@@ -74,11 +76,11 @@ if torch.cuda.is_available():
     
     if args.size == "small":
         # Increase batch size and reduce gradient accumulation steps
-        batch_size = 8  
+        batch_size = 16  
         block_size = 64
         
-        num_experts = 16
-        expert_k = 2
+        num_experts = 32
+        expert_k = 4
         
         gradient_accumulation_steps = 2
         
@@ -196,35 +198,34 @@ compile = True
 # Prompts for generation
 PROMPT_TEMPLATES = [
     # Science Fiction
-    "Dans un monde futuriste",
-    "Sur une planète lointaine",
-    "Le robot découvrit que",
-    # Fantasy
-    "Le dragon survola",
-    "Le sorcier murmura une incantation",
-    # Histoire
-    "En l'an 1789",
-    "Dans l'Égypte ancienne",
-    # Vie quotidienne
-    "Au marché ce matin",
-    "Dans la salle de classe",
-    # Nature
-    "Au cœur de l'Amazonie",
-    "L'ours polaire observait",
-    # Romance
-    "Leurs regards se croisèrent",
-    "La lettre d'amour disait",
-    # Aventure
-    "Le trésor se trouvait",
-    "L'explorateur s'aventura",
-    # Policier
-    "L'inspecteur examina",
-    "Le mystère commença quand",
-    # Gastronomie
-    "Dans la cuisine du restaurant",
-    "La recette secrète contenait",
-    # Sport
-    "Le match décisif allait"
+    # Science
+    "The quantum experiment revealed",
+    "In the laboratory, scientists discovered",
+    "The research paper concluded that",
+    # Mathematics
+    "The mathematical proof showed",
+    "By solving the equation",
+    # History
+    "During the Industrial Revolution",
+    "Ancient civilizations developed",
+    # Literature
+    "Shakespeare's influence on",
+    "The literary analysis demonstrates",
+    # Education
+    "Modern teaching methods focus on",
+    "Students learn best when",
+    # Technology
+    "Artificial intelligence systems can",
+    "The future of computing lies in",
+    # Biology
+    "The human genome contains",
+    "Cellular processes involve",
+    # Physics
+    "According to quantum mechanics",
+    "The laws of thermodynamics state",
+    # Chemistry
+    "The chemical reaction between",
+    "Molecular structures reveal"
 ]
 
 # -----------------------------------------------------------------------------
@@ -698,6 +699,8 @@ while True:
                 print(f"Generated text: {generated_text}")
         except Exception as e:
             print(f"Erreur lors de la génération: {str(e)}")
+            # print the stack trace
+            print(traceback.format_exc())
             continue
 
     if iter_num == 0 and eval_only:

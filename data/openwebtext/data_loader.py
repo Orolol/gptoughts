@@ -16,8 +16,8 @@ class TokenTracker:
         self.total_tokens += new_tokens
 
 class StreamingDataset(IterableDataset):
-    def __init__(self, block_size, batch_size, dataset_name="HuggingFaceFW/fineweb-2", 
-                 dataset_config="fra_Latn", split="train", device='cuda'):
+    def __init__(self, block_size, batch_size, dataset_name="HuggingFaceFW/fineweb-edu", 
+                 dataset_config="CC-MAIN-2024-10", split="train", device='cuda'):
         super().__init__()
         self.block_size = block_size
         self.batch_size = batch_size

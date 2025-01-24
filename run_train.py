@@ -15,8 +15,8 @@ def get_datasets(block_size, batch_size, device):
     train_dataset = StreamingDataset(
         block_size=block_size,
         batch_size=batch_size,
-        dataset_name="HuggingFaceFW/fineweb-2",
-        dataset_config="fra_Latn",
+        dataset_name="HuggingFaceFW/fineweb-edu",
+        dataset_config="CC-MAIN-2024-10",
         split="train",
         device=device
     )
@@ -24,9 +24,9 @@ def get_datasets(block_size, batch_size, device):
     val_dataset = StreamingDataset(
         block_size=block_size,
         batch_size=batch_size,
-        dataset_name="HuggingFaceFW/fineweb-2",
-        dataset_config="fra_Latn",
-        split="test",
+        dataset_name="HuggingFaceFW/fineweb-edu",
+        dataset_config="CC-MAIN-2024-10",
+        split="train",
         device=device
     )
     return train_dataset, val_dataset
