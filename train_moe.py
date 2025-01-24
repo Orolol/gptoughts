@@ -36,9 +36,13 @@ import torch._dynamo.config
 
 # Configuration optimisée pour les modèles avec dimensions dynamiques
 torch._dynamo.config.suppress_errors = True
-torch._dynamo.config.cache_size_limit = 8192  # Augmenté pour gérer plus de cas
+torch._dynamo.config.cache_size_limit = 16384  # Augmenté pour gérer plus de cas
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = False  # Permettre les graphes dynamiques
 torch._inductor.config.debug = False
+torch._inductor.config.triton.autotune_pointwise = True  # Activer l'autotuning
+torch._inductor.config.triton.unique_kernel_names = True  # Optimisation des noms de kernel
+torch._inductor.config.coordinate_descent_tuning = True  # Optimisation des tuning
+torch._inductor.config.triton.cudagraphs = True  # Activer CUDA graphs quand possible
 
 # -----------------------------------------------------------------------------
 # Parse command line arguments
@@ -72,7 +76,7 @@ data_dir = 'data/openwebtext'
 gradient_accumulation_steps = 1
 dropout = 0.0
 bias = False
-attention_backend = "xformers" # "sdpa"
+attention_backend = "sdpa" # "sdpa"
 
 # Configure CUDA Graph behavior
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
@@ -446,8 +450,7 @@ if master_process:
     os.makedirs(out_dir, exist_ok=True)
 
 torch.manual_seed(1337 + seed_offset)
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+
 
 device_type = 'cuda' if 'cuda' in device else 'cpu'
 dtype = 'float16'
@@ -597,6 +600,10 @@ if compile:
                 "triton.cudagraphs": False,  # Désactivé pour plus de stabilité
                 "trace.enabled": True,
                 "trace.graph_diagram": False,
+                "triton.autotune_pointwise": True,
+                "triton.unique_kernel_names": True,
+                "triton.persistent_reductions": True,  # Optimisation des réductions
+                "max_parallel_block_count": 50,  # Augmenter le parallélisme
                 "triton.cudagraphs": True,
             }
         )
@@ -665,7 +672,7 @@ train_start_time = time.time()
 tokens_per_iter = batch_size * block_size * gradient_accumulation_steps
 total_tokens = 0
 tokens_window = []  # Pour calculer une moyenne glissante des tokens/s
-window_size = 100   # Taille de la fenêtre pour la moyenne glissante
+window_size = 10   # Taille de la fenêtre pour la moyenne glissante
 
 print(f"Starting training with {num_experts} experts and top-{expert_k} routing")
 print_memory_stats("Initial")
