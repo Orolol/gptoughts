@@ -9,10 +9,10 @@ from typing import Optional
 import inspect
 import gc
 
-class EnhancedRouter(nn.Module):
+class Router(nn.Module):
     """
-    Enhanced Router with token clustering, confidence-based routing,
-    and improved load balancing.
+    Router module that determines which expert should process each token.
+    Uses top-k routing with load balancing.
     """
     def __init__(self, input_dim: int, num_experts: int, k: int = 2, capacity_factor: float = 1.25):
         super().__init__()
@@ -21,127 +21,88 @@ class EnhancedRouter(nn.Module):
         self.k = k
         self.capacity_factor = capacity_factor
         
-        # Dimensionality reduction for routing computation
-        self.routing_dim = input_dim // 2
-        self.route_reduction = nn.Sequential(
-            nn.Linear(input_dim, self.routing_dim),
-            nn.LayerNorm(self.routing_dim),
-            nn.GELU()
-        )
+        # Router projection
+        self.router = nn.Linear(input_dim, num_experts, bias=False)
         
-        # Router projection with noise and temperature
-        self.router = nn.Linear(self.routing_dim, num_experts, bias=False)
-        self.temperature = nn.Parameter(torch.ones(1) * 0.1)
-        self.noise_scale = 0.1
+        # Initialize with smaller weights for better stability
+        nn.init.normal_(self.router.weight, mean=0.0, std=0.001)
         
-        # Token clustering
-        self.cluster_size = 4  # Group similar tokens together
-        self.cluster_proj = nn.Linear(self.routing_dim, self.routing_dim, bias=False)
-        
-        # Expert importance weighting
-        self.expert_weights = nn.Parameter(torch.ones(num_experts))
-        
-        # Initialize
-        for layer in self.route_reduction:
-            if isinstance(layer, nn.Linear):
-                nn.init.normal_(layer.weight, mean=0.0, std=0.01)
-                if layer.bias is not None:
-                    nn.init.zeros_(layer.bias)
-        nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
-        nn.init.normal_(self.cluster_proj.weight, mean=0.0, std=0.01)
+        # Pre-register buffers with fixed size
+        max_batch_size = 32  # Adjust this based on your needs
+        max_seq_len = 256
+        self.register_buffer('_indices_buffer', 
+            torch.arange(max_batch_size * max_seq_len).unsqueeze(1).expand(-1, self.k),
+            persistent=False)
+        self.register_buffer('_zeros_buffer', 
+            torch.zeros((self.num_experts,)),
+            persistent=False)
+        self.register_buffer('_dispatch_buffer', 
+            torch.zeros((max_batch_size * max_seq_len, self.num_experts)),
+            persistent=False)
+        self.register_buffer('_ones_buffer',
+            torch.ones((max_batch_size * max_seq_len,), dtype=torch.float32),
+            persistent=False)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
-        device = x.device
         combined_batch_size = batch_size * seq_len
+        device = x.device
         
-        # Reduce dimensionality for routing computation
-        route_features = self.route_reduction(x)
-        x_flat = route_features.view(combined_batch_size, -1)
+        # Use slices of pre-allocated buffers
+        indices = self._indices_buffer[:combined_batch_size]
+        dispatch_mask = self._dispatch_buffer[:combined_batch_size].clone()  # Clone to avoid in-place ops
+        dispatch_mask.zero_()
+        expert_counts = self._zeros_buffer.clone()  # Clone to avoid in-place ops
+        expert_counts.zero_()
+        ones = self._ones_buffer[:combined_batch_size]
         
-        # Token clustering for similar routing decisions
-        if self.training:
-            # Group similar tokens
-            similarity = torch.matmul(
-                self.cluster_proj(route_features.view(-1, self.routing_dim)),
-                route_features.view(-1, self.routing_dim).transpose(-1, -2)
-            )
-            # Apply clustering only within each sequence
-            similarity = similarity.view(batch_size, seq_len, batch_size, seq_len)
-            similarity = similarity * torch.eye(batch_size, device=device)[:, None, :, None]
-            similarity = similarity.view(combined_batch_size, combined_batch_size)
-            
-            # Create clusters
-            clusters = torch.argmax(similarity, dim=-1).view(-1)
-            unique_clusters = torch.unique(clusters)
-            
-            # Average features within clusters
-            clustered_features = torch.zeros_like(x_flat)
-            for cluster in unique_clusters:
-                mask = (clusters == cluster)
-                if mask.any():
-                    clustered_features[mask] = x_flat[mask].mean(0)
-            x_flat = x_flat * 0.7 + clustered_features * 0.3  # Soft clustering
+        # Calculate expert capacity
+        capacity = int(self.capacity_factor * combined_batch_size * self.k / self.num_experts)
         
-        # Compute router logits with noise during training
-        router_logits = self.router(x_flat)
-        if self.training:
-            noise = torch.randn_like(router_logits) * self.noise_scale
-            router_logits = router_logits + noise
-        
-        # Apply learned temperature and expert importance
-        router_logits = router_logits * torch.sigmoid(self.temperature)
-        router_logits = router_logits * F.softmax(self.expert_weights, dim=0)
-        
-        # Compute routing probabilities
-        routing_probs = F.softmax(router_logits, dim=-1)
+        # Compute router logits and probabilities
+        x_reshaped = x.view(combined_batch_size, -1)
+        router_logits = self.router(x_reshaped)
+        routing_weights = F.softmax(router_logits, dim=-1)
         
         # Get top-k experts and weights
-        top_k_probs, top_k_indices = torch.topk(routing_probs, self.k, dim=-1)
+        top_k_weights, top_k_indices = torch.topk(routing_weights, self.k, dim=-1)
+        top_k_weights_sum = top_k_weights.sum(dim=-1, keepdim=True)
+        top_k_weights = top_k_weights / (top_k_weights_sum + 1e-8)
         
-        # Normalize weights and apply confidence scaling
-        prob_sum = top_k_probs.sum(dim=-1, keepdim=True)
-        top_k_weights = top_k_probs / (prob_sum + 1e-9)
+        # Create routing tensor
+        for k_idx in range(self.k):
+            expert_idx = top_k_indices[:, k_idx]
+            mask = expert_counts[expert_idx] < capacity
+            expert_counts = expert_counts.clone()  # Clone before in-place op
+            expert_counts.scatter_add_(0, expert_idx[mask], ones[mask])
+            dispatch_mask[indices[mask, k_idx], expert_idx[mask]] = top_k_weights[mask, k_idx]
         
-        # Confidence-based routing: reduce weight of uncertain assignments
-        confidence = (top_k_probs.max(dim=-1)[0] / prob_sum.squeeze(-1))
-        confidence = confidence.unsqueeze(-1)
-        top_k_weights = top_k_weights * confidence
-        
-        # Create dispatch mask with capacity limit
-        capacity = int(self.capacity_factor * combined_batch_size * self.k / self.num_experts)
-        dispatch_mask = torch.zeros(combined_batch_size, self.num_experts, device=device)
-        
-        # Track expert assignment counts
-        expert_counts = torch.zeros(self.num_experts, device=device)
-        
-        # Assign tokens to experts with capacity limit
-        for i in range(self.k):
-            expert_idx = top_k_indices[:, i]
-            weight = top_k_weights[:, i]
-            
-            # Check capacity constraints
-            can_assign = expert_counts[expert_idx] < capacity
-            expert_counts.scatter_add_(0, expert_idx[can_assign], 
-                                    torch.ones_like(expert_counts)[can_assign])
-            
-            # Assign tokens that fit within capacity
-            dispatch_mask[torch.arange(combined_batch_size)[can_assign], expert_idx[can_assign]] = weight[can_assign]
+        # Handle unrouted tokens
+        unrouted = dispatch_mask.sum(dim=-1) == 0
+        if torch.any(unrouted):
+            least_loaded = (capacity - expert_counts).argmax()
+            dispatch_mask = dispatch_mask.clone()  # Clone before modification
+            dispatch_mask[unrouted, least_loaded] = 1.0
         
         # Normalize dispatch mask
         dispatch_mask_sum = dispatch_mask.sum(dim=-1, keepdim=True)
-        dispatch_mask = dispatch_mask / (dispatch_mask_sum + 1e-9)
+        normalized_dispatch_mask = dispatch_mask / (dispatch_mask_sum + 1e-8)
+        
+        # Compute auxiliary losses
+        router_z_loss = torch.mean(torch.square(router_logits))
         
         # Compute load balancing loss
-        load = dispatch_mask.sum(0)
-        load = load / load.sum()  # Normalize load
-        target_load = torch.ones_like(load) / self.num_experts
-        load_balance_loss = torch.sum((load - target_load) ** 2)
+        expert_counts = normalized_dispatch_mask.sum(0)
+        target_count = float(combined_batch_size * self.k / self.num_experts)
+        counts_scaled = expert_counts / float(combined_batch_size)
+        target_scaled = target_count / float(combined_batch_size)
+        load_balance_loss = torch.mean(torch.square(counts_scaled - target_scaled))
         
-        # Add auxiliary losses
-        aux_loss = 0.01 * load_balance_loss + 0.01 * torch.mean(router_logits ** 2)
+        # Combine losses with detached tensors where needed
+        router_loss = (0.001 * router_z_loss.detach() + 
+                      0.001 * load_balance_loss.detach())
         
-        return routing_probs.detach(), dispatch_mask, aux_loss
+        return routing_weights.detach(), normalized_dispatch_mask, router_loss
 
 class SharedExpertMLP(nn.Module):
     """
@@ -389,7 +350,7 @@ class MoELayer(nn.Module):
         if hierarchical:
             self.router = HierarchicalRouter(config.n_embd, num_experts, k=self.k, group_size=4)
         else:
-            self.router = EnhancedRouter(config.n_embd, num_experts, k=self.k, capacity_factor=capacity_factor)
+            self.router = Router(config.n_embd, num_experts, k=self.k, capacity_factor=capacity_factor)
         
         # Replace individual experts with ExpertGroup
         self.expert_group = ExpertGroup(config, num_experts)

@@ -273,36 +273,40 @@ def estimate_loss():
     out = {}
     model.eval()
     
-    # Désactiver temporairement la compilation pour l'évaluation
-    with torch.set_grad_enabled(False):
-        with torch.compiler.disable():  # Nouvelle méthode recommandée
-            for split, dataset in [('train', train_dataset), ('val', val_dataset)]:
-                losses = torch.zeros(eval_iters, device=device)
-                router_losses = torch.zeros(eval_iters, device=device)
-                valid_iters = 0
-                
-                for k in range(eval_iters):
-                    encoder_input, decoder_input, target = next(iter(dataset))
-                    with ctx:
-                        logits, loss, router_loss = model(encoder_input, decoder_input, target)
-                        if loss is not None:
-                            losses[valid_iters] = loss.item()
-                            router_losses[valid_iters] = router_loss.item()
-                            valid_iters += 1
-                
-                if valid_iters > 0:
-                    mean_loss = losses[:valid_iters].mean()
-                    mean_router_loss = router_losses[:valid_iters].mean()
-                    if ddp:
-                        mean_loss = reduce_metrics(mean_loss, ddp_world_size)
-                        mean_router_loss = reduce_metrics(mean_router_loss, ddp_world_size)
-                    out[split] = mean_loss
-                    out[f'{split}_router'] = mean_router_loss
-                    out[f'{split}_ppl'] = calculate_perplexity(mean_loss)
-                else:
-                    out[split] = float('inf')
-                    out[f'{split}_router'] = float('inf')
-                    out[f'{split}_ppl'] = float('inf')
+    # Temporarily disable compilation for evaluation
+    if hasattr(model, '_orig_mod'):
+        eval_model = model._orig_mod
+    else:
+        eval_model = model
+        
+    with torch.no_grad():
+        for split, dataset in [('train', train_dataset), ('val', val_dataset)]:
+            losses = torch.zeros(eval_iters, device=device)
+            router_losses = torch.zeros(eval_iters, device=device)
+            valid_iters = 0
+            
+            for k in range(eval_iters):
+                encoder_input, decoder_input, target = next(iter(dataset))
+                with ctx:
+                    logits, loss, router_loss = eval_model(encoder_input, decoder_input, target)
+                    if loss is not None:
+                        losses[valid_iters] = loss.item()
+                        router_losses[valid_iters] = router_loss.item()
+                        valid_iters += 1
+            
+            if valid_iters > 0:
+                mean_loss = losses[:valid_iters].mean()
+                mean_router_loss = router_losses[:valid_iters].mean()
+                if ddp:
+                    mean_loss = reduce_metrics(mean_loss, ddp_world_size)
+                    mean_router_loss = reduce_metrics(mean_router_loss, ddp_world_size)
+                out[split] = mean_loss
+                out[f'{split}_router'] = mean_router_loss
+                out[f'{split}_ppl'] = calculate_perplexity(mean_loss)
+            else:
+                out[split] = float('inf')
+                out[f'{split}_router'] = float('inf')
+                out[f'{split}_ppl'] = float('inf')
     
     model.train()
     return out
