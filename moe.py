@@ -131,7 +131,6 @@ class Router(nn.Module):
         # Mark CUDA graph step boundary
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-            torch._dynamo.graph.mark_step_begin()
         
         return routing_weights.detach(), normalized_dispatch_mask, router_loss
 
