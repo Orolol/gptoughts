@@ -72,7 +72,7 @@ data_dir = 'data/openwebtext'
 gradient_accumulation_steps = 1
 dropout = 0.0
 bias = False
-attention_backend = "sdpa"
+attention_backend = "xformers" # "sdpa"
 
 # Configure CUDA Graph behavior
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
@@ -272,32 +272,37 @@ def calculate_perplexity(loss):
 def estimate_loss():
     out = {}
     model.eval()
-    for split, dataset in [('train', train_dataset), ('val', val_dataset)]:
-        losses = torch.zeros(eval_iters, device=device)
-        router_losses = torch.zeros(eval_iters, device=device)
-        valid_iters = 0
-        for k in range(eval_iters):
-            encoder_input, decoder_input, target = next(iter(dataset))
-            with ctx:
-                logits, loss, router_loss = model(encoder_input, decoder_input, target)
-                if loss is not None:
-                    losses[valid_iters] = loss.item()
-                    router_losses[valid_iters] = router_loss.item()
-                    valid_iters += 1
-        
-        if valid_iters > 0:
-            mean_loss = losses[:valid_iters].mean()
-            mean_router_loss = router_losses[:valid_iters].mean()
-            if ddp:
-                mean_loss = reduce_metrics(mean_loss, ddp_world_size)
-                mean_router_loss = reduce_metrics(mean_router_loss, ddp_world_size)
-            out[split] = mean_loss
-            out[f'{split}_router'] = mean_router_loss
-            out[f'{split}_ppl'] = calculate_perplexity(mean_loss)
-        else:
-            out[split] = float('inf')
-            out[f'{split}_router'] = float('inf')
-            out[f'{split}_ppl'] = float('inf')
+    
+    # Désactiver temporairement la compilation pour l'évaluation
+    with torch.set_grad_enabled(False):
+        with torch.compiler.disable():  # Nouvelle méthode recommandée
+            for split, dataset in [('train', train_dataset), ('val', val_dataset)]:
+                losses = torch.zeros(eval_iters, device=device)
+                router_losses = torch.zeros(eval_iters, device=device)
+                valid_iters = 0
+                
+                for k in range(eval_iters):
+                    encoder_input, decoder_input, target = next(iter(dataset))
+                    with ctx:
+                        logits, loss, router_loss = model(encoder_input, decoder_input, target)
+                        if loss is not None:
+                            losses[valid_iters] = loss.item()
+                            router_losses[valid_iters] = router_loss.item()
+                            valid_iters += 1
+                
+                if valid_iters > 0:
+                    mean_loss = losses[:valid_iters].mean()
+                    mean_router_loss = router_losses[:valid_iters].mean()
+                    if ddp:
+                        mean_loss = reduce_metrics(mean_loss, ddp_world_size)
+                        mean_router_loss = reduce_metrics(mean_router_loss, ddp_world_size)
+                    out[split] = mean_loss
+                    out[f'{split}_router'] = mean_router_loss
+                    out[f'{split}_ppl'] = calculate_perplexity(mean_loss)
+                else:
+                    out[split] = float('inf')
+                    out[f'{split}_router'] = float('inf')
+                    out[f'{split}_ppl'] = float('inf')
     
     model.train()
     return out
@@ -373,6 +378,13 @@ def pad_sequences(encoder_input, decoder_input, target):
             target = target[:, :decoder_seq_len]
     
     return encoder_input, decoder_input, target
+
+def reset_cuda_cache():
+    """Reset CUDA cache and garbage collection"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+    gc.collect()
 
 # -----------------------------------------------------------------------------
 # Init
@@ -839,6 +851,35 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
+
+    # Nettoyage périodique de la mémoire
+    if iter_num > 0 and iter_num % 100 == 0:
+        reset_cuda_cache()
+        
+    # Monitoring de la mémoire et du temps
+    if iter_num > 0 and iter_num % 10 == 0 and master_process:
+        torch.cuda.synchronize()
+        current_memory = torch.cuda.memory_allocated() / 1e9
+        max_memory = torch.cuda.max_memory_allocated() / 1e9
+        print(f"Memory usage: {current_memory:.2f}GB (max: {max_memory:.2f}GB)")
+        
+        # Calcul du temps moyen par batch sur les dernières itérations
+        if len(tokens_window) >= 2:
+            time_diff = tokens_window[-1][0] - tokens_window[0][0]
+            tokens_sum = sum(tokens for _, tokens in tokens_window)
+            tokens_per_sec = tokens_sum / time_diff
+            print(f"Processing speed: {tokens_per_sec:.2f} tokens/s")
+
+    # Modifier la gestion des streams CUDA
+    if device_type == 'cuda':
+        # Utiliser des streams séparés pour le calcul et les transferts
+        with torch.cuda.stream(copy_stream):
+            encoder_input = encoder_input.to(device, non_blocking=True)
+            decoder_input = decoder_input.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
+        
+        # Synchroniser les streams avant le calcul
+        copy_stream.synchronize()
 
 if ddp:
     destroy_process_group()
