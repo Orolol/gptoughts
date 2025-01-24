@@ -32,6 +32,14 @@ from rich.console import Console
 console = Console()
 
 import torch._inductor.config
+import torch._dynamo.config
+
+# Configuration pour plus de stabilité
+torch._dynamo.config.suppress_errors = True
+torch._dynamo.config.cache_size_limit = 4096
+torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
+torch._inductor.config.debug = False
+torch._inductor.config.optimize_kernels = True
 
 # -----------------------------------------------------------------------------
 # Parse command line arguments
@@ -546,7 +554,7 @@ if compile:
     print("Compiling model...")
     model.set_gradient_checkpointing(False)
     try:
-        model = torch.compile(model, mode="max-autotune")
+        model = torch.compile(model, mode="reduce-overhead")
     except Exception as e:
         print(f"Compilation failed: {e}")
         compile = False
