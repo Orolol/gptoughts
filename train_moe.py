@@ -599,7 +599,6 @@ if compile:
                 "triton.cudagraphs": False,  # Désactivé pour plus de stabilité
                 "trace.enabled": True,
                 "trace.graph_diagram": False,
-                "max_block_size": 256,
                 "profile_bandwidth": True,
             }
         )
