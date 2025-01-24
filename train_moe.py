@@ -352,8 +352,10 @@ def cleanup_memory():
         
         # Clear autograd graph
         torch.cuda.synchronize()
+        
+        # Get memory stats for debugging
         if hasattr(torch.cuda, 'memory_stats'):
-            torch.cuda.memory_stats(reset=True)
+            torch.cuda.memory_stats()
         
         # Optional: clear CUDA graph cache
         if hasattr(torch.cuda, '_graph_pool_handle'):
@@ -784,6 +786,8 @@ while True:
                 
                 # Forward pass
                 logits, loss, router_loss = model(encoder_input, decoder_input, target)
+                batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
+                total_tokens += batch_tokens
                 del logits  # Libérer immédiatement
                 
                 if loss is not None:
@@ -834,6 +838,8 @@ while True:
             current_tokens_per_sec = window_tokens / window_time if window_time > 0 else 0
         else:
             current_tokens_per_sec = 0
+        
+        
         
         # Calculer le temps total d'entraînement
         total_time = time.time() - train_start_time
