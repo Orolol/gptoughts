@@ -22,7 +22,7 @@ from torch.serialization import add_safe_globals
 
 from transformers import AutoTokenizer
 from model import GPTConfig
-from moe import MoEEncoderDecoderGPT
+from moe import MoEEncoderDecoderGPT, timing_stats
 from data.openwebtext.data_loader import StreamingDataset
 from run_train import get_datasets
 
@@ -671,6 +671,9 @@ print_memory_stats("Initial")
 
 # training loop
 while True:
+    # Reset timing stats au début de chaque itération
+    timing_stats.reset()
+    
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
@@ -798,9 +801,12 @@ while True:
                     router_loss = router_loss / gradient_accumulation_steps
                     combined_loss = loss + router_aux_loss_coef * router_loss
                     
-                    # Backward pass
+                    # Mesurer le temps du backward
+                    backward_start = time.time()
                     scaled_loss = scaler.scale(combined_loss)
                     scaled_loss.backward()
+                    backward_end = time.time()
+                    timing_stats.backward_time += backward_end - backward_start
                     
                     # Stocker les scalaires et libérer les tenseurs
                     total_loss += loss.item()
@@ -828,6 +834,7 @@ while True:
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
+    timing_stats.total_time = dt
     t0 = t1
     
     if iter_num % log_interval == 0:
@@ -852,8 +859,9 @@ while True:
             mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
 
-        print(f"iter {iter_num}: loss {lossf:.4f}, router_loss {router_lossf:.4f}, " 
-              f"time {dt*1000:.2f}ms, lr {lr:.2e}, "
+        # Ajouter les stats de timing au log
+        print(f"iter {iter_num}: loss {lossf:.4f}, router_loss {router_lossf:.4f}, "
+              f"time {dt*1000:.2f}ms {timing_stats}, lr {lr:.2e}, "
               f"tt {total_tokens:,}, "
               f"t/s {current_tokens_per_sec:.2f}, "
               f"avgt/s {avg_tokens_per_sec:.2f}")

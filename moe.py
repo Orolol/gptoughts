@@ -9,6 +9,27 @@ from typing import Optional
 import inspect
 import gc
 import time
+
+class TimingStats:
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        self.router_time = 0.0
+        self.expert_time = 0.0
+        self.attention_time = 0.0
+        self.backward_time = 0.0
+        self.total_time = 0.0
+    
+    def __str__(self):
+        return (f"[R: {self.router_time*1000:.1f}ms "
+                f"E: {self.expert_time*1000:.1f}ms "
+                f"A: {self.attention_time*1000:.1f}ms "
+                f"B: {self.backward_time*1000:.1f}ms]")
+
+# Variable globale pour stocker les stats
+timing_stats = TimingStats()
+
 class Router(nn.Module):
     """
     Router module that determines which expert should process each token.
@@ -64,6 +85,7 @@ class Router(nn.Module):
         self.training_mode = True
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        start_time = time.time()
         batch_size, seq_len, _ = x.shape
         combined_batch_size = batch_size * seq_len
         
@@ -77,9 +99,6 @@ class Router(nn.Module):
         # Réinitialiser les buffers
         self._dispatch_buffer.zero_()
         self._zeros_buffer.zero_()
-        
-        # Time the forward pass
-        start_time = time.time()
         
         # Compute router logits avec normalisation et clipping
         x_reshaped = x.view(combined_batch_size, -1)
@@ -166,9 +185,8 @@ class Router(nn.Module):
         else:
             router_loss = torch.tensor(0.0, device=x.device)
         
-        # Time the forward pass
         end_time = time.time()
-        print(f"Forward pass time: {end_time - start_time:.4f} seconds")
+        timing_stats.router_time += end_time - start_time
         
         return routing_weights.detach(), normalized_dispatch_mask, router_loss
 
@@ -204,6 +222,7 @@ class SharedExpertMLP(nn.Module):
         self._init_weights()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        start_time = time.time()
         B, S, D = x.shape
         
         # Main computation with shared weights
@@ -230,6 +249,9 @@ class SharedExpertMLP(nn.Module):
         
         # Combine main path with adaptation
         hidden = hidden + adapt
+        
+        end_time = time.time()
+        timing_stats.expert_time += end_time - start_time
         
         return self.dropout(self.shared_down(hidden))
 
@@ -454,8 +476,12 @@ class MoEBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, key_value: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
         # Attention
+        start_time = time.time()
         attn_output = self.attn(self.ln_1(x), key_value=key_value)
         x = x + attn_output
+        
+        end_time = time.time()
+        timing_stats.attention_time += end_time - start_time
         
         # MoE
         if self.use_checkpoint and self.training:
@@ -637,10 +663,7 @@ class MoEEncoderDecoderGPT(nn.Module):
         """
         Generate text using the MoE model.
         """
-        # Ensure input has correct shape
-        
-        print(idx)
-        
+        # Ensure input has correct shape and is on the correct device
         if idx.dim() == 1:
             idx = idx.unsqueeze(0)
         
@@ -648,8 +671,6 @@ class MoEEncoderDecoderGPT(nn.Module):
         encoder_pos = torch.arange(0, idx.size(1), device=idx.device)
         encoder_emb = self.shared_embedding(idx)
         encoder_pos_emb = self.shared_pos_embedding(encoder_pos)
-        
-        # Adjust dimensions for broadcasting
         encoder_pos_emb = encoder_pos_emb.unsqueeze(0).expand(idx.size(0), -1, -1)
         
         x = self.encoder.drop(encoder_emb + encoder_pos_emb)
@@ -657,26 +678,16 @@ class MoEEncoderDecoderGPT(nn.Module):
         # Encoder forward pass
         for block in self.encoder.h:
             x, _ = block(x)
-            
         encoder_output = self.encoder.ln_f(x)
         
-        # Create prompt-aware initial state for decoder
-        prompt_summary = torch.mean(encoder_output, dim=1, keepdim=True)  # [B, 1, C]
-        
-        # Initialize decoder input with BOS token + prompt
+        # Initialize decoder input with BOS token
         bos_token = torch.full(
             (idx.size(0), 1),
             self.shared_embedding.weight.size(0)-2,  # BOS token
             dtype=torch.long,
             device=idx.device
         )
-        # Feed the entire prompt to decoder 
-        decoder_idx = torch.cat([bos_token, idx], dim=1)
-        
-        # Track generated tokens for repetition detection
-        last_tokens = []
-        repetition_penalty = 1.5  # Increased from 1.2
-        min_tokens_before_repetition = 5  # Increased from 3
+        decoder_idx = bos_token
         
         # Generate tokens autoregressively
         for _ in range(max_new_tokens):
@@ -688,30 +699,19 @@ class MoEEncoderDecoderGPT(nn.Module):
             decoder_pos = torch.arange(0, decoder_idx.size(1), device=decoder_idx.device)
             decoder_emb = self.shared_embedding(decoder_idx)
             decoder_pos_emb = self.shared_pos_embedding(decoder_pos)
-            
-            # Add prompt context to decoder embeddings
-            decoder_emb = decoder_emb + 0.3 * prompt_summary.expand(-1, decoder_emb.size(1), -1)
-            
-            # Adjust dimensions for broadcasting
             decoder_pos_emb = decoder_pos_emb.unsqueeze(0).expand(decoder_idx.size(0), -1, -1)
             
-            # Process decoder input
             decoder_x = self.decoder.drop(decoder_emb + decoder_pos_emb)
             
-            # Decoder layers with cross-attention
+            # Decoder layers
             for i, (block, cross_attn) in enumerate(zip(self.decoder.h, self.cross_attention)):
                 # Self-attention
                 attn_output = block.attn(block.ln_1(decoder_x))
                 decoder_x = decoder_x + attn_output
                 
-                # Cross-attention with encoder output
+                # Cross-attention
                 cross_x = self.cross_ln[i](decoder_x)
-                # Explicitly use encoder output in cross-attention
-                cross_output = cross_attn(
-                    cross_x, 
-                    key_value=encoder_output,
-                    is_generation=True
-                )
+                cross_output = cross_attn(cross_x, key_value=encoder_output)
                 decoder_x = decoder_x + cross_output
                 
                 # MoE layer
@@ -723,39 +723,37 @@ class MoEEncoderDecoderGPT(nn.Module):
             
             # Get logits for next token
             logits = self.lm_head(decoder_x[:, -1:])
-            logits = logits.reshape(decoder_x.size(0), -1)  # Use reshape instead of squeeze
+            logits = logits.float().squeeze(1)  # Ensure float32 precision
             
-            # Apply repetition penalty
-            if len(last_tokens) >= min_tokens_before_repetition:
-                for token in set(last_tokens[-min_tokens_before_repetition:]):
-                    logits[:, token] = logits[:, token] / repetition_penalty
+            # Apply temperature
+            if temperature == 0.0:
+                # Greedy decoding
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            else:
+                # Apply temperature and top-k sampling
+                logits = logits / temperature
+                
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = float('-inf')
+                
+                # Ensure valid probabilities
+                probs = F.softmax(logits, dim=-1)
+                probs = probs.clamp(min=1e-5)  # Prevent zeros
+                probs = probs / probs.sum(dim=-1, keepdim=True)  # Renormalize
+                
+                try:
+                    next_token = torch.multinomial(probs, num_samples=1)
+                except RuntimeError:
+                    print("Warning: Sampling failed, falling back to argmax")
+                    next_token = torch.argmax(logits, dim=-1, keepdim=True)
             
-            # Apply temperature and top-k sampling
-            logits = logits / (temperature + 1e-5)  # Add small epsilon for stability
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float('-inf')
-            
-            # Add length penalty to discourage very short sequences
-            if decoder_idx.size(1) < 10:  # Minimum desired length
-                length_penalty = torch.ones_like(logits) * -0.5
-                logits = logits + length_penalty
-            
-            # Sample next token
-            probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
-            
-            # Update last tokens
-            last_tokens.append(next_token.item())
-            if len(last_tokens) > min_tokens_before_repetition * 2:
-                last_tokens.pop(0)
+            # Append to sequence
+            decoder_idx = torch.cat((decoder_idx, next_token), dim=1)
             
             # Stop if we generate an EOS token
             if (next_token == self.shared_embedding.weight.size(0)-1).any():
                 break
-            
-            # Append to sequence
-            decoder_idx = torch.cat((decoder_idx, next_token), dim=1)
         
         return decoder_idx
 
