@@ -39,7 +39,6 @@ torch._dynamo.config.suppress_errors = True
 torch._dynamo.config.cache_size_limit = 4096
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
 torch._inductor.config.debug = False
-torch._inductor.config.optimize_kernels = True
 
 # -----------------------------------------------------------------------------
 # Parse command line arguments
@@ -554,9 +553,20 @@ if compile:
     print("Compiling model...")
     model.set_gradient_checkpointing(False)
     try:
-        model = torch.compile(model, mode="reduce-overhead")
+        model = torch.compile(
+            model,
+            mode="reduce-overhead",
+            options={
+                "max_autotune": True,
+                "epilogue_fusion": True,
+                "trace.enabled": True,
+                "trace.graph_diagram": False,
+                "triton.cudagraphs": True,
+            }
+        )
     except Exception as e:
         print(f"Compilation failed: {e}")
+        print(traceback.format_exc())
         compile = False
         model.set_gradient_checkpointing(True)
 
