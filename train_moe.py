@@ -76,7 +76,7 @@ data_dir = 'data/openwebtext'
 gradient_accumulation_steps = 1
 dropout = 0.0
 bias = False
-attention_backend = "sdpa" # "sdpa"
+attention_backend = "flash_attn_2" if ATTENTION_BACKENDS.get('flash_attn_2', False) else "xformers" if ATTENTION_BACKENDS.get('xformers', False) else "sdpa"  # Utiliser le meilleur backend disponible
 
 # Configure CUDA Graph behavior
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
@@ -602,10 +602,15 @@ if compile:
                 "trace.graph_diagram": False,
                 "triton.autotune_pointwise": True,
                 "triton.unique_kernel_names": True,
-                "triton.persistent_reductions": True,  # Optimisation des réductions
-                "max_parallel_block_count": 50,  # Augmenter le parallélisme
-                "triton.cudagraphs": True,
-            }
+                "triton.persistent_reductions": True,
+                "triton.divisible_by_16": True,  # Optimisation pour les tailles de tenseurs
+                "triton.use_block_ptr": True,  # Utilisation des pointeurs de bloc pour plus de performance
+                "max_autotune_gemm": True,  # Optimisation des opérations GEMM
+                "aggressive_fusion": True,  # Fusion agressive des opérations
+                "coordinate_descent_tuning": True,  # Optimisation par descente de coordonnées
+                "layout_optimization": True,  # Optimisation des layouts mémoire
+            },
+            fullgraph=True  # Activer la compilation du graphe complet
         )
     except Exception as e:
         print(f"Compilation failed: {e}")
