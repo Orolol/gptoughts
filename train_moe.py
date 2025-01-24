@@ -13,6 +13,8 @@ import argparse
 from queue import Queue
 from contextlib import nullcontext
 import random
+import logging
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -34,11 +36,17 @@ console = Console()
 import torch._inductor.config
 import torch._dynamo.config
 
+# Supprimer les warnings de torch inductor
+logging.getLogger("torch._inductor.debug").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", category=UserWarning)
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/tmp/torch_inductor_cache"  # Éviter d'écrire dans le workspace
+
 # Configuration optimisée pour les modèles avec dimensions dynamiques
 torch._dynamo.config.suppress_errors = True
-torch._dynamo.config.cache_size_limit = 16384  # Augmenté pour gérer plus de cas
-torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = False  # Permettre les graphes dynamiques
-torch._inductor.config.debug = False
+torch._dynamo.config.cache_size_limit = 16384
+torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = False
+torch._inductor.config.debug = False  # Désactiver le debug
+torch._inductor.config.trace.enabled = False  # Désactiver le tracing
 
 # -----------------------------------------------------------------------------
 # Parse command line arguments
@@ -589,14 +597,14 @@ if compile:
     try:
         model = torch.compile(
             model,
-            # mode="reduce-overhead",
             options={
                 "max_autotune": True,
                 "epilogue_fusion": True,
-                "triton.cudagraphs": False,  # Désactivé pour plus de stabilité
-                "trace.enabled": True,
+                "triton.cudagraphs": False,
+                "trace.enabled": False,  # Désactiver le tracing
                 "trace.graph_diagram": False,
-                "triton.cudagraphs": True,
+                "debug": False,  # Désactiver le debug
+                "verbose": False  # Désactiver les messages verbeux
             }
         )
     except Exception as e:
