@@ -8,7 +8,7 @@ from model import CausalSelfAttention
 from typing import Optional
 import inspect
 import gc
-
+import time
 class Router(nn.Module):
     """
     Router module that determines which expert should process each token.
@@ -34,23 +34,26 @@ class Router(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, mean=0.0, std=0.02)
         
-        # Pre-register buffers with fixed size
-        max_batch_size = 32  # Adjust this based on your needs
-        max_seq_len = 256
+        # Augmenter les tailles max pour les buffers
+        max_batch_size = 64  # Augmenté de 32 à 64
+        max_seq_len = 512    # Augmenté de 256 à 512
+        max_tokens = max_batch_size * max_seq_len
+        
+        # Pre-register buffers with larger sizes
         self.register_buffer('_indices_buffer', 
-            torch.arange(max_batch_size * max_seq_len).unsqueeze(1).expand(-1, self.k),
+            torch.arange(max_tokens).unsqueeze(1).expand(-1, self.k),
             persistent=False)
         self.register_buffer('_zeros_buffer', 
             torch.zeros((self.num_experts,)),
             persistent=False)
         self.register_buffer('_dispatch_buffer', 
-            torch.zeros((max_batch_size * max_seq_len, self.num_experts)),
+            torch.zeros((max_tokens, self.num_experts)),
             persistent=False)
         self.register_buffer('_ones_buffer',
-            torch.ones((max_batch_size * max_seq_len,), dtype=torch.float32),
+            torch.ones((max_tokens,), dtype=torch.float32),
             persistent=False)
         
-        # Température fixe (pas de Parameter)
+        # Température fixe
         self.register_buffer('temperature', torch.ones(1) * 0.07)
         
         # Scaling factors pour les pertes
@@ -60,6 +63,20 @@ class Router(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
         combined_batch_size = batch_size * seq_len
+        
+        # Vérifier et redimensionner les buffers si nécessaire
+        if combined_batch_size > self._indices_buffer.size(0):
+            device = x.device
+            self._indices_buffer = torch.arange(combined_batch_size, device=device).unsqueeze(1).expand(-1, self.k)
+            self._dispatch_buffer = torch.zeros((combined_batch_size, self.num_experts), device=device)
+            self._ones_buffer = torch.ones((combined_batch_size,), dtype=torch.float32, device=device)
+        
+        # Réinitialiser les buffers
+        self._dispatch_buffer.zero_()
+        self._zeros_buffer.zero_()
+        
+        # Time the forward pass
+        start_time = time.time()
         
         # Compute router logits avec normalisation
         x_reshaped = x.view(combined_batch_size, -1)
@@ -77,24 +94,28 @@ class Router(nn.Module):
         top_k_weights_sum = top_k_weights.sum(dim=-1, keepdim=True)
         top_k_weights = top_k_weights / top_k_weights_sum.clamp(min=1e-12)
         
+        # Utiliser seulement la partie nécessaire des buffers
+        indices = self._indices_buffer[:combined_batch_size]
+        dispatch_mask = self._dispatch_buffer[:combined_batch_size]
+        ones = self._ones_buffer[:combined_batch_size]
+        
         # Create routing tensor
         for k_idx in range(self.k):
             expert_idx = top_k_indices[:, k_idx]
             mask = self._zeros_buffer[expert_idx] < self.capacity_factor * combined_batch_size * self.k / self.num_experts
-            self._zeros_buffer = self._zeros_buffer.clone()  # Clone before in-place op
-            self._zeros_buffer.scatter_add_(0, expert_idx[mask], self._ones_buffer[mask])
-            self._dispatch_buffer[self._indices_buffer[mask, k_idx], expert_idx[mask]] = top_k_weights[mask, k_idx]
+            self._zeros_buffer.scatter_add_(0, expert_idx[mask], ones[mask])
+            dispatch_mask[indices[mask, k_idx], expert_idx[mask]] = top_k_weights[mask, k_idx]
         
         # Handle unrouted tokens
-        unrouted = self._dispatch_buffer.sum(dim=-1) == 0
+        unrouted = dispatch_mask.sum(dim=-1) == 0
         if torch.any(unrouted):
             least_loaded = (self.capacity_factor * combined_batch_size * self.k / self.num_experts - self._zeros_buffer).argmax()
-            self._dispatch_buffer = self._dispatch_buffer.clone()  # Clone before modification
-            self._dispatch_buffer[unrouted, least_loaded] = 1.0
+            dispatch_mask = dispatch_mask.clone()  # Clone before modification
+            dispatch_mask[unrouted, least_loaded] = 1.0
         
         # Normalize dispatch mask
-        dispatch_mask_sum = self._dispatch_buffer.sum(dim=-1, keepdim=True)
-        normalized_dispatch_mask = self._dispatch_buffer / (dispatch_mask_sum + 1e-8)
+        dispatch_mask_sum = dispatch_mask.sum(dim=-1, keepdim=True)
+        normalized_dispatch_mask = dispatch_mask / (dispatch_mask_sum + 1e-8)
         
         # Pertes auxiliaires recalibrées
         # Z-loss sur les logits normalisés
@@ -118,6 +139,10 @@ class Router(nn.Module):
             self.router_z_loss_coef * router_z_loss +
             self.load_balance_coef * load_balance_loss
         )
+        
+        # Time the forward pass
+        end_time = time.time()
+        print(f"Forward pass time: {end_time - start_time:.4f} seconds")
         
         return routing_weights.detach(), normalized_dispatch_mask, router_loss
 
