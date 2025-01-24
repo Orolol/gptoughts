@@ -59,7 +59,7 @@ log_interval = 1
 eval_iters = 100
 eval_only = False
 always_save_checkpoint = True
-init_from = 'resume'  # 'scratch' or 'resume'
+init_from = 'scratch'  # 'scratch' or 'resume'
 
 # wandb logging
 wandb_log = False
@@ -105,13 +105,13 @@ if torch.cuda.is_available():
     
     elif args.size == "medium":
         # Increase batch size and reduce gradient accumulation steps
-        batch_size = 16  
+        batch_size = 20  
         block_size = 256
         
         num_experts = 32
         expert_k = 4
     
-        gradient_accumulation_steps = 2
+        gradient_accumulation_steps = 8
 
         # Encoder config
         encoder_n_layer = 8
@@ -163,6 +163,9 @@ if torch.cuda.is_available():
     
     # Additional CUDA optimizations
     torch.backends.cudnn.enabled = True
+    
+    # Désactiver le cache JIT qui peut croître au fil du temps
+    torch.jit.set_fusion_strategy([('DYNAMIC', 3)])
     
     print(f"Using device: {device}")
     print(f"Batch size: {batch_size}")
@@ -333,11 +336,28 @@ def cleanup_old_checkpoints(out_dir, keep_num=2):
             print(f"Error removing checkpoint {ckpt}: {e}")
 
 def cleanup_memory():
-    """Cleans up GPU memory"""
-    if device_type == 'cuda':
+    """Clean up memory more aggressively"""
+    if torch.cuda.is_available():
+        # Synchronize all streams
+        torch.cuda.synchronize()
+        
+        # Clear cache
         torch.cuda.empty_cache()
-        if gc.isenabled():
-            gc.collect()
+        
+        # Reset peak memory stats
+        torch.cuda.reset_peak_memory_stats()
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Clear autograd graph
+        torch.cuda.synchronize()
+        if hasattr(torch.cuda, 'memory_stats'):
+            torch.cuda.memory_stats(reset=True)
+        
+        # Optional: clear CUDA graph cache
+        if hasattr(torch.cuda, '_graph_pool_handle'):
+            torch.cuda._graph_pool_handle.clear()
 
 def ensure_model_dtype(model, dtype):
     """Ensures model is in the correct dtype"""
@@ -346,12 +366,16 @@ def ensure_model_dtype(model, dtype):
     return model
 
 def print_memory_stats(prefix=""):
-    """Prints GPU memory statistics"""
-    if device_type == 'cuda':
-        print(f"{prefix} Memory stats:")
+    """Prints detailed GPU memory statistics"""
+    if torch.cuda.is_available():
+        print(f"\n{prefix} Memory stats:")
         print(f"Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB")
         print(f"Reserved: {torch.cuda.memory_reserved()/1e9:.2f}GB")
         print(f"Max allocated: {torch.cuda.max_memory_allocated()/1e9:.2f}GB")
+        print(f"Max reserved: {torch.cuda.max_memory_reserved()/1e9:.2f}GB")
+        
+        # Reset peak stats
+        torch.cuda.reset_peak_memory_stats()
 
 def pad_sequences(encoder_input, decoder_input, target):
     """
@@ -746,50 +770,40 @@ while True:
                     micro_step == gradient_accumulation_steps - 1
                 )
             
-            try:
+            # Créer un nouveau contexte pour chaque micro-step
+            with torch.amp.autocast(enabled=True, device_type=device_type):
+                # Libérer la mémoire des tenseurs précédents
+                if 'encoder_input' in locals(): del encoder_input
+                if 'decoder_input' in locals(): del decoder_input
+                if 'target' in locals(): del target
+                
                 encoder_input, decoder_input, target = next(train_iterator)
                 encoder_input, decoder_input, target = pad_sequences(
                     encoder_input, decoder_input, target
                 )
-            except StopIteration:
-                train_iterator = iter(train_dataset)
-                encoder_input, decoder_input, target = next(train_iterator)
-                encoder_input, decoder_input, target = pad_sequences(
-                    encoder_input, decoder_input, target
-                )
+                
+                # Forward pass
+                logits, loss, router_loss = model(encoder_input, decoder_input, target)
+                del logits  # Libérer immédiatement
+                
+                if loss is not None:
+                    loss = loss / gradient_accumulation_steps
+                    router_loss = router_loss / gradient_accumulation_steps
+                    combined_loss = loss + router_aux_loss_coef * router_loss
+                    
+                    # Backward pass
+                    scaled_loss = scaler.scale(combined_loss)
+                    scaled_loss.backward()
+                    
+                    # Stocker les scalaires et libérer les tenseurs
+                    total_loss += loss.item()
+                    total_router_loss += router_loss.item()
+                    del loss, router_loss, combined_loss, scaled_loss
             
-            try:
-                with ctx:
-                    logits, loss, router_loss = model(encoder_input, decoder_input, target)
-                    # Compter les tokens réels (entrée + sortie)
-                    batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
-                    total_tokens += batch_tokens
-                    
-                    # Mettre à jour la fenêtre glissante pour les tokens/s
-                    tokens_window.append((time.time(), batch_tokens))
-                    if len(tokens_window) > window_size:
-                        tokens_window.pop(0)
-                    
-                    if loss is not None:
-                        # Vérifier les NaN avant de continuer
-                        if torch.isnan(loss).any() or torch.isnan(router_loss).any():
-                            print("NaN detected in loss calculation, skipping batch")
-                            skip_optimizer_step = True
-                            break
-                        
-                        loss = loss / gradient_accumulation_steps
-                        router_loss = router_loss / gradient_accumulation_steps
-                        combined_loss = loss + router_aux_loss_coef * router_loss
-                        scaled_loss = scaler.scale(combined_loss)
-                        scaled_loss.backward()
-                        total_loss += loss.item()
-                        total_router_loss += router_loss.item()
-            except RuntimeError as e:
-                print(f"Error during forward/backward pass: {e}")
-                skip_optimizer_step = True
-                break
-
-        if not skip_optimizer_step:
+            # Synchronisation périodique
+            if micro_step % 2 == 0:
+                torch.cuda.synchronize()
+            
             if grad_clip != 0.0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -799,6 +813,7 @@ while True:
 
     except Exception as e:
         print(f"Training iteration failed: {e}")
+        cleanup_memory()
         if ddp:
             dist_barrier()
         continue
@@ -837,13 +852,20 @@ while True:
     iter_num += 1
     local_iter_num += 1
     
-
-    if iter_num % 100 == 0:
+    if iter_num % 50 == 0:  # Monitoring plus fréquent
+        print_memory_stats(f"Iter {iter_num}")
+        cleanup_memory()
+        
+        # Forcer une synchronisation et un nettoyage complet
         if device_type == 'cuda':
             torch.cuda.synchronize()
+            torch.cuda.empty_cache()
             
-        if gc.isenabled():
-            gc.collect()
+            # Réinitialiser les caches de compilation si nécessaire
+            if hasattr(torch, '_dynamo'):
+                torch._dynamo.reset()
+            if hasattr(torch, '_inductor'):
+                torch._inductor.codecache.reset()
 
     # termination conditions
     if iter_num > max_iters:
