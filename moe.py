@@ -93,12 +93,12 @@ class EnhancedRouter(nn.Module):
             # Update expert counts
             expert_counts += counts
             
-            # Create mask for assignment
-            assign_mask = torch.zeros(combined_batch_size, device=device, dtype=torch.bool)
-            assign_mask[torch.arange(combined_batch_size)[can_assign]] = True
+            # Create indices tensor on the correct device
+            indices = torch.arange(combined_batch_size, device=device)
+            valid_indices = indices[can_assign]
             
             # Assign tokens that fit within capacity
-            dispatch_mask[assign_mask, expert_idx[can_assign]] = weight[can_assign]
+            dispatch_mask[valid_indices, expert_idx[can_assign]] = weight[can_assign]
         
         # Normalize dispatch mask
         dispatch_mask_sum = dispatch_mask.sum(dim=-1, keepdim=True)
