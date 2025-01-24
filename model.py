@@ -270,6 +270,11 @@ class CausalSelfAttention(nn.Module):
         Wrapper pour Flash Attention 2 avec optimisations
         """
         try:
+            # Convert inputs to bfloat16
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+            v = v.to(torch.bfloat16)
+            
             # Utiliser la mise en cache des KV pour la génération
             if hasattr(self, '_cached_k') and hasattr(self, '_cached_v'):
                 k = torch.cat([self._cached_k, k], dim=2)  # dim=2 car Flash Attention utilise [B, H, T, D]
@@ -288,6 +293,7 @@ class CausalSelfAttention(nn.Module):
             
         except Exception as e:
             print(f"Flash Attention 2 failed: {e}")
+            print(f"Input dtypes - q: {q.dtype}, k: {k.dtype}, v: {v.dtype}")
             return None
 
     def _sdpa_attention(self, q, k, v, mask=None, is_causal=True):
