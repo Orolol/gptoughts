@@ -54,7 +54,7 @@ args = parser.parse_args()
 
 # I/O
 out_dir = 'out_moe'
-eval_interval = 10
+eval_interval = 1000
 log_interval = 1
 eval_iters = 100
 eval_only = False
