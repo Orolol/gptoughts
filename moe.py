@@ -153,7 +153,7 @@ class SharedExpertMLP(nn.Module):
         adapt_weights = F.silu(adapt_weights)
         
         # Apply adaptation avec gradient scaling
-        with torch.amp.autocast(enabled=False):
+        with torch.amp.autocast(enabled=False, device_type='cuda'):
             adapt = torch.bmm(adapt_weights.float(), adapt_in.float())
         adapt = self.adapt_proj(adapt.to(x.dtype))
         
