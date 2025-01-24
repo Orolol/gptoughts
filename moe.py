@@ -42,18 +42,20 @@ class Router(nn.Module):
         self.k = k
         self.capacity_factor = capacity_factor
         
-        # Router projection avec normalisation
+        # Simplifier l'architecture du router
         self.router = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 2, bias=False),
-            nn.LayerNorm(input_dim // 2),
-            nn.ReLU(),
-            nn.Linear(input_dim // 2, num_experts, bias=False)
+            nn.Linear(input_dim, input_dim // 4, bias=False),
+            nn.LayerNorm(input_dim // 4),
+            nn.GELU(),  # GELU au lieu de ReLU
+            nn.Linear(input_dim // 4, num_experts, bias=True)  # Ajouter bias
         )
         
-        # Meilleure initialisation
+        # Initialisation plus agressive
         for m in self.router.modules():
             if isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                nn.init.normal_(m.weight, mean=0.0, std=0.1)  # Augmenter std
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
         
         # Augmenter les tailles max pour les buffers
         max_batch_size = 64  # Augmenté de 32 à 64
@@ -74,12 +76,12 @@ class Router(nn.Module):
             torch.ones((max_tokens,), dtype=torch.float32),
             persistent=False)
         
-        # Scaling factors pour les pertes (réduits pour plus de stabilité)
-        self.router_z_loss_coef = 0.0001  # Réduit de 0.001
-        self.load_balance_coef = 0.0001   # Réduit de 0.001
+        # Ajuster les coefficients de perte
+        self.router_z_loss_coef = 0.01  # Augmenté de 0.0001
+        self.load_balance_coef = 0.01   # Augmenté de 0.0001
         
-        # Température plus élevée pour un softmax plus doux
-        self.register_buffer('temperature', torch.ones(1) * 0.1)  # Augmenté de 0.07 à 0.1
+        # Température plus basse pour des décisions plus nettes
+        self.register_buffer('temperature', torch.ones(1) * 0.05)  # Réduit de 0.1
         
         # Flag pour le mode d'entraînement
         self.training_mode = True
@@ -100,25 +102,22 @@ class Router(nn.Module):
         self._dispatch_buffer.zero_()
         self._zeros_buffer.zero_()
         
-        # Compute router logits avec normalisation et clipping
+        # Compute router logits avec normalisation plus agressive
         x_reshaped = x.view(combined_batch_size, -1)
         router_logits = self.router(x_reshaped)
         
-        # Clipper les logits avant normalisation
-        router_logits = torch.clamp(router_logits, min=-50.0, max=50.0)
+        # Normalisation plus agressive des logits
+        router_logits = router_logits / (router_logits.norm(dim=-1, keepdim=True).clamp(min=1e-8) + 1e-8)
         
-        # Normaliser les logits avec epsilon plus grand
-        router_logits = router_logits / (router_logits.norm(dim=-1, keepdim=True).clamp(min=1e-6) + 1e-6)
-        
-        # Softmax avec température
+        # Softmax avec température plus basse
         routing_weights = F.softmax(router_logits / self.temperature, dim=-1)
         
-        # Top-k avec clipping plus conservateur
+        # Top-k avec clipping plus agressif
         with torch.no_grad():
             top_k_weights, top_k_indices = torch.topk(routing_weights, self.k, dim=-1)
-            top_k_weights = torch.clamp(top_k_weights, min=1e-3, max=0.8)  # Bornes plus conservatrices
+            top_k_weights = torch.clamp(top_k_weights, min=1e-6, max=0.95)  # Augmenter max
             top_k_weights_sum = top_k_weights.sum(dim=-1, keepdim=True)
-            top_k_weights = top_k_weights / (top_k_weights_sum.clamp(min=1e-6) + 1e-6)
+            top_k_weights = top_k_weights / top_k_weights_sum.clamp(min=1e-8)
         
         # Utiliser seulement la partie nécessaire des buffers
         indices = self._indices_buffer[:combined_batch_size]
@@ -144,36 +143,20 @@ class Router(nn.Module):
             normalized_dispatch_mask = dispatch_mask / (dispatch_mask_sum.clamp(min=1e-12))
         
         if self.training:
-            # Z-loss avec meilleure stabilité numérique
+            # Z-loss modifiée pour encourager des décisions plus nettes
             log_probs = F.log_softmax(router_logits, dim=-1)
-            log_probs = torch.clamp(log_probs, min=-50.0, max=50.0)
-            router_z_loss = torch.mean(torch.square(log_probs))
+            router_z_loss = -torch.mean(torch.max(log_probs, dim=-1)[0])
             
-            # Load balancing avec epsilon et clipping
+            # Load balancing avec pénalité plus forte
             expert_usage = normalized_dispatch_mask.sum(0)
-            total_usage = expert_usage.sum().clamp(min=1e-6)
-            expert_usage = expert_usage / (total_usage + 1e-6)
+            total_usage = expert_usage.sum().clamp(min=1e-8)
+            expert_usage = expert_usage / (total_usage + 1e-8)
             
-            # Éviter les valeurs extrêmes dans l'usage des experts
-            expert_usage = torch.clamp(expert_usage, min=1e-6, max=1.0)
-            
-            # Distribution cible avec epsilon
+            # Pénaliser plus fortement les experts sous-utilisés et sur-utilisés
             target_usage = torch.ones_like(expert_usage) / self.num_experts
-            target_usage = target_usage.clamp(min=1e-6)
+            load_balance_loss = torch.mean(torch.square(expert_usage - target_usage)) * self.num_experts
             
-            # KL div avec epsilon
-            load_balance_loss = F.kl_div(
-                torch.log(expert_usage + 1e-6),
-                target_usage,
-                reduction='batchmean',
-                log_target=False
-            )
-            
-            # Clipper les pertes avant de les combiner
-            router_z_loss = torch.clamp(router_z_loss, max=100.0)
-            load_balance_loss = torch.clamp(load_balance_loss, max=100.0)
-            
-            # Combiner les pertes avec des coefficients plus petits
+            # Combiner les pertes avec des coefficients plus élevés
             router_loss = (
                 self.router_z_loss_coef * router_z_loss +
                 self.load_balance_coef * load_balance_loss
@@ -850,7 +833,7 @@ class MoEEncoderDecoderGPT(nn.Module):
             {
                 'params': router_params,
                 'weight_decay': 0.0,  # No weight decay for router
-                'lr': learning_rate * 0.1  # Lower learning rate for stability
+                'lr': learning_rate 
             },
             # Other parameters
             {
