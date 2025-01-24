@@ -26,39 +26,59 @@ class Router(nn.Module):
         with torch.no_grad():
             nn.init.normal_(self.router.weight, mean=0.0, std=0.001)
 
-        # Pre-register buffers with fixed size and pin memory for faster transfer
-        self.register_buffer('_indices_buffer', torch.empty(0), persistent=False)
-        self.register_buffer('_zeros_buffer', torch.empty(0), persistent=False)
-        self.register_buffer('_dispatch_buffer', torch.empty(0), persistent=False)
-        self.register_buffer('_ones_buffer', torch.empty(0), persistent=False)
+        # Pre-register buffers with maximum expected size
+        max_batch = 32
+        max_seq = 512
+        max_size = max_batch * max_seq
+        
+        self.register_buffer(
+            '_indices_buffer',
+            torch.arange(max_size).unsqueeze(1).expand(-1, self.k),
+            persistent=False
+        )
+        self.register_buffer(
+            '_zeros_buffer',
+            torch.zeros((self.num_experts,)),
+            persistent=False
+        )
+        self.register_buffer(
+            '_dispatch_buffer',
+            torch.zeros((max_size, self.num_experts)),
+            persistent=False
+        )
+        self.register_buffer(
+            '_ones_buffer',
+            torch.ones((max_size,), dtype=torch.float32),
+            persistent=False
+        )
+        
+        # For CUDA Graph compatibility
+        self._max_size = max_size
+        self._current_size = 0
 
-    def _ensure_buffer_size(self, batch_size, seq_len):
-        """Ensure buffers are correctly sized"""
-        combined_size = batch_size * seq_len
-        device = self.router.weight.device
-
-        if self._indices_buffer.numel() < combined_size * self.k:
-            self._indices_buffer = torch.arange(combined_size, device=device).unsqueeze(1).expand(-1, self.k)
-        if self._zeros_buffer.numel() < self.num_experts:
-            self._zeros_buffer = torch.zeros((self.num_experts,), device=device)
-        if self._dispatch_buffer.numel() < combined_size * self.num_experts:
-            self._dispatch_buffer = torch.zeros((combined_size, self.num_experts), device=device)
-        if self._ones_buffer.numel() < combined_size:
-            self._ones_buffer = torch.ones((combined_size,), dtype=torch.float32, device=device)
+    def _get_buffer_slice(self, size: int, buffer: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        """Safely get a slice of a buffer"""
+        if size > self._max_size:
+            raise ValueError(f"Requested size {size} exceeds maximum buffer size {self._max_size}")
+        return buffer.narrow(dim, 0, size).clone()
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
         combined_batch_size = batch_size * seq_len
         device = x.device
         
-        # Ensure buffers are correctly sized
-        self._ensure_buffer_size(batch_size, seq_len)
+        # Move buffers to correct device if needed
+        if self._indices_buffer.device != device:
+            self._indices_buffer = self._indices_buffer.to(device)
+            self._zeros_buffer = self._zeros_buffer.to(device)
+            self._dispatch_buffer = self._dispatch_buffer.to(device)
+            self._ones_buffer = self._ones_buffer.to(device)
         
         # Get buffer slices
-        indices = self._indices_buffer[:combined_batch_size]
-        dispatch_mask = self._dispatch_buffer[:combined_batch_size]
+        indices = self._get_buffer_slice(combined_batch_size, self._indices_buffer)
+        dispatch_mask = self._get_buffer_slice(combined_batch_size, self._dispatch_buffer)
         expert_counts = self._zeros_buffer.clone()
-        ones = self._ones_buffer[:combined_batch_size]
+        ones = self._get_buffer_slice(combined_batch_size, self._ones_buffer)
         
         # Clear dispatch mask
         dispatch_mask.zero_()
@@ -108,9 +128,10 @@ class Router(nn.Module):
         router_loss = (0.001 * router_z_loss.detach() + 
                       0.001 * load_balance_loss.detach())
         
-        # Clean up any remaining references
-        del router_logits, top_k_weights, top_k_indices
-        torch.cuda.empty_cache()
+        # Mark CUDA graph step boundary
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch._dynamo.graph.mark_step_begin()
         
         return routing_weights.detach(), normalized_dispatch_mask, router_loss
 
