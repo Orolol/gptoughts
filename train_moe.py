@@ -861,9 +861,9 @@ while True:
     iter_num += 1
     local_iter_num += 1
     
-    if iter_num % 50 == 0:  # Monitoring plus fréquent
-        print_memory_stats(f"Iter {iter_num}")
-        cleanup_memory()
+    # if iter_num % 50 == 0:  # Monitoring plus fréquent
+    #     print_memory_stats(f"Iter {iter_num}")
+    #     cleanup_memory()
 
     # termination conditions
     if iter_num > max_iters:
