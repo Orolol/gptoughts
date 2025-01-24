@@ -72,7 +72,7 @@ data_dir = 'data/openwebtext'
 gradient_accumulation_steps = 1
 dropout = 0.0
 bias = False
-attention_backend = "xformers" # "sdpa"
+attention_backend = "sdpa" # "sdpa"
 
 # Configure CUDA Graph behavior
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
@@ -855,8 +855,8 @@ while True:
         print(f"iter {iter_num}: loss {lossf:.4f}, router_loss {router_lossf:.4f}, " 
               f"time {dt*1000:.2f}ms, lr {lr:.2e}, "
               f"tt {total_tokens:,}, "
-              f"t/s {current_tokens_per_sec:.2f}, ")
-            #   f"avgt/s {avg_tokens_per_sec:.2f}")
+              f"t/s {current_tokens_per_sec:.2f}, "
+              f"avgt/s {avg_tokens_per_sec:.2f}")
 
     iter_num += 1
     local_iter_num += 1
