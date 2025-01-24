@@ -447,9 +447,8 @@ if master_process:
 
 torch.manual_seed(1337 + seed_offset)
 
-
 device_type = 'cuda' if 'cuda' in device else 'cpu'
-dtype = 'float16'
+dtype = 'bfloat16' if backend == "flash_attn_2" else 'float16'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
