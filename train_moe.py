@@ -72,7 +72,7 @@ data_dir = 'data/openwebtext'
 gradient_accumulation_steps = 1
 dropout = 0.0
 bias = False
-attention_backend = "flash_attn_2" # "sdpa"
+attention_backend = "sdpa" # "sdpa"
 
 # Configure CUDA Graph behavior
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
@@ -105,7 +105,7 @@ if torch.cuda.is_available():
     
     elif args.size == "medium":
         # Increase batch size and reduce gradient accumulation steps
-        batch_size = 18  
+        batch_size = 16  
         block_size = 256
         
         num_experts = 32
@@ -623,7 +623,7 @@ if device_type == 'cuda':
     
     pin_memory = True
     
-    gc.disable()
+    gc.enable()
     
     torch.cuda.set_per_process_memory_fraction(0.95)
 
@@ -715,7 +715,7 @@ while True:
                 cleanup_memory()
 
     # Generate text every 200 iterations
-    if iter_num % 100 == 0 and master_process:
+    if iter_num % 500 == 0 and master_process:
         print("\nGénération de texte :")
         prompt = random.choice(PROMPT_TEMPLATES)
         
