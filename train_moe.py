@@ -865,17 +865,6 @@ while True:
     if iter_num % 50 == 0:  # Monitoring plus fréquent
         print_memory_stats(f"Iter {iter_num}")
         cleanup_memory()
-        
-        # Forcer une synchronisation et un nettoyage complet
-        if device_type == 'cuda':
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            
-            # Réinitialiser les caches de compilation si nécessaire
-            if hasattr(torch, '_dynamo'):
-                torch._dynamo.reset()
-            if hasattr(torch, '_inductor') and hasattr(torch._inductor, 'clear_cache'):
-                torch._inductor.clear_cache()
 
     # termination conditions
     if iter_num > max_iters:
