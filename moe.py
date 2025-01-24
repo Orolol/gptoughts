@@ -68,7 +68,7 @@ class Router(nn.Module):
         
         # Compute router logits and probabilities using memory-efficient operations
         x_reshaped = x.view(-1, x.size(-1))
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.amp.autocast(enabled=True, device_type='cuda'):
             router_logits = self.router(x_reshaped)
             routing_weights = F.softmax(router_logits, dim=-1)
         
@@ -109,7 +109,7 @@ class Router(nn.Module):
                       0.001 * load_balance_loss.detach())
         
         # Clean up any remaining references
-        del router_logits, routing_weights, top_k_weights, top_k_indices
+        del router_logits, top_k_weights, top_k_indices
         torch.cuda.empty_cache()
         
         return routing_weights.detach(), normalized_dispatch_mask, router_loss
