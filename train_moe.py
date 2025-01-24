@@ -590,16 +590,14 @@ if compile:
     try:
         model = torch.compile(
             model,
-            # mode="max-autotune",
-            fullgraph=False,  # Important pour les dimensions dynamiques
-            dynamic=True,
+            # mode="reduce-overhead",
             options={
                 "max_autotune": True,
                 "epilogue_fusion": True,
                 "triton.cudagraphs": False,  # Désactivé pour plus de stabilité
                 "trace.enabled": True,
                 "trace.graph_diagram": False,
-                "profile_bandwidth": True,
+                "triton.cudagraphs": True,
             }
         )
     except Exception as e:
@@ -610,26 +608,25 @@ if compile:
 
 model.to(device)
 
-# Optimisations CUDA supplémentaires
-if torch.cuda.is_available():
-    # Optimisations de base
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
+# CUDA optimizations
+if device_type == 'cuda':
+    print("CUDA optimizations")
+    default_stream = torch.cuda.current_stream()
+    copy_stream = torch.cuda.Stream()
     
-    # Optimisations avancées
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-    torch.backends.cudnn.enabled = True
+    torch.multiprocessing.set_sharing_strategy('file_system')
     
-    # Gestion de la mémoire
-    torch.cuda.set_per_process_memory_fraction(0.95)
+    device_index = 0 if isinstance(device, str) else device
+    if isinstance(device, str) and ':' in device:
+        device_index = int(device.split(':')[1])
+    torch.cuda.set_device(device_index)
     torch.cuda.empty_cache()
     
-    # Optimisations pour les opérations de matmul
-    if hasattr(torch.backends.cuda, 'enable_math_sdp'):
-        torch.backends.cuda.enable_math_sdp(True)
-    if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
-        torch.backends.cuda.enable_flash_sdp(True)
+    pin_memory = True
+    
+    gc.disable()
+    
+    torch.cuda.set_per_process_memory_fraction(0.95)
 
 # Configure gradient scaler
 scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
