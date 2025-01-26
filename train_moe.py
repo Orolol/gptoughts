@@ -927,56 +927,83 @@ while True:
                         micro_step == gradient_accumulation_steps - 1
                     )
                 
-                with timing_stats.track("forward"), torch.amp.autocast(enabled=True, device_type=device_type):
-                    # Libérer la mémoire des tenseurs précédents
-                    if 'encoder_input' in locals(): del encoder_input
-                    if 'decoder_input' in locals(): del decoder_input
-                    if 'target' in locals(): del target
+                # Libérer la mémoire des tenseurs précédents
+                if 'encoder_input' in locals(): del encoder_input
+                if 'decoder_input' in locals(): del decoder_input
+                if 'target' in locals(): del target
+                
+                # Récupérer les données
+                encoder_input, decoder_input, target = next(train_iterator)
+                encoder_input, decoder_input, target = pad_sequences(
+                    encoder_input, decoder_input, target
+                )
+                
+                # Utiliser des streams différents pour le calcul
+                if device_type == 'cuda':
+                    stream = compute_streams[current_stream]
+                    current_stream = (current_stream + 1) % num_streams
                     
-                    encoder_input, decoder_input, target = next(train_iterator)
-                    encoder_input, decoder_input, target = pad_sequences(
-                        encoder_input, decoder_input, target
-                    )
+                    # Synchroniser le stream avec le stream principal
+                    stream.wait_stream(torch.cuda.current_stream())
                     
-                    # Utiliser des streams différents pour le calcul
-                    if device_type == 'cuda':
-                        stream = compute_streams[current_stream]
-                        current_stream = (current_stream + 1) % num_streams
-                        
-                        with torch.cuda.stream(stream):
-                            # Forward pass
+                    with torch.cuda.stream(stream):
+                        # Forward pass avec autocast
+                        with torch.amp.autocast(device_type=device_type, dtype=ptdtype):
                             logits, loss, router_loss = model(encoder_input, decoder_input, target)
                             
                             if loss is not None:
+                                # Scale losses
                                 loss = loss / gradient_accumulation_steps
                                 router_loss = router_loss / gradient_accumulation_steps
                                 combined_loss = loss + router_aux_loss_coef * router_loss
-                                
-                                # Scale loss pour mixed precision
-                                with ctx:
-                                    scaled_loss = scaler.scale(combined_loss)
-                                    scaled_loss.backward()
-                                
-                                total_loss += loss.item()
-                                total_router_loss += router_loss.item()
-                                
-                                # Libérer la mémoire immédiatement
-                                del loss, router_loss, combined_loss, scaled_loss
-
-                    batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
-                    total_tokens += batch_tokens
-                    tokens_window.append((time.time(), batch_tokens))
-                    if len(tokens_window) > window_size:
-                        tokens_window.pop(0)
-                    del logits
+                        
+                        # Backward pass en dehors de autocast
+                        if loss is not None:
+                            scaled_loss = scaler.scale(combined_loss)
+                            scaled_loss.backward()
+                            
+                            total_loss += loss.item()
+                            total_router_loss += router_loss.item()
+                        
+                        # Libérer la mémoire
+                        del loss, router_loss, combined_loss, scaled_loss
+                        
+                        # Synchroniser avant de continuer
+                        torch.cuda.current_stream().wait_stream(stream)
+                else:
+                    # CPU fallback
+                    with torch.amp.autocast(device_type=device_type, dtype=ptdtype):
+                        logits, loss, router_loss = model(encoder_input, decoder_input, target)
+                        
+                        if loss is not None:
+                            loss = loss / gradient_accumulation_steps
+                            router_loss = router_loss / gradient_accumulation_steps
+                            combined_loss = loss + router_aux_loss_coef * router_loss
+                            scaled_loss = scaler.scale(combined_loss)
+                            scaled_loss.backward()
+                            
+                            total_loss += loss.item()
+                            total_router_loss += router_loss.item()
+                            
+                            del loss, router_loss, combined_loss, scaled_loss
                 
-                with timing_stats.track("optimizer_step"):
-                    if grad_clip != 0.0:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    
-                    scaler.step(optimizer)
-                    scaler.update()
+                # Tracking des tokens
+                batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
+                total_tokens += batch_tokens
+                tokens_window.append((time.time(), batch_tokens))
+                if len(tokens_window) > window_size:
+                    tokens_window.pop(0)
+                del logits
+                
+                # Optimizer step
+                if micro_step == gradient_accumulation_steps - 1:
+                    with timing_stats.track("optimizer_step"):
+                        if grad_clip != 0.0:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                        
+                        scaler.step(optimizer)
+                        scaler.update()
 
         except Exception as e:
             print(f"Training iteration failed: {e}")
