@@ -110,6 +110,8 @@ class StreamingDataset(IterableDataset):
         max_retries = 3
         retry_count = 0
         
+        print("Getting batch")
+        
         while retry_count < max_retries:
             try:
                 with torch.cuda.stream(self.prefetch_stream):
@@ -129,6 +131,8 @@ class StreamingDataset(IterableDataset):
                     if len(self.token_buffer) < self.block_size * self.batch_size * 2:
                         continue
                     
+                    print("Got enough tokens")
+                    
                     total_length = self.block_size * self.batch_size
                     
                     # Copier d'abord dans les buffers CPU
@@ -138,30 +142,34 @@ class StreamingDataset(IterableDataset):
                             dtype=torch.long
                         ).view(self.batch_size, self.block_size)
                     )
+                    print("Copied encoder buffer")
                     self.decoder_buffer_cpu.copy_(
                         torch.tensor(
                             self.token_buffer[total_length:total_length*2], 
                             dtype=torch.long
                         ).view(self.batch_size, self.block_size)
                     )
+                    print("Copied decoder buffer")
                     self.target_buffer_cpu.copy_(
                         torch.tensor(
                             self.token_buffer[total_length+1:total_length*2+1], 
                             dtype=torch.long
                         ).view(self.batch_size, self.block_size)
                     )
+                    print("Copied target buffer")
                     
                     # Transférer de manière asynchrone vers GPU
                     self.encoder_buffer.copy_(self.encoder_buffer_cpu, non_blocking=True)
                     self.decoder_buffer.copy_(self.decoder_buffer_cpu, non_blocking=True)
                     self.target_buffer.copy_(self.target_buffer_cpu, non_blocking=True)
-                    
+                    print("Copied buffers to GPU")
                     # Nettoyer le buffer
                     self.token_buffer = self.token_buffer[total_length*2:]
                     
                     # Synchroniser le stream de préfetch
                     self.prefetch_stream.synchronize()
                     
+                    print("Returning batch")
                     return (
                         self.encoder_buffer.clone(), 
                         self.decoder_buffer.clone(), 
