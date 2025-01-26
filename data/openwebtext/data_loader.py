@@ -71,6 +71,8 @@ class StreamingDataset(IterableDataset):
         
         # Save tokenizer metadata
         self.save_meta()
+        
+        self.reset_dataset()
     
     def save_meta(self):
         meta = {
@@ -89,76 +91,99 @@ class StreamingDataset(IterableDataset):
         ids.append(self.tokenizer.eos_token_id)
         return ids
     
+    def reset_dataset(self):
+        """Reset the dataset iterator"""
+        self.dataset = load_dataset("HuggingFaceFW/fineweb-2", 
+                                  num_proc=4,
+                                  name=self.dataset_config,
+                                  split=self.split,
+                                  streaming=True)
+        self.dataset = self.dataset.shuffle(buffer_size=10_000)
+        self.dataset_iterator = iter(self.dataset)
+        self.token_buffer = []
+    
     def get_batch(self):
         """Get a batch of token sequences of length block_size."""
-        with torch.cuda.stream(self.prefetch_stream):
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
             try:
-                # Remplir le buffer en arrière-plan
-                while len(self.token_buffer) < self.prefetch_buffer_size:
-                    example = next(self.dataset_iterator)
-                    new_tokens = self.process_example(example)
-                    self.token_buffer.extend(new_tokens)
-                    self.token_tracker.update(len(new_tokens))
-                
-                # Préparer les données dans les buffers CPU pré-alloués
-                total_length = self.block_size * self.batch_size
-                
-                # Copier d'abord dans les buffers CPU
-                self.encoder_buffer_cpu.copy_(
-                    torch.tensor(
-                        self.token_buffer[:total_length], 
-                        dtype=torch.long
-                    ).view(self.batch_size, self.block_size)
-                )
-                self.decoder_buffer_cpu.copy_(
-                    torch.tensor(
-                        self.token_buffer[total_length:total_length*2], 
-                        dtype=torch.long
-                    ).view(self.batch_size, self.block_size)
-                )
-                self.target_buffer_cpu.copy_(
-                    torch.tensor(
-                        self.token_buffer[total_length+1:total_length*2+1], 
-                        dtype=torch.long
-                    ).view(self.batch_size, self.block_size)
-                )
-                
-                # Transférer de manière asynchrone vers GPU
-                self.encoder_buffer.copy_(self.encoder_buffer_cpu, non_blocking=True)
-                self.decoder_buffer.copy_(self.decoder_buffer_cpu, non_blocking=True)
-                self.target_buffer.copy_(self.target_buffer_cpu, non_blocking=True)
-                
-                # Nettoyer le buffer
-                self.token_buffer = self.token_buffer[total_length*2:]
-                
-                # Synchroniser le stream de préfetch
-                self.prefetch_stream.synchronize()
-                
-                return (
-                    self.encoder_buffer.clone(), 
-                    self.decoder_buffer.clone(), 
-                    self.target_buffer.clone()
-                )
-                
-            except StopIteration:
-                # Quand on arrive à la fin du dataset, on crée un nouvel itérateur
-                self.dataset = load_dataset("HuggingFaceFW/fineweb-2", 
-                                         num_proc=4,
-                                         name=self.dataset_config,
-                                         split=self.split,
-                                         streaming=True)
-                self.dataset = self.dataset.shuffle(buffer_size=10_000)
-                self.dataset_iterator = iter(self.dataset)
-                # Si le buffer est vide après avoir atteint la fin du dataset,
-                # on continue à charger des données
-                if len(self.token_buffer) == 0:
-                    raise StopIteration("End of dataset reached")
-                # Sinon, on peut utiliser ce qu'il reste dans le buffer
-                return self.get_batch()
+                with torch.cuda.stream(self.prefetch_stream):
+                    # Remplir le buffer en arrière-plan
+                    while len(self.token_buffer) < self.prefetch_buffer_size:
+                        try:
+                            example = next(self.dataset_iterator)
+                            new_tokens = self.process_example(example)
+                            self.token_buffer.extend(new_tokens)
+                            self.token_tracker.update(len(new_tokens))
+                        except StopIteration:
+                            # Reset le dataset si on atteint la fin
+                            self.reset_dataset()
+                            continue
+                    
+                    # S'assurer qu'on a assez de tokens
+                    if len(self.token_buffer) < self.block_size * self.batch_size * 2:
+                        continue
+                    
+                    total_length = self.block_size * self.batch_size
+                    
+                    # Copier d'abord dans les buffers CPU
+                    self.encoder_buffer_cpu.copy_(
+                        torch.tensor(
+                            self.token_buffer[:total_length], 
+                            dtype=torch.long
+                        ).view(self.batch_size, self.block_size)
+                    )
+                    self.decoder_buffer_cpu.copy_(
+                        torch.tensor(
+                            self.token_buffer[total_length:total_length*2], 
+                            dtype=torch.long
+                        ).view(self.batch_size, self.block_size)
+                    )
+                    self.target_buffer_cpu.copy_(
+                        torch.tensor(
+                            self.token_buffer[total_length+1:total_length*2+1], 
+                            dtype=torch.long
+                        ).view(self.batch_size, self.block_size)
+                    )
+                    
+                    # Transférer de manière asynchrone vers GPU
+                    self.encoder_buffer.copy_(self.encoder_buffer_cpu, non_blocking=True)
+                    self.decoder_buffer.copy_(self.decoder_buffer_cpu, non_blocking=True)
+                    self.target_buffer.copy_(self.target_buffer_cpu, non_blocking=True)
+                    
+                    # Nettoyer le buffer
+                    self.token_buffer = self.token_buffer[total_length*2:]
+                    
+                    # Synchroniser le stream de préfetch
+                    self.prefetch_stream.synchronize()
+                    
+                    return (
+                        self.encoder_buffer.clone(), 
+                        self.decoder_buffer.clone(), 
+                        self.target_buffer.clone()
+                    )
+                    
+            except Exception as e:
+                print(f"Error in get_batch: {str(e)}")
+                retry_count += 1
+                if retry_count >= max_retries:
+                    print("Max retries reached, resetting dataset")
+                    self.reset_dataset()
+                    retry_count = 0
+                continue
+        
+        raise RuntimeError("Failed to get batch after multiple retries")
     
     def __iter__(self):
         while True:
-            yield self.get_batch()
+            try:
+                yield self.get_batch()
+            except Exception as e:
+                print(f"Error in iterator: {str(e)}")
+                self.reset_dataset()
+                continue
     
     def get_total_tokens(self):
         """Return the total number of tokens processed so far."""
