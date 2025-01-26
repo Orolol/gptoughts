@@ -662,7 +662,7 @@ if compile:
     try:
         model = torch.compile(
             model,
-            mode="reduce-overhead",
+            mode="default",
             # options={
             #     "max_autotune": True,
             #     "epilogue_fusion": True,
