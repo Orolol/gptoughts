@@ -208,37 +208,43 @@ if torch.cuda.is_available():
             batch_size = 92
             gradient_accumulation_steps = 1
             
-            # Nouvelles optimisations pour maximiser l'utilisation GPU
+            # Configuration mémoire CUDA optimisée
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+                "max_split_size_mb:512,"
+                "garbage_collection_threshold:0.9,"  # Augmenté pour moins de GC
+                "expandable_segments:True,"
+                "roundup_power2_divisions:16"  # Optimise l'allocation mémoire
+            )
+            
+            # Optimisations de performance
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.set_float32_matmul_precision('high')
             
-            # Augmenter la taille des buffers CUDA
-            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
-                "max_split_size_mb:512,"
-                "garbage_collection_threshold:0.8,"
-                "expandable_segments:True"
-            )
+            # Optimisations mémoire
+            torch.cuda.empty_cache()
+            torch.cuda.memory.set_per_process_memory_fraction(0.95)
             
-            # Optimisations NCCL pour meilleur throughput
-            os.environ["NCCL_NSOCKS_PERTHREAD"] = "8"  # Augmenté de 4 à 8
-            os.environ["NCCL_SOCKET_NTHREADS"] = "8"   # Augmenté de 4 à 8
-            os.environ["NCCL_MIN_NCHANNELS"] = "8"     # Augmenté de 4 à 8
+            # Désactiver le garbage collector Python pendant l'entraînement
+            gc.disable()
             
-            # Optimisations pour réduire la latence
-            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
-            os.environ["NCCL_BUFFSIZE"] = "8388608"  # 8MB buffer
+            # Optimisations NCCL pour le multi-GPU
+            os.environ["NCCL_NSOCKS_PERTHREAD"] = "4"
+            os.environ["NCCL_SOCKET_NTHREADS"] = "4"
+            os.environ["NCCL_MIN_NCHANNELS"] = "4"
+            os.environ["NCCL_BUFFSIZE"] = "2097152"
             
-            # Désactiver l'autotuning qui peut causer des pauses
-            torch._inductor.config.coordinate_descent_tuning = False
+            # Optimisations CUDA
+            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+            os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
             
-            # Optimiser pour le throughput plutôt que la latence
-            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+            # Activer le mode déterministe pour plus de stabilité
+            torch.backends.cudnn.deterministic = False
             torch.backends.cudnn.benchmark = True
             
-            # Augmenter la taille des micro-batches
-            os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
-            torch.cuda.set_per_process_memory_fraction(0.98)  # Augmenté de 0.95
+            # Optimisations pour réduire la fragmentation mémoire
+            torch.cuda.set_per_process_memory_fraction(0.95)
+            torch.cuda.memory.set_per_process_memory_fraction(0.95)
         elif is_ada:
             # Optimisations 4090
             batch_size = 18

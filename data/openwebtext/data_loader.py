@@ -42,7 +42,23 @@ class StreamingDataset(IterableDataset):
         
         # Modifions la façon dont nous gérons le dataset
         self.dataset_iterator = iter(self.dataset)
+        
+        # Ajouter un buffer préfetch plus grand
+        self.prefetch_buffer_size = 20_000  # Augmenté pour réduire les pauses
         self.token_buffer = []
+        
+        # Créer un stream CUDA dédié pour le préfetch
+        self.prefetch_stream = torch.cuda.Stream()
+        
+        # Allouer des buffers fixes pour les tenseurs
+        self.encoder_buffer = torch.empty(
+            (batch_size, block_size), 
+            dtype=torch.long, 
+            device=device,
+            pin_memory=True
+        )
+        self.decoder_buffer = torch.empty_like(self.encoder_buffer)
+        self.target_buffer = torch.empty_like(self.encoder_buffer)
         
         # Save tokenizer metadata
         self.save_meta()
@@ -66,15 +82,50 @@ class StreamingDataset(IterableDataset):
     
     def get_batch(self):
         """Get a batch of token sequences of length block_size."""
-        # On s'assure d'avoir assez de tokens dans le buffer
-        # tracking time to get a batch
-        start_time = time.time()
-        while len(self.token_buffer) < (self.block_size * self.batch_size * 2 + 1):
+        with torch.cuda.stream(self.prefetch_stream):
             try:
-                example = next(self.dataset_iterator)
-                new_tokens = self.process_example(example)
-                self.token_buffer.extend(new_tokens)
-                self.token_tracker.update(len(new_tokens))
+                # Remplir le buffer en arrière-plan
+                while len(self.token_buffer) < self.prefetch_buffer_size:
+                    example = next(self.dataset_iterator)
+                    new_tokens = self.process_example(example)
+                    self.token_buffer.extend(new_tokens)
+                    self.token_tracker.update(len(new_tokens))
+                
+                # Préparer les données dans les buffers pré-alloués
+                total_length = self.block_size * self.batch_size
+                
+                # Copier directement dans les buffers pré-alloués
+                self.encoder_buffer.copy_(
+                    torch.tensor(
+                        self.token_buffer[:total_length], 
+                        dtype=torch.long
+                    ).view(self.batch_size, self.block_size)
+                )
+                self.decoder_buffer.copy_(
+                    torch.tensor(
+                        self.token_buffer[total_length:total_length*2], 
+                        dtype=torch.long
+                    ).view(self.batch_size, self.block_size)
+                )
+                self.target_buffer.copy_(
+                    torch.tensor(
+                        self.token_buffer[total_length+1:total_length*2+1], 
+                        dtype=torch.long
+                    ).view(self.batch_size, self.block_size)
+                )
+                
+                # Nettoyer le buffer
+                self.token_buffer = self.token_buffer[total_length*2:]
+                
+                # Synchroniser le stream de préfetch
+                self.prefetch_stream.synchronize()
+                
+                return (
+                    self.encoder_buffer.clone(), 
+                    self.decoder_buffer.clone(), 
+                    self.target_buffer.clone()
+                )
+                
             except StopIteration:
                 # Quand on arrive à la fin du dataset, on crée un nouvel itérateur
                 self.dataset = load_dataset("HuggingFaceFW/fineweb-2", 
@@ -87,39 +138,9 @@ class StreamingDataset(IterableDataset):
                 # Si le buffer est vide après avoir atteint la fin du dataset,
                 # on continue à charger des données
                 if len(self.token_buffer) == 0:
-                    continue
+                    raise StopIteration("End of dataset reached")
                 # Sinon, on peut utiliser ce qu'il reste dans le buffer
-                break
-
-        # Si après avoir essayé de remplir le buffer, on n'a toujours pas assez de tokens,
-        # on utilise ce qu'on a en ajustant la taille du batch
-        available_sequences = len(self.token_buffer) // self.block_size
-        if available_sequences == 0:
-            raise RuntimeError("Not enough tokens to create even one sequence")
-        
-        actual_batch_size = min(self.batch_size, available_sequences // 2)  # Divise par 2 car on a besoin d'input et target
-        total_length = self.block_size * actual_batch_size
-
-        # Prepare les tensors comme avant, mais avec la taille de batch ajustée
-        encoder_input = torch.tensor(self.token_buffer[:total_length], 
-                                   dtype=torch.long, device=self.device)
-        decoder_input = torch.tensor(self.token_buffer[total_length:total_length*2], 
-                                   dtype=torch.long, device=self.device)
-        target = torch.tensor(self.token_buffer[total_length+1:total_length*2+1], 
-                            dtype=torch.long, device=self.device)
-
-        # Reshape avec la taille de batch ajustée
-        encoder_input = encoder_input.view(actual_batch_size, self.block_size)
-        decoder_input = decoder_input.view(actual_batch_size, self.block_size)
-        target = target.view(actual_batch_size, self.block_size)
-
-        # Nettoie le buffer
-        self.token_buffer = self.token_buffer[total_length*2:]
-        
-        end_time = time.time()
-        # print(f"Time to get a batch: {end_time - start_time:.4f} seconds")
-
-        return encoder_input, decoder_input, target
+                return self.get_batch()
     
     def __iter__(self):
         while True:
