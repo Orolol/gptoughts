@@ -94,33 +94,34 @@ class RoPE(nn.Module):
         self.register_buffer('cos_cached', emb.cos().view(1, 1, max_seq_len, dim), persistent=False)
         self.register_buffer('sin_cached', emb.sin().view(1, 1, max_seq_len, dim), persistent=False)
 
-    def forward(self, x: torch.Tensor, seq_len: Optional[int] = None) -> torch.Tensor:
-        # x: [batch, nhead, seq_len, head_dim]
-        if seq_len is None:
-            seq_len = x.shape[-2]
-            
-        return self._rotate_half(x, seq_len)
-
     def _rotate_half(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
-        # Ensure x is the right shape: [batch, nhead, seq_len, head_dim]
-        x = x.view(*x.shape[:-1], -1, 2)  # Split last dim into pairs
+        # Utiliser des dimensions fixes quand possible
+        B, H, T, D = x.shape
+        
+        # Reshape avec des dimensions explicites
+        x_reshaped = x.view(B, H, T, D // 2, 2)
+        x1, x2 = x_reshaped[..., 0], x_reshaped[..., 1]
         
         # Get the cos and sin values for the current sequence length
-        cos = self.cos_cached[..., :seq_len, :x.shape[-2]]
-        sin = self.sin_cached[..., :seq_len, :x.shape[-2]]
+        cos = self.cos_cached[:, :, :seq_len, :(D//2)]
+        sin = self.sin_cached[:, :, :seq_len, :(D//2)]
         
         # Ensure broadcasting works correctly
-        cos = cos.expand(x.shape[0], x.shape[1], -1, -1)  # [batch, nhead, seq_len, dim/2]
-        sin = sin.expand(x.shape[0], x.shape[1], -1, -1)
+        cos = cos.expand(B, H, -1, -1)
+        sin = sin.expand(B, H, -1, -1)
         
         # Apply rotation
-        x1, x2 = x[..., 0], x[..., 1]
         rotated = torch.stack([
             x1 * cos - x2 * sin,
             x2 * cos + x1 * sin,
         ], dim=-1)
         
-        return rotated.flatten(-2)  # Combine the rotated pairs
+        return rotated.view(B, H, T, D)
+
+    def forward(self, x: torch.Tensor, seq_len: Optional[int] = None) -> torch.Tensor:
+        if seq_len is None:
+            seq_len = x.shape[-2]
+        return self._rotate_half(x, seq_len)
 
 class AlibiPositionalBias(nn.Module):
     """

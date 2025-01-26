@@ -33,11 +33,16 @@ console = Console()
 
 import torch._inductor.config
 import torch._dynamo.config
+from torch.compiler import allow_in_graph
+
+# Permettre time.time() dans le graphe
+allow_in_graph(time.time)
 
 # Configuration optimisée pour les modèles avec dimensions dynamiques
 torch._dynamo.config.suppress_errors = True
-torch._dynamo.config.cache_size_limit = 16384  # Augmenté pour gérer plus de cas
-torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = False  # Permettre les graphes dynamiques
+torch._dynamo.config.cache_size_limit = 16384
+# Activer les CUDA graphs même avec des formes dynamiques
+torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = False
 torch._inductor.config.debug = False
 
 # -----------------------------------------------------------------------------
@@ -626,14 +631,18 @@ if compile:
     try:
         model = torch.compile(
             model,
-            mode="reduce-overhead",
-            # options={
-            #     "max_autotune": True,
-            #     "epilogue_fusion": True,
-            #     "triton.cudagraphs": False,  # Désactivé pour plus de stabilité
-            #     "trace.graph_diagram": False,
-            #     "triton.cudagraphs": True,
-            # }
+            mode="max-autotune",  # Changed from "reduce-overhead"
+            options={
+                "max_autotune": True,
+                "epilogue_fusion": True,
+                "triton.cudagraphs": True,  # Activé
+                "trace.graph_diagram": False,
+                # Ajouter des options pour mieux gérer les formes dynamiques
+                "dynamic_shapes": True,
+                "dynamic_memory": True,
+                "max_parallel_block_sizes": 6,
+                "max_autotune_gemm": True,
+            }
         )
     except Exception as e:
         print(f"Compilation failed: {e}")
