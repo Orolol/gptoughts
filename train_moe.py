@@ -81,6 +81,11 @@ torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
 if torch.cuda.is_available():
     device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'
     
+    # Détection automatique de la carte graphique
+    gpu_name = torch.cuda.get_device_name()
+    is_ampere = any(x in gpu_name.lower() for x in ['a100', 'a6000', 'a5000', 'a4000'])
+    is_ada = any(x in gpu_name.lower() for x in ['4090', '4080', '4070'])
+    
     if args.size == "small":
         # Increase batch size and reduce gradient accumulation steps
         batch_size = 16  
@@ -104,43 +109,69 @@ if torch.cuda.is_available():
         decoder_ratio_kv = 4
     
     elif args.size == "medium":
-        # Increase batch size and reduce gradient accumulation steps
-        batch_size = 18  
+        # Paramètres de base
         block_size = 256
-        
         num_experts = 32
         expert_k = 4
-    
         gradient_accumulation_steps = 2
-
-        # Encoder config
+        
+        # Ajustements spécifiques selon le GPU
+        if is_ampere:
+            # Optimisations A100
+            batch_size = 24  # Augmenté pour mieux utiliser la bande passante
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            # Utiliser plus de streams pour le parallélisme
+            torch.cuda.set_num_threads(8)
+        elif is_ada:
+            # Optimisations 4090
+            batch_size = 18
+            # La 4090 a une meilleure latence mais moins de bande passante
+            torch.cuda.set_num_threads(4)
+        else:
+            batch_size = 16
+        
+        # Configuration commune
         encoder_n_layer = 8
         encoder_n_head = 8
         encoder_n_embd = 768
         encoder_ratio_kv = 8
         
-        # Decoder config
         decoder_n_layer = 8
         decoder_n_head = 8
         decoder_n_embd = 768
         decoder_ratio_kv = 8
     elif args.size == "large":
-        # Increase batch size and reduce gradient accumulation steps
-        batch_size = 32  
+        # Paramètres de base
         block_size = 256
-        
         num_experts = 32
         expert_k = 4
-    
         gradient_accumulation_steps = 2
 
-        # Encoder config
+        # Ajustements spécifiques selon le GPU
+        if is_ampere:
+            # Optimisations A100
+            batch_size = 40  # Augmenté pour mieux utiliser la bande passante
+            gradient_accumulation_steps = 1  # Réduit car batch_size plus grand
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            # Utiliser plus de streams pour le parallélisme
+            torch.cuda.set_num_threads(8)
+        elif is_ada:
+            # Optimisations 4090
+            batch_size = 32
+            # La 4090 a une meilleure latence mais moins de bande passante
+            torch.cuda.set_num_threads(4)
+        else:
+            batch_size = 24
+            gradient_accumulation_steps = 3
+
+        # Configuration commune
         encoder_n_layer = 16
         encoder_n_head = 16
         encoder_n_embd = 1024
         encoder_ratio_kv = 16
         
-        # Decoder config
         decoder_n_layer = 16
         decoder_n_head = 16
         decoder_n_embd = 1024
@@ -625,6 +656,22 @@ if device_type == 'cuda':
     gc.enable()
     
     torch.cuda.set_per_process_memory_fraction(0.95)
+
+    if is_ampere:
+        # Optimisations spécifiques A100
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+        # Utiliser des algorithmes optimisés pour les grandes matrices
+        torch.backends.cudnn.benchmark = True
+        # Optimiser pour la throughput plutôt que la latence
+        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+        # Augmenter la taille du cache L2
+        torch.cuda.set_per_process_memory_fraction(0.95)
+    elif is_ada:
+        # Optimisations spécifiques 4090
+        # Privilégier la latence
+        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
+        torch.cuda.set_per_process_memory_fraction(0.85)
 
 # Configure gradient scaler
 scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
