@@ -51,11 +51,20 @@ class StreamingDataset(IterableDataset):
         self.prefetch_stream = torch.cuda.Stream()
         
         # Allouer des buffers fixes pour les tenseurs
+        # D'abord créer sur CPU avec pin_memory, puis transférer sur GPU
+        self.encoder_buffer_cpu = torch.empty(
+            (batch_size, block_size), 
+            dtype=torch.long,
+            pin_memory=True
+        )
+        self.decoder_buffer_cpu = torch.empty_like(self.encoder_buffer_cpu, pin_memory=True)
+        self.target_buffer_cpu = torch.empty_like(self.encoder_buffer_cpu, pin_memory=True)
+        
+        # Créer les buffers GPU
         self.encoder_buffer = torch.empty(
             (batch_size, block_size), 
-            dtype=torch.long, 
-            device=device,
-            pin_memory=True
+            dtype=torch.long,
+            device=device
         )
         self.decoder_buffer = torch.empty_like(self.encoder_buffer)
         self.target_buffer = torch.empty_like(self.encoder_buffer)
@@ -91,28 +100,33 @@ class StreamingDataset(IterableDataset):
                     self.token_buffer.extend(new_tokens)
                     self.token_tracker.update(len(new_tokens))
                 
-                # Préparer les données dans les buffers pré-alloués
+                # Préparer les données dans les buffers CPU pré-alloués
                 total_length = self.block_size * self.batch_size
                 
-                # Copier directement dans les buffers pré-alloués
-                self.encoder_buffer.copy_(
+                # Copier d'abord dans les buffers CPU
+                self.encoder_buffer_cpu.copy_(
                     torch.tensor(
                         self.token_buffer[:total_length], 
                         dtype=torch.long
                     ).view(self.batch_size, self.block_size)
                 )
-                self.decoder_buffer.copy_(
+                self.decoder_buffer_cpu.copy_(
                     torch.tensor(
                         self.token_buffer[total_length:total_length*2], 
                         dtype=torch.long
                     ).view(self.batch_size, self.block_size)
                 )
-                self.target_buffer.copy_(
+                self.target_buffer_cpu.copy_(
                     torch.tensor(
                         self.token_buffer[total_length+1:total_length*2+1], 
                         dtype=torch.long
                     ).view(self.batch_size, self.block_size)
                 )
+                
+                # Transférer de manière asynchrone vers GPU
+                self.encoder_buffer.copy_(self.encoder_buffer_cpu, non_blocking=True)
+                self.decoder_buffer.copy_(self.decoder_buffer_cpu, non_blocking=True)
+                self.target_buffer.copy_(self.target_buffer_cpu, non_blocking=True)
                 
                 # Nettoyer le buffer
                 self.token_buffer = self.token_buffer[total_length*2:]
