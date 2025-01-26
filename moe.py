@@ -9,7 +9,7 @@ from typing import Optional
 import inspect
 import gc
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 
 class DummyTimingContext:
     @contextmanager
