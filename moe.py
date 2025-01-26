@@ -645,7 +645,15 @@ class MoEEncoderDecoderGPT(nn.Module):
         
         # Encoder forward pass
         for block in self.encoder.h:
-            x, _ = block(x)
+            # Self-attention
+            x = x + block.attn(block.ln_1(x))
+            
+            # MoE layer
+            moe_input = block.ln_2(x)
+            routing_weights, dispatch_mask, _ = block.router(moe_input)
+            expert_output = block.expert_group(moe_input, dispatch_mask)
+            x = x + expert_output
+        
         encoder_output = self.encoder.ln_f(x)
         
         # Initialize decoder input with BOS token
@@ -672,10 +680,9 @@ class MoEEncoderDecoderGPT(nn.Module):
             decoder_x = self.decoder.drop(decoder_emb + decoder_pos_emb)
             
             # Decoder layers
-            for i, (block, cross_attn) in enumerate(zip(self.decoder.h, self.cross_attention)):
+            for block, cross_attn in zip(self.decoder.h, self.cross_attention):
                 # Self-attention
-                attn_output = block.attn(block.ln_1(decoder_x))
-                decoder_x = decoder_x + attn_output
+                decoder_x = decoder_x + block.attn(block.ln_1(decoder_x))
                 
                 # Cross-attention
                 cross_x = self.cross_ln[i](decoder_x)
@@ -684,44 +691,31 @@ class MoEEncoderDecoderGPT(nn.Module):
                 
                 # MoE layer
                 moe_input = block.ln_2(decoder_x)
-                moe_out, _ = block.moe(moe_input)
-                decoder_x = decoder_x + moe_out
+                routing_weights, dispatch_mask, _ = block.router(moe_input)
+                expert_output = block.expert_group(moe_input, dispatch_mask)
+                decoder_x = decoder_x + expert_output
             
             decoder_x = self.decoder.ln_f(decoder_x)
             
             # Get logits for next token
             logits = self.lm_head(decoder_x[:, -1:])
-            logits = logits.float().squeeze(1)  # Ensure float32 precision
             
-            # Apply temperature
-            if temperature == 0.0:
-                # Greedy decoding
-                next_token = torch.argmax(logits, dim=-1, keepdim=True)
-            else:
-                # Apply temperature and top-k sampling
-                logits = logits / temperature
-                
-                if top_k is not None:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = float('-inf')
-                
-                # Ensure valid probabilities
-                probs = F.softmax(logits, dim=-1)
-                probs = probs.clamp(min=1e-5)  # Prevent zeros
-                probs = probs / probs.sum(dim=-1, keepdim=True)  # Renormalize
-                
-                try:
-                    next_token = torch.multinomial(probs, num_samples=1)
-                except RuntimeError:
-                    print("Warning: Sampling failed, falling back to argmax")
-                    next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            # Pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
             
-            # Append to sequence
-            decoder_idx = torch.cat((decoder_idx, next_token), dim=1)
+            # Optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
             
-            # Stop if we generate an EOS token
-            if (next_token == self.shared_embedding.weight.size(0)-1).any():
-                break
+            # Apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            
+            # Sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            
+            # Append sampled index to the running sequence and continue
+            decoder_idx = torch.cat((decoder_idx, idx_next), dim=1)
         
         return decoder_idx
 
