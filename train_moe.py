@@ -123,7 +123,7 @@ if torch.cuda.is_available():
         # Ajustements spécifiques selon le GPU
         if is_ampere:
             # Optimisations A100
-            batch_size = 92  # On garde cette taille
+            batch_size = 64  # On garde cette taille
             gradient_accumulation_steps = 1
             
             # Optimisations mémoire et calcul
@@ -662,7 +662,7 @@ if compile:
                 "triton.store_cubin": True,
                 "max_fusion_size": 128,
                 "triton.cudagraph_trees": True,
-                "profile_bandwidth": True,
+                # "profile_bandwidth": True,
                 "permute_fusion": True,
                 "aggressive_fusion": True,
                 "max_autotune_gemm_backends": "triton",
