@@ -111,122 +111,86 @@ class StreamingDataset(IterableDataset):
         """Get a batch of token sequences of length block_size."""
         max_retries = 3
         retry_count = 0
-        
-        batch_start_time = time.time()
-        print("Getting batch")
         required_tokens = self.block_size * self.batch_size * 2
-        print(f"Required tokens for batch: {required_tokens}")
         
         while retry_count < max_retries:
             try:
-                print("Starting prefetch stream", retry_count)
                 with torch.cuda.stream(self.prefetch_stream):
                     # Remplir le buffer en arrière-plan
                     fill_start_time = time.time()
-                    print("Filling token buffer")
                     
                     fill_attempts = 0
                     max_fill_attempts = 1000
                     
+                    # Remplissage rapide sans logs fréquents
                     while len(self.token_buffer) < required_tokens and fill_attempts < max_fill_attempts:
                         try:
                             example = next(self.dataset_iterator)
                             if not example or 'text' not in example:
-                                print("Invalid example received")
                                 continue
-                                
+                            
                             new_tokens = self.process_example(example)
                             if not new_tokens:
-                                print("No tokens generated from example")
                                 continue
-                                
+                            
                             self.token_buffer.extend(new_tokens)
                             self.token_tracker.update(len(new_tokens))
                             
-                            if fill_attempts % 10 == 0:
-                                elapsed = time.time() - fill_start_time
-                                tokens_per_sec = len(self.token_buffer) / elapsed if elapsed > 0 else 0
-                                print(f"Buffer size: {len(self.token_buffer)}/{required_tokens} "
-                                      f"({tokens_per_sec:.0f} tokens/s)")
-                                
+                            # Log moins fréquent
+                            if fill_attempts % 50 == 0 and fill_attempts > 0:
+                                tokens_per_sec = len(self.token_buffer) / (time.time() - fill_start_time)
+                                print(f"Tokenization speed: {tokens_per_sec:.0f} tokens/s")
+                            
                         except StopIteration:
-                            print("Reached end of dataset, resetting")
                             self.reset_dataset()
                         
                         fill_attempts += 1
                     
-                    fill_time = time.time() - fill_start_time
-                    print(f"Buffer filling took {fill_time:.2f}s")
-                    
-                    if fill_attempts >= max_fill_attempts:
-                        print(f"Failed to fill buffer after {max_fill_attempts} attempts")
-                        raise RuntimeError("Failed to fill token buffer")
-                    
-                    if len(self.token_buffer) < required_tokens:
-                        print(f"Not enough tokens: {len(self.token_buffer)}/{required_tokens}")
+                    if fill_attempts >= max_fill_attempts or len(self.token_buffer) < required_tokens:
                         retry_count += 1
                         continue
                     
-                    print(f"Got enough tokens: {len(self.token_buffer)}")
-                    
-                    # Timing pour les opérations de copie
-                    copy_start = time.time()
+                    # Optimisation des copies mémoire
                     total_length = self.block_size * self.batch_size
                     
-                    # Copier vers CPU
-                    self.encoder_buffer_cpu.copy_(
-                        torch.tensor(
-                            self.token_buffer[:total_length], 
-                            dtype=torch.long
-                        ).view(self.batch_size, self.block_size)
-                    )
-                    print("Copied encoder buffer")
-                    self.decoder_buffer_cpu.copy_(
-                        torch.tensor(
-                            self.token_buffer[total_length:total_length*2], 
-                            dtype=torch.long
-                        ).view(self.batch_size, self.block_size)
-                    )
-                    print("Copied decoder buffer")
-                    self.target_buffer_cpu.copy_(
-                        torch.tensor(
-                            self.token_buffer[total_length+1:total_length*2+1], 
-                            dtype=torch.long
-                        ).view(self.batch_size, self.block_size)
-                    )
-                    print("Copied target buffer")
+                    # Créer les tenseurs une seule fois et les copier directement
+                    tokens_tensor = torch.tensor(
+                        self.token_buffer[:total_length*2], 
+                        dtype=torch.long
+                    ).view(-1, self.block_size)
                     
-                    cpu_copy_time = time.time() - copy_start
-                    print(f"CPU copy took {cpu_copy_time:.3f}s")
+                    # Copier en une seule opération vers CPU
+                    with torch.cuda.stream(self.prefetch_stream):
+                        self.encoder_buffer_cpu.copy_(tokens_tensor[:self.batch_size])
+                        self.decoder_buffer_cpu.copy_(tokens_tensor[self.batch_size:2*self.batch_size])
+                        self.target_buffer_cpu.copy_(tokens_tensor[self.batch_size+1:2*self.batch_size+1])
                     
-                    # Timing pour le transfert GPU
-                    gpu_start = time.time()
-                    self.encoder_buffer.copy_(self.encoder_buffer_cpu, non_blocking=True)
-                    self.decoder_buffer.copy_(self.decoder_buffer_cpu, non_blocking=True)
-                    self.target_buffer.copy_(self.target_buffer_cpu, non_blocking=True)
+                        # Transfert asynchrone vers GPU
+                        self.encoder_buffer.copy_(self.encoder_buffer_cpu, non_blocking=True)
+                        self.decoder_buffer.copy_(self.decoder_buffer_cpu, non_blocking=True)
+                        self.target_buffer.copy_(self.target_buffer_cpu, non_blocking=True)
                     
                     # Nettoyer le buffer
                     self.token_buffer = self.token_buffer[total_length*2:]
                     
-                    # Synchroniser et mesurer le temps de transfert GPU
+                    # Synchronisation minimale
                     self.prefetch_stream.synchronize()
-                    gpu_time = time.time() - gpu_start
-                    print(f"GPU transfer took {gpu_time:.3f}s")
                     
-                    total_time = time.time() - batch_start_time
-                    print(f"Total batch preparation took {total_time:.2f}s")
+                    # Log de performance occasionnel (1 fois sur 100)
+                    if self.token_tracker.total_tokens % 100000 == 0:
+                        current_time = time.time()
+                        elapsed = current_time - fill_start_time
+                        print(f"Average throughput: {len(self.token_buffer)/elapsed:.0f} tokens/s")
                     
                     return (
-                        self.encoder_buffer.clone(), 
-                        self.decoder_buffer.clone(), 
-                        self.target_buffer.clone()
+                        self.encoder_buffer, 
+                        self.decoder_buffer, 
+                        self.target_buffer
                     )
                     
             except Exception as e:
-                print(f"Error in get_batch: {str(e)}")
                 retry_count += 1
                 if retry_count >= max_retries:
-                    print("Max retries reached, resetting dataset")
                     self.reset_dataset()
                     retry_count = 0
                 continue
