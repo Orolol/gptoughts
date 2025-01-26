@@ -445,32 +445,33 @@ class MoELayer(nn.Module):
 
 class MoEBlock(nn.Module):
     """
-    Transformer block that uses MoE instead of standard MLP.
+    Block combining attention and MoE layers
     """
-    def __init__(self, config, num_experts: int = 8, k: int = 2):
+    def __init__(self, config, num_experts, k):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.moe = MoELayer(config, num_experts=num_experts, k=k)
-        self.use_checkpoint = True
+        
+        # MoE components
+        self.router = Router(config.n_embd, num_experts, k)
+        self.expert_group = ExpertGroup(config, num_experts)
+        
+        # Router loss coefficient
+        self.router_z_loss = 0.001
+        
+        # Gradient checkpointing flag
+        self.use_checkpoint = False
 
-    def forward(self, x: torch.Tensor, key_value: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
-        # Attention
-        attn_output = self.attn(self.ln_1(x), key_value=key_value)
-        x = x + attn_output
+    def forward(self, x):
+        # Self-attention
+        x = x + self.attn(self.ln_1(x))
         
-        # MoE
-        if self.use_checkpoint and self.training:
-            moe_output, router_loss = checkpoint.checkpoint(
-                self.moe,
-                self.ln_2(x),
-                use_reentrant=False
-            )
-        else:
-            moe_output, router_loss = self.moe(self.ln_2(x))
-        
-        x = x + moe_output
+        # MoE layer
+        moe_input = self.ln_2(x)
+        routing_weights, dispatch_mask, router_loss = self.router(moe_input)
+        expert_output = self.expert_group(moe_input, dispatch_mask)
+        x = x + expert_output
         
         return x, router_loss
 
@@ -544,23 +545,9 @@ class MoEEncoderDecoderGPT(nn.Module):
 
     def forward(self, encoder_idx: torch.Tensor, decoder_idx: torch.Tensor, 
                 targets: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-        """
-        Forward pass of the MoE encoder-decoder model.
-        
-        Args:
-            encoder_idx: Input tokens for encoder [batch_size, encoder_seq_len]
-            decoder_idx: Input tokens for decoder [batch_size, decoder_seq_len]
-            targets: Optional target tokens [batch_size, decoder_seq_len]
-            
-        Returns:
-            logits: Output logits
-            loss: Optional loss value if targets provided
-            router_loss: Combined routing loss from all MoE layers
-        """
         device = encoder_idx.device
         total_router_loss = torch.tensor(0.0, device=device)
         
-        # Utiliser un context manager qui ne fait rien si timing_stats n'est pas défini
         track = self.timing_stats.track if self.timing_stats is not None else nullcontext
         
         with track("encoder"):
@@ -576,19 +563,17 @@ class MoEEncoderDecoderGPT(nn.Module):
             for i, block in enumerate(self.encoder.h):
                 with track(f"layer_{i}"):
                     with track("attention"):
-                        attn_output = block.attn(block.ln_1(x))
-                        x = x + attn_output
+                        # Self-attention
+                        x = x + block.attn(block.ln_1(x))
                     
                     with track("moe"):
+                        # MoE layer
+                        moe_input = block.ln_2(x)
                         with track("router"):
-                            moe_input = block.ln_2(x)
-                            routing_logits = block.router(moe_input)
-                        
+                            routing_weights, dispatch_mask, router_loss = block.router(moe_input)
                         with track("experts"):
-                            expert_outputs = block.expert_group(moe_input, routing_logits)
-                            x = x + expert_outputs
-                        
-                        router_loss = block.router_z_loss * routing_logits.pow(2).mean()
+                            expert_output = block.expert_group(moe_input, dispatch_mask)
+                            x = x + expert_output
                         total_router_loss = total_router_loss + router_loss
             
             with track("final_norm"):
@@ -607,8 +592,7 @@ class MoEEncoderDecoderGPT(nn.Module):
             for i, (block, cross_attn) in enumerate(zip(self.decoder.h, self.cross_attention)):
                 with track(f"layer_{i}"):
                     with track("self_attention"):
-                        attn_output = block.attn(block.ln_1(x))
-                        x = x + attn_output
+                        x = x + block.attn(block.ln_1(x))
                     
                     with track("cross_attention"):
                         cross_x = self.cross_ln[i](x)
@@ -616,15 +600,12 @@ class MoEEncoderDecoderGPT(nn.Module):
                         x = x + cross_output
                     
                     with track("moe"):
+                        moe_input = block.ln_2(x)
                         with track("router"):
-                            moe_input = block.ln_2(x)
-                            routing_logits = block.router(moe_input)
-                        
+                            routing_weights, dispatch_mask, router_loss = block.router(moe_input)
                         with track("experts"):
-                            expert_outputs = block.expert_group(moe_input, routing_logits)
-                            x = x + expert_outputs
-                        
-                        router_loss = block.router_z_loss * routing_logits.pow(2).mean()
+                            expert_output = block.expert_group(moe_input, dispatch_mask)
+                            x = x + expert_output
                         total_router_loss = total_router_loss + router_loss
             
             with track("final_norm"):
