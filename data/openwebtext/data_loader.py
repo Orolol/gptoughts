@@ -87,19 +87,45 @@ class StreamingDataset(IterableDataset):
     
     def process_example(self, example):
         """Optimized tokenization with memory reuse"""
-        # Reuse existing buffer to avoid allocations
-        ids = self.tokenizer.encode_plus(
-            example['text'],
-            add_special_tokens=False,
-            return_tensors='pt',
-            max_length=self.block_size,
-            truncation=True,
-            padding='max_length',
-            return_attention_mask=False
-        ).input_ids.squeeze(0)
-        
-        ids = ids.to(device='cpu', non_blocking=True)
-        return ids
+        # Vérifier que le texte est bien une chaîne de caractères
+        text = example['text']
+        if isinstance(text, (list, tuple)):
+            text = text[0]  # Prendre le premier élément si c'est une liste
+        if not isinstance(text, str):
+            text = str(text)  # Convertir en string si ce n'en est pas un
+            
+        # Tokenize avec gestion des erreurs
+        try:
+            # Encoder le texte
+            ids = self.tokenizer.encode(
+                text,
+                add_special_tokens=True,
+                max_length=self.block_size,
+                truncation=True,
+                padding='max_length',
+                return_tensors=None  # Retourner une liste plutôt qu'un tensor
+            )
+            
+            # Convertir en tensor
+            ids = torch.tensor(ids, dtype=torch.long)
+            
+            # Padding si nécessaire
+            if len(ids) < self.block_size:
+                padding = torch.full((self.block_size - len(ids),), 
+                                  self.tokenizer.pad_token_id,
+                                  dtype=torch.long)
+                ids = torch.cat([ids, padding])
+            else:
+                ids = ids[:self.block_size]
+            
+            return ids
+            
+        except Exception as e:
+            print(f"Tokenization error: {e}")
+            # Retourner un tensor de padding en cas d'erreur
+            return torch.full((self.block_size,), 
+                            self.tokenizer.pad_token_id,
+                            dtype=torch.long)
     
     def get_batch(self):
         """Vectorized batch preparation"""
