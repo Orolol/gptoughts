@@ -72,7 +72,7 @@ data_dir = 'data/openwebtext'
 gradient_accumulation_steps = 1
 dropout = 0.0
 bias = False
-attention_backend = "sdpa" # "sdpa"
+attention_backend = "flash_attn_2" # "sdpa"
 
 # Configure CUDA Graph behavior
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
@@ -589,14 +589,14 @@ if compile:
     try:
         model = torch.compile(
             model,
-            # mode="reduce-overhead",
-            options={
-                "max_autotune": True,
-                "epilogue_fusion": True,
-                "triton.cudagraphs": False,  # Désactivé pour plus de stabilité
-                "trace.graph_diagram": False,
-                "triton.cudagraphs": True,
-            }
+            mode="default",
+            # options={
+            #     "max_autotune": True,
+            #     "epilogue_fusion": True,
+            #     "triton.cudagraphs": False,  # Désactivé pour plus de stabilité
+            #     "trace.graph_diagram": False,
+            #     "triton.cudagraphs": True,
+            # }
         )
     except Exception as e:
         print(f"Compilation failed: {e}")
