@@ -638,7 +638,7 @@ if compile:
                 "triton.cudagraphs": True,  # Activé
                 "trace.graph_diagram": False,
                 # Ajouter des options pour mieux gérer les formes dynamiques
-                "dynamic_shapes": True,
+                # "dynamic_shapes": True,
                 "dynamic_memory": True,
                 "max_parallel_block_sizes": 6,
                 "max_autotune_gemm": True,
