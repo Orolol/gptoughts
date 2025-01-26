@@ -96,7 +96,7 @@ class StreamingDataset(IterableDataset):
     def reset_dataset(self):
         """Reset the dataset iterator"""
         self.dataset = load_dataset(
-            "HuggingFaceFW/fineweb-2", 
+            "HuggingFaceFW/fineweb-edu", 
             name=self.dataset_config,
             split=self.split,
             streaming=True
