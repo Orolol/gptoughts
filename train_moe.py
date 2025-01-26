@@ -678,10 +678,6 @@ if compile:
         print(traceback.format_exc())
         compile = False
 
-# Remplacez timing_stats = TimingStats() par:
-timing_stats = AveragedTimingStats(print_interval=100)  # Afficher les stats tous les 10 iterations
-# Après la création du modèle et avant de le déplacer sur le device
-model.set_timing_stats(timing_stats)
 
 # Si vous utilisez DDP, modifiez aussi:
 if ddp:
