@@ -126,7 +126,7 @@ if torch.cuda.is_available():
         # Ajustements spécifiques selon le GPU
         if is_ampere:
             # Optimisations A100
-            batch_size = 128  # Réduit pour éviter OOM
+            batch_size = 92  # Réduit pour éviter OOM
             gradient_accumulation_steps = 1  # Augmenté pour compenser
             
             # Optimisations mémoire et calcul
