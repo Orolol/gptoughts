@@ -263,6 +263,10 @@ class ExpertGroup(nn.Module):
         self.num_experts = num_experts
         self.config = config
         
+        # Define dimensions
+        self.hidden_dim = 2 * config.n_embd
+        self.adapt_dim = self.hidden_dim // 16
+        
         # Shared MLP backbone with larger capacity
         self.shared_mlp = SharedExpertMLP(config)
         
@@ -274,9 +278,20 @@ class ExpertGroup(nn.Module):
             ) for _ in range(num_experts)
         ])
         
+        # Projections for dimension matching
+        self.expert_proj = nn.Linear(self.adapt_dim, self.hidden_dim, bias=False)
+        self.output_proj = nn.Linear(self.hidden_dim, config.n_embd, bias=False)
+        
         # Enable parallel computation
         self.parallel_adapters = True
         
+        # Initialize with small values
+        adapt_scale = 0.01 / (self.adapt_dim ** 0.5)
+        for adapter in self.expert_adapters:
+            nn.init.normal_(adapter[0].weight, mean=0.0, std=adapt_scale)
+        nn.init.normal_(self.expert_proj.weight, mean=0.0, std=adapt_scale)
+        nn.init.normal_(self.output_proj.weight, mean=0.0, std=adapt_scale)
+
     def forward(self, x: torch.Tensor, expert_weights: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, hidden_dim = x.shape
         
@@ -294,7 +309,12 @@ class ExpertGroup(nn.Module):
                 if mask.any():
                     masks.append(mask)
                     expert_x = x[mask]
-                    expert_outputs.append(self.expert_adapters[i](expert_x))
+                    # Process through adapter and projections
+                    expert_hidden = self.shared_mlp.pre_adapt(expert_x)
+                    expert_hidden = self.expert_adapters[i](expert_hidden)
+                    expert_hidden = self.expert_proj(expert_hidden)
+                    expert_hidden = self.output_proj(expert_hidden)
+                    expert_outputs.append(expert_hidden)
             
             # Combine expert outputs efficiently
             if expert_outputs:
