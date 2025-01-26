@@ -30,16 +30,17 @@ class StreamingDataset(IterableDataset):
         access_token = os.getenv('HF_TOKEN')
         
         # Initialize tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True, access_token=access_token)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "meta-llama/Llama-3.2-1B-Instruct", 
+            use_fast=True, 
+            access_token=access_token
+        )
         self.tokenizer.pad_token = self.tokenizer.eos_token
         
         # Initialize token tracker
         tracker_dir = os.path.join('data', 'token_tracking')
         os.makedirs(tracker_dir, exist_ok=True)
         self.token_tracker = TokenTracker()
-        
-        # Modifions la façon dont nous gérons le dataset
-        self.dataset_iterator = iter(self.dataset)
         
         # Ajouter un buffer préfetch plus grand
         self.prefetch_buffer_size = 20_000  # Augmenté pour réduire les pauses
@@ -70,7 +71,10 @@ class StreamingDataset(IterableDataset):
         # Save tokenizer metadata
         self.save_meta()
         
-        self.reset_dataset()
+        # Initialize dataset and iterator
+        self.dataset = None
+        self.dataset_iterator = None
+        self.reset_dataset()  # This will set up dataset and iterator
     
     def save_meta(self):
         meta = {
