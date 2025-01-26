@@ -174,8 +174,10 @@ class Router(nn.Module):
         # Time the forward pass
         end_time = time.time()
 
+        # Reshape dispatch_mask to [batch_size, seq_len, num_experts]
+        dispatch_mask = normalized_dispatch_mask.view(batch_size, seq_len, self.num_experts)
         
-        return routing_weights.detach(), normalized_dispatch_mask, router_loss
+        return routing_weights.detach(), dispatch_mask, router_loss
 
 class SharedExpertMLP(nn.Module):
     """
@@ -302,6 +304,10 @@ class ExpertGroup(nn.Module):
             # Process all experts in parallel
             expert_outputs = []
             masks = []
+            
+            # Ensure expert_weights has correct shape [batch_size, seq_len, num_experts]
+            if expert_weights.dim() == 2:
+                expert_weights = expert_weights.view(batch_size, seq_len, -1)
             
             # Create masks for each expert
             for i in range(self.num_experts):
@@ -497,6 +503,12 @@ class MoEBlock(nn.Module):
         # MoE layer
         moe_input = self.ln_2(x)
         routing_weights, dispatch_mask, router_loss = self.router(moe_input)
+        
+        # Ensure dispatch_mask has correct shape
+        if dispatch_mask.dim() == 2:
+            batch_size, seq_len = x.shape[:2]
+            dispatch_mask = dispatch_mask.view(batch_size, seq_len, -1)
+            
         expert_output = self.expert_group(moe_input, dispatch_mask)
         x = x + expert_output
         
