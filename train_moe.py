@@ -662,21 +662,13 @@ if compile:
             options={
                 "max_autotune": True,
                 "epilogue_fusion": True,
-                "triton.cudagraphs": False,
+                "triton.cudagraphs": True,  # Activé
                 "trace.graph_diagram": False,
-                "layout_optimization": True,
+                # Ajouter des options pour mieux gérer les formes dynamiques
+                "dynamic_shapes": True,
+                "dynamic_memory": True,
+                "max_parallel_block_sizes": 6,
                 "max_autotune_gemm": True,
-                "max_autotune_pointwise": True,
-                "triton.persistent_reductions": True,
-                "triton.unique_kernel_names": True,
-                "triton.store_cubin": True,
-                "max_fusion_size": 32,  # Réduit encore plus
-                "permute_fusion": True,
-                "aggressive_fusion": False,
-                "max_autotune_gemm_backends": "triton",
-                "coordinate_descent_tuning": True,
-                "combo_kernels": False,  # Désactivé pour économiser la mémoire
-                "combo_kernels_autotune": 1
             }
         )
     except Exception as e:
