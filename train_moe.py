@@ -767,77 +767,54 @@ window_size = 10   # Taille de la fenêtre pour la moyenne glissante
 print(f"Starting training with {num_experts} experts and top-{expert_k} routing")
 print_memory_stats("Initial")
 
-# Modifier la classe TimingStats
-class TimingStats:
-    def __init__(self, window_size=10):
-        self.timings = defaultdict(float)
-        self._start_times = {}
-        self.total_time = 0.0
-        self.window_size = window_size
-        self.history = defaultdict(lambda: [])
-        
+# Après la classe TimingStats, ajoutez:
+class AveragedTimingStats:
+    def __init__(self, print_interval=10):
+        self.print_interval = print_interval
+        self.current_stats = TimingStats()
+        self.accumulated_timings = defaultdict(list)
+        self.iter_count = 0
+    
     @contextmanager
     def track(self, name):
-        try:
-            start = time.time()
+        with self.current_stats.track(name):
             yield
-        finally:
-            duration = time.time() - start
-            self.timings[name] += duration
-            self.total_time += duration
-            self.history[name].append(duration)
-            if len(self.history[name]) > self.window_size:
-                self.history[name].pop(0)
     
-    def get_stats(self, use_average=False):
-        # Créer une structure hiérarchique pour les timings
-        hierarchical = defaultdict(dict)
+    def step(self):
+        """Appelé à la fin de chaque itération"""
+        timings, _ = self.current_stats.get_stats()
+        for name, time_value in timings.items():
+            self.accumulated_timings[name].append(time_value)
+        self.iter_count += 1
+        self.current_stats.reset()
+    
+    def should_print(self):
+        return self.iter_count >= self.print_interval
+    
+    def get_averaged_stats(self):
+        """Retourne les statistiques moyennes et réinitialise l'accumulateur"""
+        if not self.accumulated_timings:
+            return {}, {}
+            
+        avg_timings = {
+            name: sum(values) / len(values) 
+            for name, values in self.accumulated_timings.items()
+        }
         
-        for name, value in self.timings.items():
-            if use_average and self.history[name]:
-                value = sum(self.history[name]) / len(self.history[name])
-                
-            if ":" in name:
-                parts = name.split(":")
-                current_dict = hierarchical
-                for i, part in enumerate(parts[:-1]):
-                    if i == len(parts) - 2:
-                        current_dict[part][parts[-1]] = value
-                    else:
-                        current_dict = current_dict[part]
-            else:
-                hierarchical[name] = value
-
-        # Formatter les résultats
-        formatted = []
-        total_time = self.total_time if not use_average else sum(sum(times) / len(times) for times in self.history.values() if times)
+        total_time = sum(avg_timings.values())
+        percentages = {
+            k: (v/total_time)*100 
+            for k, v in avg_timings.items()
+        }
         
-        def format_timing(name, value, level=0, parent_time=total_time):
-            indent = "  " * level
-            pct = (value / parent_time) * 100 if parent_time > 0 else 0
-            return f"{indent}{'└─ ' if level > 0 else ''}{name}: {value*1000:.1f}ms ({pct:.1f}%)"
+        # Réinitialiser les accumulateurs
+        self.accumulated_timings.clear()
+        self.iter_count = 0
+        
+        return avg_timings, percentages
 
-        def process_dict(d, level=0, parent_time=total_time):
-            items = sorted(d.items(), key=lambda x: (sum(x[1].values()) if isinstance(x[1], dict) else x[1]), reverse=True)
-            for name, value in items:
-                if isinstance(value, dict):
-                    subtotal = sum(value.values())
-                    formatted.append(format_timing(name, subtotal, level, parent_time))
-                    for subname, subvalue in sorted(value.items(), key=lambda x: x[1], reverse=True):
-                        formatted.append(format_timing(subname, subvalue, level + 1, subtotal))
-                else:
-                    formatted.append(format_timing(name, value, level, parent_time))
-
-        process_dict(hierarchical)
-        return formatted
-
-    def reset(self):
-        self.timings.clear()
-        self._start_times.clear()
-        self.total_time = 0.0
-
-# Dans la boucle d'entraînement principale:
-timing_stats = TimingStats(window_size=10)  # Moyenne sur 10 itérations
+# Remplacez timing_stats = TimingStats() par:
+timing_stats = AveragedTimingStats(print_interval=10)  # Afficher les stats tous les 10 iterations
 
 # training loop
 while True:
@@ -943,13 +920,18 @@ while True:
                         micro_step == gradient_accumulation_steps - 1
                     )
                 
-                with timing_stats.track("data:load"):
+                with timing_stats.track("forward"), torch.amp.autocast(enabled=True, device_type=device_type):
+                    # Libérer la mémoire des tenseurs précédents
+                    if 'encoder_input' in locals(): del encoder_input
+                    if 'decoder_input' in locals(): del decoder_input
+                    if 'target' in locals(): del target
+                    
                     encoder_input, decoder_input, target = next(train_iterator)
                     encoder_input, decoder_input, target = pad_sequences(
                         encoder_input, decoder_input, target
                     )
-                
-                with timing_stats.track("compute:forward"):
+                    
+                    # Forward pass
                     logits, loss, router_loss = model(encoder_input, decoder_input, target)
                     batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
                     total_tokens += batch_tokens
@@ -958,7 +940,7 @@ while True:
                         tokens_window.pop(0)
                     del logits
                 
-                with timing_stats.track("compute:backward"):
+                with timing_stats.track("backward"):
                     if loss is not None:
                         loss = loss / gradient_accumulation_steps
                         router_loss = router_loss / gradient_accumulation_steps
@@ -972,7 +954,7 @@ while True:
                         total_router_loss += router_loss.item()
                         del loss, router_loss, combined_loss, scaled_loss
 
-                with timing_stats.track("compute:optimizer"):
+                with timing_stats.track("optimizer_step"):
                     if grad_clip != 0.0:
                         scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -982,7 +964,6 @@ while True:
 
         except Exception as e:
             print(f"Training iteration failed: {e}")
-            print(traceback.format_exc())
             cleanup_memory()
             if ddp:
                 dist_barrier()
@@ -997,7 +978,7 @@ while True:
         lossf = total_loss
         router_lossf = total_router_loss
         
-        # Calculer le taux de tokens/s sur la fenêtre glissante 
+        # Calculer le taux de tokens/s sur la fenêtre glissante
         if len(tokens_window) > 1:
             window_time = tokens_window[-1][0] - tokens_window[0][0]
             window_tokens = sum(tokens for _, tokens in tokens_window)
@@ -1012,24 +993,25 @@ while True:
             mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         
-        # Obtenir et afficher les statistiques de timing
-        timing_stats_formatted = timing_stats.get_stats(use_average=True)
+        # Afficher toujours les métriques de base
         print(f"iter {iter_num}: loss {lossf:.4f}, router_loss {router_lossf:.4f}, "
               f"time {dt*1000:.2f}ms, lr {lr:.2e}, "
               f"tt {total_tokens:,}, t/s {current_tokens_per_sec:.2f}, "
               f"avgt/s {avg_tokens_per_sec:.2f}")
-        print("Timing breakdown:")
-        for stat in timing_stats_formatted:
-            print(stat)
         
-        # Afficher le timing breakdown tous les 10 iterations avec la moyenne
-        if iter_num % (log_interval * 10) == 0:
-            timing_stats_formatted = timing_stats.get_stats(use_average=True)
-            print("\nTiming breakdown (average over last 10 iterations):")
-            for stat in timing_stats_formatted:
-                print(stat)
+        # Accumuler les stats de timing
+        timing_stats.step()
         
-        timing_stats.reset()
+        # Afficher les statistiques détaillées de timing uniquement tous les X iterations
+        if timing_stats.should_print():
+            avg_timings, percentages = timing_stats.get_averaged_stats()
+            if avg_timings:  # Si nous avons des données à afficher
+                timing_str = " | ".join([
+                    f"{k}: {v*1000:.1f}ms ({percentages[k]:.1f}%)" 
+                    for k, v in sorted(avg_timings.items(), key=lambda x: x[1], reverse=True)
+                ])
+                print(f"Average timing over last {timing_stats.print_interval} iterations:")
+                print(f"Timing breakdown: {timing_str}")
 
     iter_num += 1
     local_iter_num += 1
