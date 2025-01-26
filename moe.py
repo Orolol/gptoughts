@@ -59,8 +59,8 @@ class Router(nn.Module):
             persistent=False)
         
         # Scaling factors pour les pertes (réduits pour plus de stabilité)
-        self.router_z_loss_coef = 0.0001  # Réduit de 0.001
-        self.load_balance_coef = 0.0001   # Réduit de 0.001
+        self.router_z_loss_coef = 0.01  # Réduit de 0.001
+        self.load_balance_coef = 0.01   # Réduit de 0.001
         
         # Température plus élevée pour un softmax plus doux
         self.register_buffer('temperature', torch.ones(1) * 0.1)  # Augmenté de 0.07 à 0.1
@@ -566,14 +566,6 @@ class MoEEncoderDecoderGPT(nn.Module):
         self.apply(self._init_weights)
         
         self.timing_stats = None  # Pour stocker l'objet timing_stats
-        
-        # Ajouter des buffers pour le prefetching
-        self.prefetch_size = 2
-        self.current_batch = None
-        self.next_batch = None
-        
-        # Activer le mode asynchrone
-        self.async_mode = True
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -593,43 +585,16 @@ class MoEEncoderDecoderGPT(nn.Module):
     def forward(self, encoder_idx: torch.Tensor, decoder_idx: torch.Tensor, 
                 targets: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         device = encoder_idx.device
-        
-        # Prefetch next batch asynchronously
-        if self.async_mode:
-            with torch.cuda.stream(torch.cuda.Stream()):
-                if self.next_batch is None:
-                    self.next_batch = {
-                        'encoder_pos': torch.arange(0, encoder_idx.size(1), device=device),
-                        'decoder_pos': torch.arange(0, decoder_idx.size(1), device=device)
-                    }
-                    
-                # Précharger les embeddings de la prochaine batch
-                self.next_batch['encoder_emb'] = self.shared_embedding(encoder_idx)
-                self.next_batch['decoder_emb'] = self.shared_embedding(decoder_idx)
-        
-        # Utiliser les données préchargées si disponibles
-        if self.current_batch is not None:
-            encoder_pos = self.current_batch['encoder_pos']
-            decoder_pos = self.current_batch['decoder_pos']
-            encoder_emb = self.current_batch['encoder_emb']
-            decoder_emb = self.current_batch['decoder_emb']
-        else:
-            encoder_pos = torch.arange(0, encoder_idx.size(1), device=device)
-            decoder_pos = torch.arange(0, decoder_idx.size(1), device=device)
-            encoder_emb = self.shared_embedding(encoder_idx)
-            decoder_emb = self.shared_embedding(decoder_idx)
-        
-        # Swap buffers
-        self.current_batch = self.next_batch
-        self.next_batch = None
-        
         total_router_loss = torch.tensor(0.0, device=device)
         
         track = self.timing_stats.track if self.timing_stats is not None else nullcontext
         
         with track("forward"):
             with track("encoder"):
+                # Encoder
                 with track("embeddings"):
+                    encoder_pos = torch.arange(0, encoder_idx.size(1), device=device)
+                    encoder_emb = self.shared_embedding(encoder_idx)
                     encoder_pos_emb = self.shared_pos_embedding(encoder_pos)
                     encoder_pos_emb = encoder_pos_emb.unsqueeze(0).expand(encoder_idx.size(0), -1, -1)
                     x = self.encoder.drop(encoder_emb + encoder_pos_emb)
@@ -652,7 +617,10 @@ class MoEEncoderDecoderGPT(nn.Module):
                     encoder_output = self.encoder.ln_f(x)
             
             with track("decoder"):
+                # Embeddings
                 with track("embeddings"):
+                    decoder_pos = torch.arange(0, decoder_idx.size(1), device=device)
+                    decoder_emb = self.shared_embedding(decoder_idx)
                     decoder_pos_emb = self.shared_pos_embedding(decoder_pos)
                     decoder_pos_emb = decoder_pos_emb.unsqueeze(0).expand(decoder_idx.size(0), -1, -1)
                     x = self.decoder.drop(decoder_emb + decoder_pos_emb)

@@ -205,46 +205,37 @@ if torch.cuda.is_available():
         # Ajustements spécifiques selon le GPU
         if is_ampere:
             # Optimisations A100
-            batch_size = 92
-            gradient_accumulation_steps = 1
+            batch_size = 92  # Réduit pour éviter OOM
+            gradient_accumulation_steps = 1  # Augmenté pour compenser
             
-            # Configuration mémoire CUDA optimisée
-            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
-                "max_split_size_mb:512,"
-                "garbage_collection_threshold:0.9,"  # Augmenté pour moins de GC
-                "expandable_segments:True,"
-                "roundup_power2_divisions:16"  # Optimise l'allocation mémoire
-            )
-            
-            # Optimisations de performance
+            # Optimisations mémoire et calcul
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.set_float32_matmul_precision('high')
             
-            # Optimisations mémoire
-            torch.cuda.empty_cache()
-            torch.cuda.memory.set_per_process_memory_fraction(0.95)
+            # CUDA Graph optimizations
+            torch._inductor.config.triton.cudagraph_trees = True
+            torch._inductor.config.coordinate_descent_tuning = True
+            torch._inductor.config.triton.unique_kernel_names = True
+            torch._inductor.config.fx_graph_cache = True
             
-            # Désactiver le garbage collector Python pendant l'entraînement
-            gc.disable()
-            
-            # Optimisations NCCL pour le multi-GPU
+            # Additional A100 optimizations
+            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+            os.environ["CUDA_MODULE_LOADING"] = "LAZY"
             os.environ["NCCL_NSOCKS_PERTHREAD"] = "4"
             os.environ["NCCL_SOCKET_NTHREADS"] = "4"
             os.environ["NCCL_MIN_NCHANNELS"] = "4"
-            os.environ["NCCL_BUFFSIZE"] = "2097152"
             
-            # Optimisations CUDA
-            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-            os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
-            
-            # Activer le mode déterministe pour plus de stabilité
-            torch.backends.cudnn.deterministic = False
-            torch.backends.cudnn.benchmark = True
-            
-            # Optimisations pour réduire la fragmentation mémoire
-            torch.cuda.set_per_process_memory_fraction(0.95)
+            # Memory management
+            torch.cuda.empty_cache()
             torch.cuda.memory.set_per_process_memory_fraction(0.95)
+            
+            # Disable JIT cache
+            torch.jit.set_fusion_strategy([('DYNAMIC', 3)])
+            
+            # Prefetch and overlap optimizations
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
         elif is_ada:
             # Optimisations 4090
             batch_size = 18
@@ -1060,38 +1051,4 @@ if device_type == 'cuda':
 
 if master_process:
     print("Training finished!")
-
-def get_datasets(block_size, batch_size, device):
-    train_dataset = StreamingDataset(
-        block_size=block_size,
-        batch_size=batch_size,
-        split='train',
-        device=device
-    )
-    
-    val_dataset = StreamingDataset(
-        block_size=block_size,
-        batch_size=batch_size,
-        split='validation',
-        device=device
-    )
-    
-    # Wrap avec DataLoader pour le parallélisme
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=None,  # Dataset gère déjà le batching
-        num_workers=4,
-        pin_memory=True,
-        prefetch_factor=2
-    )
-    
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=None,
-        num_workers=2,
-        pin_memory=True,
-        prefetch_factor=2
-    )
-    
-    return train_loader, val_loader
 
