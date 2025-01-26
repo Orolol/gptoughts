@@ -719,13 +719,21 @@ class MoEEncoderDecoderGPT(nn.Module):
             decoder_x = self.decoder.drop(decoder_emb + decoder_pos_emb)
             
             # Decoder layers
-            for block, cross_attn in zip(self.decoder.h, self.cross_attention):
+            for layer_idx, (block, cross_attn, cross_ln) in enumerate(zip(
+                self.decoder.h, 
+                self.cross_attention, 
+                self.cross_ln
+            )):
                 # Self-attention
                 decoder_x = decoder_x + block.attn(block.ln_1(decoder_x))
                 
                 # Cross-attention
-                cross_x = self.cross_ln[i](decoder_x)
-                cross_output = cross_attn(cross_x, key_value=encoder_output)
+                cross_x = cross_ln(decoder_x)
+                cross_output = cross_attn(
+                    cross_x, 
+                    key_value=encoder_output,
+                    is_generation=True
+                )
                 decoder_x = decoder_x + cross_output
                 
                 # MoE layer
