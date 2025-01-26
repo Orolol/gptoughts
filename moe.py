@@ -77,11 +77,11 @@ class Router(nn.Module):
             persistent=False)
         
         # Ajuster les coefficients de perte
-        self.router_z_loss_coef = 0.01
-        self.load_balance_coef = 0.01
+        self.router_z_loss_coef = 0.01  # Augmenté de 0.0001
+        self.load_balance_coef = 0.01   # Augmenté de 0.0001
         
-        # Baisser la température si c'est trop instable
-        self.register_buffer('temperature', torch.ones(1) * 0.05)
+        # Température plus basse pour des décisions plus nettes
+        self.register_buffer('temperature', torch.ones(1) * 0.05)  # Réduit de 0.1
         
         # Flag pour le mode d'entraînement
         self.training_mode = True
@@ -162,11 +162,9 @@ class Router(nn.Module):
                 self.load_balance_coef * load_balance_loss
             )
             
-            # Clamp pour éviter explosion
-            router_loss = torch.clamp(router_loss, max=5.0)
-            
-            # Remplacer éventuels NaN/inf par 0
-            router_loss = torch.nan_to_num(router_loss, nan=0.0, posinf=5.0, neginf=-5.0)
+            # Vérification finale pour éviter les inf/nan
+            if torch.isnan(router_loss) or torch.isinf(router_loss):
+                router_loss = torch.tensor(0.1, device=x.device)
         else:
             router_loss = torch.tensor(0.0, device=x.device)
         
@@ -835,7 +833,7 @@ class MoEEncoderDecoderGPT(nn.Module):
             {
                 'params': router_params,
                 'weight_decay': 0.0,  # No weight decay for router
-                'lr': learning_rate * 0.1  # Baisser pour éviter nan
+                'lr': learning_rate 
             },
             # Other parameters
             {

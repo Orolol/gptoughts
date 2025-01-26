@@ -604,6 +604,7 @@ if compile:
                 "trace.enabled": False,  # Désactiver le tracing
                 "trace.graph_diagram": False,
                 "debug": False,  # Désactiver le debug
+                "verbose": False  # Désactiver les messages verbeux
             }
         )
     except Exception as e:
