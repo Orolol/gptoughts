@@ -652,7 +652,7 @@ if compile:
             options={
                 "max_autotune": True,
                 "epilogue_fusion": True,
-                "triton.cudagraphs": True,
+                "triton.cudagraphs": False,  # Désactivé pour éviter les problèmes de mémoire
                 "trace.graph_diagram": False,
                 "layout_optimization": True,
                 "max_autotune_gemm": True,
