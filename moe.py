@@ -803,14 +803,14 @@ class MoEEncoderDecoderGPT(nn.Module):
                 other_params.append(param)
         
         # Debug print
-        print("\nParameter classification:")
-        for name, param in param_dict.items():
-            if any(expert_type in name.lower() for expert_type in ['expert_group', 'shared_mlp', 'expert_proj', 'expert_adapters']):
-                print(f"Expert param: {name} - {param.numel():,} parameters")
-            elif 'router' in name.lower():
-                print(f"Router param: {name} - {param.numel():,} parameters")
-            else:
-                print(f"Other param: {name} - {param.numel():,} parameters")
+        # print("\nParameter classification:")
+        # for name, param in param_dict.items():
+        #     if any(expert_type in name.lower() for expert_type in ['expert_group', 'shared_mlp', 'expert_proj', 'expert_adapters']):
+        #         print(f"Expert param: {name} - {param.numel():,} parameters")
+        #     elif 'router' in name.lower():
+        #         print(f"Router param: {name} - {param.numel():,} parameters")
+        #     else:
+        #         print(f"Other param: {name} - {param.numel():,} parameters")
         
         # Create optimizer groups with different hyperparameters
         optim_groups = [
