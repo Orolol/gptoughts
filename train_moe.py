@@ -622,6 +622,81 @@ class AveragedTimingStats:
     def should_print(self):
         return self.iter_count >= self.print_interval
     
+    def _format_timing_stats(self, avg_timings, percentages):
+        """Format timing stats in a hierarchical and readable way"""
+        # Regrouper les statistiques par catégorie
+        categories = {
+            'encoder': {'total': 0.0, 'layers': defaultdict(float), 'other': 0.0},
+            'decoder': {'total': 0.0, 'layers': defaultdict(float), 'other': 0.0},
+            'other': 0.0
+        }
+        
+        for name, time in avg_timings.items():
+            parts = name.split('/')
+            if 'optimization' in parts:
+                parts = parts[1:]  # Ignorer le préfixe optimization
+            
+            if not parts:
+                continue
+                
+            if parts[0] == 'encoder':
+                if len(parts) > 1:
+                    if 'layer' in parts[1]:
+                        layer_num = parts[1]
+                        if len(parts) > 2:
+                            categories['encoder']['layers'][layer_num][parts[2]] = time
+                    else:
+                        categories['encoder']['other'] += time
+                categories['encoder']['total'] += time
+            elif parts[0] == 'decoder':
+                if len(parts) > 1:
+                    if 'layer' in parts[1]:
+                        layer_num = parts[1]
+                        if len(parts) > 2:
+                            categories['decoder']['layers'][layer_num][parts[2]] = time
+                    else:
+                        categories['decoder']['other'] += time
+                categories['decoder']['total'] += time
+            else:
+                categories['other'] += time
+        
+        # Formatter la sortie
+        lines = []
+        total_time = sum(avg_timings.values())
+        
+        # Encoder stats
+        enc = categories['encoder']
+        lines.append(f"Encoder: {enc['total']*1000:.1f}ms ({enc['total']/total_time*100:.1f}%)")
+        if enc['layers']:
+            # Calculer les moyennes par type d'opération
+            ops_avg = defaultdict(list)
+            for layer_stats in enc['layers'].values():
+                for op, time in layer_stats.items():
+                    ops_avg[op].append(time)
+            
+            for op, times in ops_avg.items():
+                avg_time = sum(times) / len(times)
+                lines.append(f"  {op}: {avg_time*1000:.1f}ms/layer")
+        
+        # Decoder stats
+        dec = categories['decoder']
+        lines.append(f"Decoder: {dec['total']*1000:.1f}ms ({dec['total']/total_time*100:.1f}%)")
+        if dec['layers']:
+            ops_avg = defaultdict(list)
+            for layer_stats in dec['layers'].values():
+                for op, time in layer_stats.items():
+                    ops_avg[op].append(time)
+            
+            for op, times in ops_avg.items():
+                avg_time = sum(times) / len(times)
+                lines.append(f"  {op}: {avg_time*1000:.1f}ms/layer")
+        
+        # Other stats
+        if categories['other'] > 0:
+            lines.append(f"Other: {categories['other']*1000:.1f}ms ({categories['other']/total_time*100:.1f}%)")
+        
+        return "\n".join(lines)
+
     def get_averaged_stats(self):
         """Retourne les statistiques moyennes et réinitialise l'accumulateur"""
         if not self.accumulated_timings:
@@ -637,6 +712,11 @@ class AveragedTimingStats:
             k: (v/total_time)*100 
             for k, v in avg_timings.items()
         }
+        
+        # Formater les statistiques
+        formatted_stats = self._format_timing_stats(avg_timings, percentages)
+        print(f"\nTiming breakdown over last {self.print_interval} iterations:")
+        print(formatted_stats)
         
         # Réinitialiser les accumulateurs
         self.accumulated_timings.clear()
