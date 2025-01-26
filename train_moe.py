@@ -945,14 +945,24 @@ while True:
                         
                         with torch.cuda.stream(stream):
                             # Forward pass
-                            with ctx:
-                                logits, loss, router_loss = model(encoder_input, decoder_input, target)
+                            logits, loss, router_loss = model(encoder_input, decoder_input, target)
+                            
+                            if loss is not None:
+                                loss = loss / gradient_accumulation_steps
+                                router_loss = router_loss / gradient_accumulation_steps
+                                combined_loss = loss + router_aux_loss_coef * router_loss
                                 
-                                if loss is not None:
-                                    # Scale loss pour mixed precision
-                                    scaled_loss = scaler.scale(loss + router_aux_loss_coef * router_loss)
+                                # Scale loss pour mixed precision
+                                with ctx:
+                                    scaled_loss = scaler.scale(combined_loss)
                                     scaled_loss.backward()
-                
+                                
+                                total_loss += loss.item()
+                                total_router_loss += router_loss.item()
+                                
+                                # Libérer la mémoire immédiatement
+                                del loss, router_loss, combined_loss, scaled_loss
+
                     batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
                     total_tokens += batch_tokens
                     tokens_window.append((time.time(), batch_tokens))
@@ -960,20 +970,6 @@ while True:
                         tokens_window.pop(0)
                     del logits
                 
-                with timing_stats.track("backward"):
-                    if loss is not None:
-                        loss = loss / gradient_accumulation_steps
-                        router_loss = router_loss / gradient_accumulation_steps
-                        combined_loss = loss + router_aux_loss_coef * router_loss
-                        
-                        # Backward pass
-                        scaled_loss = scaler.scale(combined_loss)
-                        scaled_loss.backward()
-                        
-                        total_loss += loss.item()
-                        total_router_loss += router_loss.item()
-                        del loss, router_loss, combined_loss, scaled_loss
-
                 with timing_stats.track("optimizer_step"):
                     if grad_clip != 0.0:
                         scaler.unscale_(optimizer)
