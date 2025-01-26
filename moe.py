@@ -11,6 +11,16 @@ import gc
 import time
 from contextlib import nullcontext
 
+class DummyTimingContext:
+    @contextmanager
+    def track(self, name):
+        yield
+
+def get_timing_stats():
+    """Get timing_stats from globals or return a dummy context manager"""
+    timing_stats = globals().get('timing_stats')
+    return timing_stats if timing_stats is not None else DummyTimingContext()
+
 class Router(nn.Module):
     """
     Router module that determines which expert should process each token.
@@ -543,7 +553,7 @@ class MoEEncoderDecoderGPT(nn.Module):
         device = encoder_idx.device
         
         # Get timing_stats from global scope if available
-        timing_stats = globals().get('timing_stats', nullcontext())
+        timing_stats = get_timing_stats()
         
         # Ensure input has correct shape
         if encoder_idx.dim() == 1:

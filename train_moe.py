@@ -982,6 +982,7 @@ while True:
 
         except Exception as e:
             print(f"Training iteration failed: {e}")
+            print(traceback.format_exc())
             cleanup_memory()
             if ddp:
                 dist_barrier()
