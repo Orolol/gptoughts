@@ -146,12 +146,9 @@ if torch.cuda.is_available():
             os.environ["NCCL_NET_GDR_READ"] = "1"
             
             # Gestion de la mémoire plus agressive
-            torch.cuda.set_per_process_memory_fraction(0.8)  # Encore plus réduit
+            torch.cuda.set_per_process_memory_fraction(0.9)  # Encore plus réduit
             torch.cuda.empty_cache()
             
-            # Activer le garbage collector périodique
-            gc.enable()
-            gc.collect()
             
             # Optimisations pour les grands batches
             torch._inductor.config.coordinate_descent_tuning = True
@@ -624,10 +621,27 @@ class AveragedTimingStats:
     
     def _format_timing_stats(self, avg_timings, percentages):
         """Format timing stats in a hierarchical and readable way"""
-        # Regrouper les statistiques par catégorie
-        categories = {
-            'encoder': {'total': 0.0, 'layers': defaultdict(float), 'other': 0.0},
-            'decoder': {'total': 0.0, 'layers': defaultdict(float), 'other': 0.0},
+        # Regrouper les statistiques par type d'opération
+        stats = {
+            'encoder': {
+                'attention': [],
+                'moe': {
+                    'router': [],
+                    'experts': []
+                },
+                'other': 0.0,
+                'total': 0.0
+            },
+            'decoder': {
+                'self_attention': [],
+                'cross_attention': [],
+                'moe': {
+                    'router': [],
+                    'experts': []
+                },
+                'other': 0.0,
+                'total': 0.0
+            },
             'other': 0.0
         }
         
@@ -640,60 +654,72 @@ class AveragedTimingStats:
                 continue
                 
             if parts[0] == 'encoder':
-                if len(parts) > 1:
-                    if 'layer' in parts[1]:
-                        layer_num = parts[1]
-                        if len(parts) > 2:
-                            categories['encoder']['layers'][layer_num][parts[2]] = time
-                    else:
-                        categories['encoder']['other'] += time
-                categories['encoder']['total'] += time
+                stats['encoder']['total'] += time
+                if 'attention' in name:
+                    stats['encoder']['attention'].append(time)
+                elif 'moe/router' in name:
+                    stats['encoder']['moe']['router'].append(time)
+                elif 'moe/experts' in name:
+                    stats['encoder']['moe']['experts'].append(time)
+                elif not any(x in name for x in ['layer', 'moe', 'attention']):
+                    stats['encoder']['other'] += time
+                
             elif parts[0] == 'decoder':
-                if len(parts) > 1:
-                    if 'layer' in parts[1]:
-                        layer_num = parts[1]
-                        if len(parts) > 2:
-                            categories['decoder']['layers'][layer_num][parts[2]] = time
-                    else:
-                        categories['decoder']['other'] += time
-                categories['decoder']['total'] += time
+                stats['decoder']['total'] += time
+                if 'self_attention' in name:
+                    stats['decoder']['self_attention'].append(time)
+                elif 'cross_attention' in name:
+                    stats['decoder']['cross_attention'].append(time)
+                elif 'moe/router' in name:
+                    stats['decoder']['moe']['router'].append(time)
+                elif 'moe/experts' in name:
+                    stats['decoder']['moe']['experts'].append(time)
+                elif not any(x in name for x in ['layer', 'moe', 'attention']):
+                    stats['decoder']['other'] += time
             else:
-                categories['other'] += time
+                stats['other'] += time
         
         # Formatter la sortie
         lines = []
         total_time = sum(avg_timings.values())
         
+        def format_time(time_value, total=total_time):
+            return f"{time_value*1000:.1f}ms ({time_value/total*100:.1f}%)"
+        
+        def avg_time(times):
+            if not times:
+                return 0.0
+            return sum(times) / len(times)
+        
         # Encoder stats
-        enc = categories['encoder']
-        lines.append(f"Encoder: {enc['total']*1000:.1f}ms ({enc['total']/total_time*100:.1f}%)")
-        if enc['layers']:
-            # Calculer les moyennes par type d'opération
-            ops_avg = defaultdict(list)
-            for layer_stats in enc['layers'].values():
-                for op, time in layer_stats.items():
-                    ops_avg[op].append(time)
-            
-            for op, times in ops_avg.items():
-                avg_time = sum(times) / len(times)
-                lines.append(f"  {op}: {avg_time*1000:.1f}ms/layer")
+        enc = stats['encoder']
+        lines.append(f"Encoder: {format_time(enc['total'])}")
+        if enc['attention']:
+            lines.append(f"  Attention: {format_time(avg_time(enc['attention']))} (per layer)")
+        if enc['moe']['router']:
+            lines.append(f"  Router: {format_time(avg_time(enc['moe']['router']))} (per layer)")
+        if enc['moe']['experts']:
+            lines.append(f"  Experts: {format_time(avg_time(enc['moe']['experts']))} (per layer)")
+        if enc['other'] > 0:
+            lines.append(f"  Other: {format_time(enc['other'])}")
         
         # Decoder stats
-        dec = categories['decoder']
-        lines.append(f"Decoder: {dec['total']*1000:.1f}ms ({dec['total']/total_time*100:.1f}%)")
-        if dec['layers']:
-            ops_avg = defaultdict(list)
-            for layer_stats in dec['layers'].values():
-                for op, time in layer_stats.items():
-                    ops_avg[op].append(time)
-            
-            for op, times in ops_avg.items():
-                avg_time = sum(times) / len(times)
-                lines.append(f"  {op}: {avg_time*1000:.1f}ms/layer")
+        dec = stats['decoder']
+        lines.append(f"\nDecoder: {format_time(dec['total'])}")
+        if dec['self_attention']:
+            lines.append(f"  Self-Attention: {format_time(avg_time(dec['self_attention']))} (per layer)")
+        if dec['cross_attention']:
+            lines.append(f"  Cross-Attention: {format_time(avg_time(dec['cross_attention']))} (per layer)")
+        if dec['moe']['router']:
+            lines.append(f"  Router: {format_time(avg_time(dec['moe']['router']))} (per layer)")
+        if dec['moe']['experts']:
+            lines.append(f"  Experts: {format_time(avg_time(dec['moe']['experts']))} (per layer)")
+        if dec['other'] > 0:
+            lines.append(f"  Other: {format_time(dec['other'])}")
         
         # Other stats
-        if categories['other'] > 0:
-            lines.append(f"Other: {categories['other']*1000:.1f}ms ({categories['other']/total_time*100:.1f}%)")
+        if stats['other'] > 0:
+            lines.append(f"\nOther: {format_time(stats['other'])}")
         
         return "\n".join(lines)
 
