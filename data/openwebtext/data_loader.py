@@ -118,22 +118,48 @@ class StreamingDataset(IterableDataset):
                 with torch.cuda.stream(self.prefetch_stream):
                     # Remplir le buffer en arrière-plan
                     print("Filling token buffer")
-                    while len(self.token_buffer) < self.prefetch_buffer_size:
+                    
+                    # Ajouter une limite au nombre de tentatives de remplissage
+                    fill_attempts = 0
+                    max_fill_attempts = 100  # Limite raisonnable
+                    
+                    while len(self.token_buffer) < self.prefetch_buffer_size and fill_attempts < max_fill_attempts:
                         try:
                             example = next(self.dataset_iterator)
+                            if not example or 'text' not in example:
+                                print("Invalid example received")
+                                continue
+                                
                             new_tokens = self.process_example(example)
+                            if not new_tokens:
+                                print("No tokens generated from example")
+                                continue
+                                
                             self.token_buffer.extend(new_tokens)
                             self.token_tracker.update(len(new_tokens))
+                            
+                            # Afficher la progression
+                            if fill_attempts % 10 == 0:
+                                print(f"Buffer size: {len(self.token_buffer)}/{self.prefetch_buffer_size}")
+                                
                         except StopIteration:
-                            # Reset le dataset si on atteint la fin
+                            print("Reached end of dataset, resetting")
                             self.reset_dataset()
-                            continue
+                        
+                        fill_attempts += 1
                     
-                    # S'assurer qu'on a assez de tokens
-                    if len(self.token_buffer) < self.block_size * self.batch_size * 2:
+                    if fill_attempts >= max_fill_attempts:
+                        print(f"Failed to fill buffer after {max_fill_attempts} attempts")
+                        raise RuntimeError("Failed to fill token buffer")
+                    
+                    # Vérifier qu'on a assez de tokens pour un batch
+                    required_tokens = self.block_size * self.batch_size * 2
+                    if len(self.token_buffer) < required_tokens:
+                        print(f"Not enough tokens: {len(self.token_buffer)}/{required_tokens}")
+                        retry_count += 1
                         continue
                     
-                    print("Got enough tokens")
+                    print(f"Got enough tokens: {len(self.token_buffer)}")
                     
                     total_length = self.block_size * self.batch_size
                     
