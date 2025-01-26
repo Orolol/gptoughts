@@ -565,6 +565,74 @@ model_args = {
     'expert_k': expert_k
 }
 
+
+# Modifiez la classe TimingStats pour supporter le nested timing
+class TimingStats:
+    def __init__(self):
+        self.timings = defaultdict(float)
+        self._start_times = {}
+        self._active_scopes = []
+    
+    @contextmanager
+    def track(self, name):
+        # Construire le nom complet avec le scope
+        full_name = "/".join(self._active_scopes + [name]) if self._active_scopes else name
+        try:
+            self._start_times[full_name] = time.time()
+            self._active_scopes.append(name)
+            yield
+        finally:
+            if full_name in self._start_times:
+                self.timings[full_name] += time.time() - self._start_times[full_name]
+                del self._start_times[full_name]
+            self._active_scopes.pop()
+
+class AveragedTimingStats:
+    def __init__(self, print_interval=10):
+        self.print_interval = print_interval
+        self.current_stats = TimingStats()
+        self.accumulated_timings = defaultdict(list)
+        self.iter_count = 0
+    
+    @contextmanager
+    def track(self, name):
+        with self.current_stats.track(name):
+            yield
+    
+    def step(self):
+        """Appelé à la fin de chaque itération"""
+        timings, _ = self.current_stats.get_stats()
+        for name, time_value in timings.items():
+            self.accumulated_timings[name].append(time_value)
+        self.iter_count += 1
+        self.current_stats.reset()
+    
+    def should_print(self):
+        return self.iter_count >= self.print_interval
+    
+    def get_averaged_stats(self):
+        """Retourne les statistiques moyennes et réinitialise l'accumulateur"""
+        if not self.accumulated_timings:
+            return {}, {}
+            
+        avg_timings = {
+            name: sum(values) / len(values) 
+            for name, values in self.accumulated_timings.items()
+        }
+        
+        total_time = sum(avg_timings.values())
+        percentages = {
+            k: (v/total_time)*100 
+            for k, v in avg_timings.items()
+        }
+        
+        # Réinitialiser les accumulateurs
+        self.accumulated_timings.clear()
+        self.iter_count = 0
+        
+        return avg_timings, percentages
+
+
 # Model initialization
 iter_num = 1
 best_val_loss = float('inf')
@@ -679,6 +747,24 @@ if compile:
         print(traceback.format_exc())
         compile = False
 
+# Remplacez timing_stats = TimingStats() par:
+timing_stats = AveragedTimingStats(print_interval=10)  # Afficher les stats tous les 10 iterations
+# Après la création du modèle et avant de le déplacer sur le device
+model.set_timing_stats(timing_stats)
+
+# Si vous utilisez DDP, modifiez aussi:
+if ddp:
+    model = DDP(
+        model,
+        device_ids=[ddp_local_rank],
+        output_device=ddp_local_rank,
+        broadcast_buffers=False,
+        find_unused_parameters=False,
+        gradient_as_bucket_view=True
+    )
+    # Assurez-vous que timing_stats est accessible dans le modèle wrappé
+    model.module.set_timing_stats(timing_stats)
+
 model.to(device)
 
 # CUDA optimizations
@@ -729,28 +815,6 @@ if device_type == 'cuda':
 # Configure gradient scaler
 scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
 
-# wrap model into DDP container
-if ddp:
-    model = DDP(
-        model,
-        device_ids=[ddp_local_rank],
-        output_device=ddp_local_rank,
-        broadcast_buffers=False,
-        find_unused_parameters=False,
-        gradient_as_bucket_view=True
-    )
-    
-    if os.environ.get('TORCH_DISTRIBUTED_DEBUG', '').upper() in ('INFO', 'DETAIL'):
-        def print_unused_parameters(model):
-            for name, param in model.named_parameters():
-                if param.grad is None:
-                    print(f"Parameter without gradient: {name}")
-        
-        def hook(state):
-            print_unused_parameters(model.module)
-        
-        model.register_comm_hook(None, hook)
-
 # Initialize datasets
 train_dataset, val_dataset = get_datasets(block_size, batch_size, device)
 train_iterator = iter(train_dataset)
@@ -768,74 +832,7 @@ window_size = 10   # Taille de la fenêtre pour la moyenne glissante
 print(f"Starting training with {num_experts} experts and top-{expert_k} routing")
 print_memory_stats("Initial")
 
-# Modifiez la classe TimingStats pour supporter le nested timing
-class TimingStats:
-    def __init__(self):
-        self.timings = defaultdict(float)
-        self._start_times = {}
-        self._active_scopes = []
-    
-    @contextmanager
-    def track(self, name):
-        # Construire le nom complet avec le scope
-        full_name = "/".join(self._active_scopes + [name]) if self._active_scopes else name
-        try:
-            self._start_times[full_name] = time.time()
-            self._active_scopes.append(name)
-            yield
-        finally:
-            if full_name in self._start_times:
-                self.timings[full_name] += time.time() - self._start_times[full_name]
-                del self._start_times[full_name]
-            self._active_scopes.pop()
 
-class AveragedTimingStats:
-    def __init__(self, print_interval=10):
-        self.print_interval = print_interval
-        self.current_stats = TimingStats()
-        self.accumulated_timings = defaultdict(list)
-        self.iter_count = 0
-    
-    @contextmanager
-    def track(self, name):
-        with self.current_stats.track(name):
-            yield
-    
-    def step(self):
-        """Appelé à la fin de chaque itération"""
-        timings, _ = self.current_stats.get_stats()
-        for name, time_value in timings.items():
-            self.accumulated_timings[name].append(time_value)
-        self.iter_count += 1
-        self.current_stats.reset()
-    
-    def should_print(self):
-        return self.iter_count >= self.print_interval
-    
-    def get_averaged_stats(self):
-        """Retourne les statistiques moyennes et réinitialise l'accumulateur"""
-        if not self.accumulated_timings:
-            return {}, {}
-            
-        avg_timings = {
-            name: sum(values) / len(values) 
-            for name, values in self.accumulated_timings.items()
-        }
-        
-        total_time = sum(avg_timings.values())
-        percentages = {
-            k: (v/total_time)*100 
-            for k, v in avg_timings.items()
-        }
-        
-        # Réinitialiser les accumulateurs
-        self.accumulated_timings.clear()
-        self.iter_count = 0
-        
-        return avg_timings, percentages
-
-# Remplacez timing_stats = TimingStats() par:
-timing_stats = AveragedTimingStats(print_interval=10)  # Afficher les stats tous les 10 iterations
 
 # training loop
 while True:
@@ -985,6 +982,7 @@ while True:
 
         except Exception as e:
             print(f"Training iteration failed: {e}")
+            print(traceback.format_exc())
             cleanup_memory()
             if ddp:
                 dist_barrier()

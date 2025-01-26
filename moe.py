@@ -10,6 +10,7 @@ import inspect
 import gc
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 
 class Router(nn.Module):
     """
@@ -523,6 +524,8 @@ class MoEEncoderDecoderGPT(nn.Module):
         
         # Initialize weights
         self.apply(self._init_weights)
+        
+        self.timing_stats = None  # Pour stocker l'objet timing_stats
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -534,6 +537,10 @@ class MoEEncoderDecoderGPT(nn.Module):
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
+
+    def set_timing_stats(self, timing_stats):
+        """Set the timing stats object for detailed profiling"""
+        self.timing_stats = timing_stats
 
     def forward(self, encoder_idx: torch.Tensor, decoder_idx: torch.Tensor, 
                 targets: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
@@ -553,9 +560,12 @@ class MoEEncoderDecoderGPT(nn.Module):
         device = encoder_idx.device
         total_router_loss = torch.tensor(0.0, device=device)
         
-        with timing_stats.track("encoder"):
+        # Utiliser un context manager qui ne fait rien si timing_stats n'est pas défini
+        track = self.timing_stats.track if self.timing_stats is not None else nullcontext
+        
+        with track("encoder"):
             # Process encoder input
-            with timing_stats.track("embeddings"):
+            with track("embeddings"):
                 encoder_pos = torch.arange(0, encoder_idx.size(1), device=device)
                 encoder_emb = self.shared_embedding(encoder_idx)
                 encoder_pos_emb = self.shared_pos_embedding(encoder_pos)
@@ -564,29 +574,29 @@ class MoEEncoderDecoderGPT(nn.Module):
             
             # Encoder forward pass
             for i, block in enumerate(self.encoder.h):
-                with timing_stats.track(f"layer_{i}"):
-                    with timing_stats.track("attention"):
+                with track(f"layer_{i}"):
+                    with track("attention"):
                         attn_output = block.attn(block.ln_1(x))
                         x = x + attn_output
                     
-                    with timing_stats.track("moe"):
-                        with timing_stats.track("router"):
+                    with track("moe"):
+                        with track("router"):
                             moe_input = block.ln_2(x)
                             routing_logits = block.router(moe_input)
                         
-                        with timing_stats.track("experts"):
+                        with track("experts"):
                             expert_outputs = block.expert_group(moe_input, routing_logits)
                             x = x + expert_outputs
                         
                         router_loss = block.router_z_loss * routing_logits.pow(2).mean()
                         total_router_loss = total_router_loss + router_loss
             
-            with timing_stats.track("final_norm"):
+            with track("final_norm"):
                 encoder_output = self.encoder.ln_f(x)
         
-        with timing_stats.track("decoder"):
+        with track("decoder"):
             # Process decoder input
-            with timing_stats.track("embeddings"):
+            with track("embeddings"):
                 decoder_pos = torch.arange(0, decoder_idx.size(1), device=device)
                 decoder_emb = self.shared_embedding(decoder_idx)
                 decoder_pos_emb = self.shared_pos_embedding(decoder_pos)
@@ -595,32 +605,32 @@ class MoEEncoderDecoderGPT(nn.Module):
             
             # Decoder forward pass
             for i, (block, cross_attn) in enumerate(zip(self.decoder.h, self.cross_attention)):
-                with timing_stats.track(f"layer_{i}"):
-                    with timing_stats.track("self_attention"):
+                with track(f"layer_{i}"):
+                    with track("self_attention"):
                         attn_output = block.attn(block.ln_1(x))
                         x = x + attn_output
                     
-                    with timing_stats.track("cross_attention"):
+                    with track("cross_attention"):
                         cross_x = self.cross_ln[i](x)
                         cross_output = cross_attn(cross_x, key_value=encoder_output)
                         x = x + cross_output
                     
-                    with timing_stats.track("moe"):
-                        with timing_stats.track("router"):
+                    with track("moe"):
+                        with track("router"):
                             moe_input = block.ln_2(x)
                             routing_logits = block.router(moe_input)
                         
-                        with timing_stats.track("experts"):
+                        with track("experts"):
                             expert_outputs = block.expert_group(moe_input, routing_logits)
                             x = x + expert_outputs
                         
                         router_loss = block.router_z_loss * routing_logits.pow(2).mean()
                         total_router_loss = total_router_loss + router_loss
             
-            with timing_stats.track("final_norm"):
+            with track("final_norm"):
                 x = self.decoder.ln_f(x)
         
-        with timing_stats.track("head"):
+        with track("head"):
             if targets is not None:
                 logits = self.lm_head(x)
                 loss = F.cross_entropy(
