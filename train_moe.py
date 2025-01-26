@@ -35,6 +35,9 @@ import torch._inductor.config
 import torch._dynamo.config
 from torch.compiler import allow_in_graph
 
+from collections import defaultdict
+from contextlib import contextmanager
+
 # Permettre time.time() dans le graphe
 allow_in_graph(time.time)
 
@@ -764,50 +767,79 @@ window_size = 10   # Taille de la fenêtre pour la moyenne glissante
 print(f"Starting training with {num_experts} experts and top-{expert_k} routing")
 print_memory_stats("Initial")
 
+# Ajoutez cette classe pour le tracking du temps
+class TimingStats:
+    def __init__(self):
+        self.timings = defaultdict(float)
+        self._start_times = {}
+        
+    @contextmanager
+    def track(self, name):
+        try:
+            self._start_times[name] = time.time()
+            yield
+        finally:
+            if name in self._start_times:
+                self.timings[name] += time.time() - self._start_times[name]
+                del self._start_times[name]
+    
+    def get_stats(self):
+        total_time = sum(self.timings.values())
+        percentages = {k: (v/total_time)*100 for k, v in self.timings.items()}
+        return self.timings, percentages
+    
+    def reset(self):
+        self.timings.clear()
+        self._start_times.clear()
+
+# Dans la boucle d'entraînement principale, modifiez comme suit:
+# Juste avant la boucle while True:
+timing_stats = TimingStats()
+
 # training loop
 while True:
     # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+    with timing_stats.track("lr_update"):
+        lr = get_lr(iter_num) if decay_lr else learning_rate
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process and iter_num > 0:
-        print("Validation")
-        losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, "
-              f"train router loss {losses['train_router']:.4f}, "
-              f"train ppl {losses['train_ppl']:.2f}, "
-              f"val loss {losses['val']:.4f}, "
-              f"val router loss {losses['val_router']:.4f}, "
-              f"val ppl {losses['val_ppl']:.2f}")
+        with timing_stats.track("validation"):
+            print("Validation")
+            losses = estimate_loss()
+            print(f"step {iter_num}: train loss {losses['train']:.4f}, "
+                  f"train router loss {losses['train_router']:.4f}, "
+                  f"train ppl {losses['train_ppl']:.2f}, "
+                  f"val loss {losses['val']:.4f}, "
+                  f"val router loss {losses['val_router']:.4f}, "
+                  f"val ppl {losses['val_ppl']:.2f}")
 
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': {k: v.cpu() for k, v in model.state_dict().items()},
-                    'optimizer': {
-                        'state': {k: {sk: sv.cpu() if isinstance(sv, torch.Tensor) else sv 
-                                     for sk, sv in v.items()}
-                                     for k, v in optimizer.state_dict()['state'].items()},
-                        'param_groups': optimizer.state_dict()['param_groups']
-                    },
-                    'scaler': scaler.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                }
-                
-                checkpoint_path = os.path.join(
-                    out_dir,
-                    f'ckpt_iter_{iter_num}_loss_{losses["val"]:.4f}.pt'
-                )
-                
-                torch.save(checkpoint, checkpoint_path)
-                cleanup_old_checkpoints(out_dir)
-                del checkpoint
-                cleanup_memory()
+            if losses['val'] < best_val_loss or always_save_checkpoint:
+                with timing_stats.track("checkpoint"):
+                    best_val_loss = losses['val']
+                    if iter_num > 0:
+                        checkpoint = {
+                            'model': {k: v.cpu() for k, v in model.state_dict().items()},
+                            'optimizer': {
+                                'state': {k: {sk: sv.cpu() if isinstance(sv, torch.Tensor) else sv 
+                                         for sk, sv in v.items()}
+                                         for k, v in optimizer.state_dict()['state'].items()},
+                                'param_groups': optimizer.state_dict()['param_groups']
+                            },
+                            'model_args': model_args,
+                            'iter_num': iter_num,
+                            'best_val_loss': best_val_loss,
+                        }
+                        checkpoint_path = os.path.join(
+                            out_dir,
+                            f'ckpt_iter_{iter_num}_loss_{losses["val"]:.4f}.pt'
+                        )
+                        torch.save(checkpoint, checkpoint_path)
+                        cleanup_old_checkpoints(out_dir)
+                        del checkpoint
+                        cleanup_memory()
 
     # Generate text every 200 iterations
     if iter_num % 500 == 0 and master_process:
@@ -855,70 +887,67 @@ while True:
         break
 
     # forward backward update, with gradient accumulation
-    optimizer.zero_grad(set_to_none=True)
-    total_loss = 0
-    total_router_loss = 0
-    skip_optimizer_step = False
+    with timing_stats.track("optimization"):
+        optimizer.zero_grad(set_to_none=True)
+        total_loss = 0
+        total_router_loss = 0
+        skip_optimizer_step = False
 
-    try:
-        for micro_step in range(gradient_accumulation_steps):
+        try:
+            for micro_step in range(gradient_accumulation_steps):
+                if ddp:
+                    model.require_backward_grad_sync = (
+                        micro_step == gradient_accumulation_steps - 1
+                    )
+                
+                with timing_stats.track("forward"), torch.amp.autocast(enabled=True, device_type=device_type):
+                    # Libérer la mémoire des tenseurs précédents
+                    if 'encoder_input' in locals(): del encoder_input
+                    if 'decoder_input' in locals(): del decoder_input
+                    if 'target' in locals(): del target
+                    
+                    encoder_input, decoder_input, target = next(train_iterator)
+                    encoder_input, decoder_input, target = pad_sequences(
+                        encoder_input, decoder_input, target
+                    )
+                    
+                    # Forward pass
+                    logits, loss, router_loss = model(encoder_input, decoder_input, target)
+                    batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
+                    total_tokens += batch_tokens
+                    tokens_window.append((time.time(), batch_tokens))
+                    if len(tokens_window) > window_size:
+                        tokens_window.pop(0)
+                    del logits
+                
+                with timing_stats.track("backward"):
+                    if loss is not None:
+                        loss = loss / gradient_accumulation_steps
+                        router_loss = router_loss / gradient_accumulation_steps
+                        combined_loss = loss + router_aux_loss_coef * router_loss
+                        
+                        # Backward pass
+                        scaled_loss = scaler.scale(combined_loss)
+                        scaled_loss.backward()
+                        
+                        total_loss += loss.item()
+                        total_router_loss += router_loss.item()
+                        del loss, router_loss, combined_loss, scaled_loss
+
+                with timing_stats.track("optimizer_step"):
+                    if grad_clip != 0.0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    
+                    scaler.step(optimizer)
+                    scaler.update()
+
+        except Exception as e:
+            print(f"Training iteration failed: {e}")
+            cleanup_memory()
             if ddp:
-                model.require_backward_grad_sync = (
-                    micro_step == gradient_accumulation_steps - 1
-                )
-            
-            # Créer un nouveau contexte pour chaque micro-step
-            with torch.amp.autocast(enabled=True, device_type=device_type):
-                # Libérer la mémoire des tenseurs précédents
-                if 'encoder_input' in locals(): del encoder_input
-                if 'decoder_input' in locals(): del decoder_input
-                if 'target' in locals(): del target
-                
-                encoder_input, decoder_input, target = next(train_iterator)
-                encoder_input, decoder_input, target = pad_sequences(
-                    encoder_input, decoder_input, target
-                )
-                
-                # Forward pass
-                logits, loss, router_loss = model(encoder_input, decoder_input, target)
-                batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
-                total_tokens += batch_tokens
-                tokens_window.append((time.time(), batch_tokens))
-                if len(tokens_window) > window_size:
-                    tokens_window.pop(0)
-                del logits  # Libérer immédiatement
-                
-                if loss is not None:
-                    loss = loss / gradient_accumulation_steps
-                    router_loss = router_loss / gradient_accumulation_steps
-                    combined_loss = loss + router_aux_loss_coef * router_loss
-                    
-                    # Backward pass
-                    scaled_loss = scaler.scale(combined_loss)
-                    scaled_loss.backward()
-                    
-                    # Stocker les scalaires et libérer les tenseurs
-                    total_loss += loss.item()
-                    total_router_loss += router_loss.item()
-                    del loss, router_loss, combined_loss, scaled_loss
-            
-            # Synchronisation périodique
-            if micro_step % 2 == 0:
-                torch.cuda.synchronize()
-            
-            if grad_clip != 0.0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            
-            scaler.step(optimizer)
-            scaler.update()
-
-    except Exception as e:
-        print(f"Training iteration failed: {e}")
-        cleanup_memory()
-        if ddp:
-            dist_barrier()
-        continue
+                dist_barrier()
+            continue
 
     # timing and logging
     t1 = time.time()
@@ -937,21 +966,27 @@ while True:
         else:
             current_tokens_per_sec = 0
         
-        
-        
-        # Calculer le temps total d'entraînement
         total_time = time.time() - train_start_time
         avg_tokens_per_sec = total_tokens / total_time if total_time > 0 else 0
         
         if local_iter_num >= 5:
             mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+        
+        # Obtenir et afficher les statistiques de timing
+        timings, percentages = timing_stats.get_stats()
+        timing_str = " | ".join([f"{k}: {v*1000:.1f}ms ({p:.1f}%)" for k, v, p in 
+                                sorted(zip(timings.keys(), timings.values(), percentages.values()),
+                                      key=lambda x: x[1], reverse=True)])
 
-        print(f"iter {iter_num}: loss {lossf:.4f}, router_loss {router_lossf:.4f}, " 
+        print(f"iter {iter_num}: loss {lossf:.4f}, router_loss {router_lossf:.4f}, "
               f"time {dt*1000:.2f}ms, lr {lr:.2e}, "
-              f"tt {total_tokens:,}, "
-              f"t/s {current_tokens_per_sec:.2f}, "
+              f"tt {total_tokens:,}, t/s {current_tokens_per_sec:.2f}, "
               f"avgt/s {avg_tokens_per_sec:.2f}")
+        print(f"Timing breakdown: {timing_str}")
+        
+        # Reset timing stats for next iteration
+        timing_stats.reset()
 
     iter_num += 1
     local_iter_num += 1
