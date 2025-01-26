@@ -113,12 +113,13 @@ if torch.cuda.is_available():
         block_size = 256
         num_experts = 32
         expert_k = 4
-        gradient_accumulation_steps = 2
+        
         
         # Ajustements spécifiques selon le GPU
         if is_ampere:
             # Optimisations A100
             batch_size = 48  # Augmenté pour mieux utiliser la bande passante
+            gradient_accumulation_steps = 1
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             # Optimiser pour le throughput
@@ -127,6 +128,7 @@ if torch.cuda.is_available():
         elif is_ada:
             # Optimisations 4090
             batch_size = 18
+            gradient_accumulation_steps = 2
             # La 4090 a une meilleure latence mais moins de bande passante
             torch.set_num_threads(4)  # Moins de CPU threads
             os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
