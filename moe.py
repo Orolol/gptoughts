@@ -168,7 +168,7 @@ class Router(nn.Module):
         
         # Time the forward pass
         end_time = time.time()
-        print(f"Forward pass time: {end_time - start_time:.4f} seconds")
+
         
         return routing_weights.detach(), normalized_dispatch_mask, router_loss
 

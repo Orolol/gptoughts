@@ -126,25 +126,25 @@ if torch.cuda.is_available():
         decoder_ratio_kv = 8
     elif args.size == "large":
         # Increase batch size and reduce gradient accumulation steps
-        batch_size = 20  
-        block_size = 512
+        batch_size = 32  
+        block_size = 256
         
-        num_experts = 64
+        num_experts = 32
         expert_k = 4
     
         gradient_accumulation_steps = 2
 
         # Encoder config
-        encoder_n_layer = 4
-        encoder_n_head = 4
-        encoder_n_embd = 384
-        encoder_ratio_kv = 4
+        encoder_n_layer = 16
+        encoder_n_head = 16
+        encoder_n_embd = 1024
+        encoder_ratio_kv = 16
         
         # Decoder config
-        decoder_n_layer = 4
-        decoder_n_head = 4
-        decoder_n_embd = 384
-        decoder_ratio_kv = 4
+        decoder_n_layer = 16
+        decoder_n_head = 16
+        decoder_n_embd = 1024
+        decoder_ratio_kv = 16
     
     router_z_loss_coef = 0.001
     router_aux_loss_coef = 0.001
@@ -594,7 +594,6 @@ if compile:
                 "max_autotune": True,
                 "epilogue_fusion": True,
                 "triton.cudagraphs": False,  # Désactivé pour plus de stabilité
-                "trace.enabled": True,
                 "trace.graph_diagram": False,
                 "triton.cudagraphs": True,
             }
