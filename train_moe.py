@@ -668,7 +668,7 @@ if compile:
                 "triton.cudagraphs": True,  # Activé
                 "trace.graph_diagram": False,
                 # Ajouter des options pour mieux gérer les formes dynamiques
-                "dynamic_memory": True,
+                # "dynamic_memory": True,
                 "max_parallel_block_sizes": 6,
                 "max_autotune_gemm": True,
             }
@@ -996,7 +996,7 @@ while True:
         lossf = total_loss
         router_lossf = total_router_loss
         
-        # Calculer le taux de tokens/s sur la fenêtre glissante
+        # Calculer le taux de tokens/s sur la fenêtre glissante 
         if len(tokens_window) > 1:
             window_time = tokens_window[-1][0] - tokens_window[0][0]
             window_tokens = sum(tokens for _, tokens in tokens_window)
