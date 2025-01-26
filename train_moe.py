@@ -276,7 +276,7 @@ min_lr = 6e-5
 
 # DDP settings
 backend = 'nccl'
-compile = True
+compile = False
 
 # Prompts for generation
 PROMPT_TEMPLATES = [
