@@ -123,13 +123,29 @@ if torch.cuda.is_available():
         # Ajustements spécifiques selon le GPU
         if is_ampere:
             # Optimisations A100
-            batch_size = 92  # Augmenté pour mieux utiliser la bande passante
+            batch_size = 128  # On garde cette taille
             gradient_accumulation_steps = 1
+            
+            # Optimisations mémoire et calcul
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             # Optimiser pour le throughput
-            torch.set_num_threads(8)  # CPU threads pour les opérations host
+            torch.set_num_threads(8)
+            
+            # Nouvelles optimisations A100
             os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
+            os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+            os.environ["CUDA_AUTO_BOOST"] = "1"
+            os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+            os.environ["NCCL_P2P_LEVEL"] = "NVL"
+            os.environ["NCCL_NET_GDR_READ"] = "1"
+            
+            # Optimisations pour les grands batches
+            torch._inductor.config.coordinate_descent_tuning = True
+            torch._inductor.config.triton.unique_kernel_names = True
+            torch._inductor.config.fx_graph_cache = True
+            # Optimiser pour le débit plutôt que la latence
+            torch._inductor.config.optimize_for_throughput = True
         elif is_ada:
             # Optimisations 4090
             batch_size = 18
@@ -631,17 +647,24 @@ if compile:
     try:
         model = torch.compile(
             model,
-            # mode="max-autotune",  # Changed from "reduce-overhead"
             options={
                 "max_autotune": True,
                 "epilogue_fusion": True,
-                "triton.cudagraphs": True,  # Activé
+                "triton.cudagraphs": True,
                 "trace.graph_diagram": False,
                 # Ajouter des options pour mieux gérer les formes dynamiques
                 # "dynamic_shapes": True,
                 "dynamic_memory": True,
-                "max_parallel_block_sizes": 6,
+                "max_parallel_block_sizes": 8,
                 "max_autotune_gemm": True,
+                "triton.cudagraphs_auto": True,
+                "triton.store_cache": True,
+                "triton.persistent_reductions": True,
+                "triton.persistent_kernels": True,
+                "triton.skip_cudagraphs_on_divergent": False,
+                "max_autotune_pointwise": True,
+                "max_fused_kernel_size": 128,
+                "layout_optimization": True,
             }
         )
     except Exception as e:
@@ -676,12 +699,26 @@ if device_type == 'cuda':
         # Optimisations spécifiques A100
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
-        # Utiliser des algorithmes optimisés pour les grandes matrices
         torch.backends.cudnn.benchmark = True
-        # Optimiser pour la throughput plutôt que la latence
+        
+        # Optimiser pour le throughput
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-        # Augmenter la taille du cache L2
-        torch.cuda.set_per_process_memory_fraction(0.95)
+        torch.cuda.set_per_process_memory_fraction(0.98)  # Augmenté
+        
+        # Nouvelles optimisations
+        torch.backends.cuda.matmul.allow_tf32_reduced_precision_reduction = True
+        torch.backends.cudnn.allow_tf32_reduced_precision_reduction = True
+        torch.backends.cuda.preferred_linalg_library = "cusolver"
+        
+        # Configuration des streams
+        torch.cuda.Stream(priority=-1)  # Stream basse priorité pour les opérations non critiques
+        
+        # Optimisation de la mémoire
+        torch.cuda.memory.set_per_process_memory_fraction(0.98)
+        torch.cuda.memory.set_per_process_memory_fraction(0.98, 0)  # Pour le device 0
+        
+        # Désactiver le garbage collector pendant l'entraînement
+        gc.disable()
     elif is_ada:
         # Optimisations spécifiques 4090
         # Privilégier la latence
