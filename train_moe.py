@@ -586,6 +586,18 @@ class TimingStats:
                 self.timings[full_name] += time.time() - self._start_times[full_name]
                 del self._start_times[full_name]
             self._active_scopes.pop()
+    
+    def get_stats(self):
+        """Retourne les timings et les pourcentages"""
+        total_time = sum(self.timings.values())
+        percentages = {k: (v/total_time)*100 for k, v in self.timings.items()}
+        return self.timings, percentages
+    
+    def reset(self):
+        """Réinitialise les timings"""
+        self.timings.clear()
+        self._start_times.clear()
+        self._active_scopes.clear()
 
 class AveragedTimingStats:
     def __init__(self, print_interval=10):
