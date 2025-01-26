@@ -205,37 +205,40 @@ if torch.cuda.is_available():
         # Ajustements spécifiques selon le GPU
         if is_ampere:
             # Optimisations A100
-            batch_size = 92  # Réduit pour éviter OOM
-            gradient_accumulation_steps = 1  # Augmenté pour compenser
+            batch_size = 92
+            gradient_accumulation_steps = 1
             
-            # Optimisations mémoire et calcul
+            # Nouvelles optimisations pour maximiser l'utilisation GPU
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.set_float32_matmul_precision('high')
             
-            # CUDA Graph optimizations
-            torch._inductor.config.triton.cudagraph_trees = True
-            torch._inductor.config.coordinate_descent_tuning = True
-            torch._inductor.config.triton.unique_kernel_names = True
-            torch._inductor.config.fx_graph_cache = True
+            # Augmenter la taille des buffers CUDA
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+                "max_split_size_mb:512,"
+                "garbage_collection_threshold:0.8,"
+                "expandable_segments:True"
+            )
             
-            # Additional A100 optimizations
-            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-            os.environ["CUDA_MODULE_LOADING"] = "LAZY"
-            os.environ["NCCL_NSOCKS_PERTHREAD"] = "4"
-            os.environ["NCCL_SOCKET_NTHREADS"] = "4"
-            os.environ["NCCL_MIN_NCHANNELS"] = "4"
+            # Optimisations NCCL pour meilleur throughput
+            os.environ["NCCL_NSOCKS_PERTHREAD"] = "8"  # Augmenté de 4 à 8
+            os.environ["NCCL_SOCKET_NTHREADS"] = "8"   # Augmenté de 4 à 8
+            os.environ["NCCL_MIN_NCHANNELS"] = "8"     # Augmenté de 4 à 8
             
-            # Memory management
-            torch.cuda.empty_cache()
-            torch.cuda.memory.set_per_process_memory_fraction(0.95)
+            # Optimisations pour réduire la latence
+            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
+            os.environ["NCCL_BUFFSIZE"] = "8388608"  # 8MB buffer
             
-            # Disable JIT cache
-            torch.jit.set_fusion_strategy([('DYNAMIC', 3)])
+            # Désactiver l'autotuning qui peut causer des pauses
+            torch._inductor.config.coordinate_descent_tuning = False
             
-            # Prefetch and overlap optimizations
-            torch.backends.cudnn.benchmark = True
+            # Optimiser pour le throughput plutôt que la latence
             torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+            torch.backends.cudnn.benchmark = True
+            
+            # Augmenter la taille des micro-batches
+            os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
+            torch.cuda.set_per_process_memory_fraction(0.98)  # Augmenté de 0.95
         elif is_ada:
             # Optimisations 4090
             batch_size = 18
