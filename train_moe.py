@@ -662,16 +662,17 @@ if compile:
     try:
         model = torch.compile(
             model,
-            options={
-                "max_autotune": True,
-                "epilogue_fusion": True,
-                "triton.cudagraphs": True,  # Activé
-                "trace.graph_diagram": False,
-                # Ajouter des options pour mieux gérer les formes dynamiques
-                # "dynamic_memory": True,
-                # "max_parallel_block_sizes": 6,
-                "max_autotune_gemm": True,
-            }
+            mode="reduce-overhead",
+            # options={
+            #     "max_autotune": True,
+            #     "epilogue_fusion": True,
+            #     "triton.cudagraphs": True,  # Activé
+            #     "trace.graph_diagram": False,
+            #     # Ajouter des options pour mieux gérer les formes dynamiques
+            #     # "dynamic_memory": True,
+            #     # "max_parallel_block_sizes": 6,
+            #     "max_autotune_gemm": True,
+            # }
         )
     except Exception as e:
         print(f"Compilation failed: {e}")
