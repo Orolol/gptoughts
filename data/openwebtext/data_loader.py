@@ -3,7 +3,7 @@ import json
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
-from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.data import IterableDataset
 import numpy as np
 import pickle
 import time
@@ -48,7 +48,7 @@ class StreamingDataset(IterableDataset):
         self.dataset = self.dataset.with_format("torch")
         self.dataset = self.dataset.shuffle(buffer_size=10_000)
         
-        # Create dataloader and iterator
+        # Add persistent workers and memory pinning
         self.dataloader = torch.utils.data.DataLoader(
             self.dataset,
             batch_size=batch_size * 4,  # Pre-batch for efficiency
@@ -57,7 +57,6 @@ class StreamingDataset(IterableDataset):
             pin_memory=self.pin_memory,
             persistent_workers=True
         )
-        self._iterator = iter(self.dataloader)
         
         # Preallocate buffers
         self.token_buffer = torch.empty((batch_size * block_size * 8), 
@@ -70,6 +69,10 @@ class StreamingDataset(IterableDataset):
         tracker_dir = os.path.join('data', 'token_tracking')
         os.makedirs(tracker_dir, exist_ok=True)
         self.token_tracker = TokenTracker()
+        
+        # Modifions la façon dont nous gérons le dataset
+        self.dataset_iterator = iter(self.dataset)
+        self.token_buffer = []
         
         # Save tokenizer metadata
         self.save_meta()
@@ -87,45 +90,19 @@ class StreamingDataset(IterableDataset):
     
     def process_example(self, example):
         """Optimized tokenization with memory reuse"""
-        # Vérifier que le texte est bien une chaîne de caractères
-        text = example['text']
-        if isinstance(text, (list, tuple)):
-            text = text[0]  # Prendre le premier élément si c'est une liste
-        if not isinstance(text, str):
-            text = str(text)  # Convertir en string si ce n'en est pas un
-            
-        # Tokenize avec gestion des erreurs
-        try:
-            # Encoder le texte
-            ids = self.tokenizer.encode(
-                text,
-                add_special_tokens=True,
-                max_length=self.block_size,
-                truncation=True,
-                padding='max_length',
-                return_tensors=None  # Retourner une liste plutôt qu'un tensor
-            )
-            
-            # Convertir en tensor
-            ids = torch.tensor(ids, dtype=torch.long)
-            
-            # Padding si nécessaire
-            if len(ids) < self.block_size:
-                padding = torch.full((self.block_size - len(ids),), 
-                                  self.tokenizer.pad_token_id,
-                                  dtype=torch.long)
-                ids = torch.cat([ids, padding])
-            else:
-                ids = ids[:self.block_size]
-            
-            return ids
-            
-        except Exception as e:
-            print(f"Tokenization error: {e}")
-            # Retourner un tensor de padding en cas d'erreur
-            return torch.full((self.block_size,), 
-                            self.tokenizer.pad_token_id,
-                            dtype=torch.long)
+        # Reuse existing buffer to avoid allocations
+        ids = self.tokenizer.encode_plus(
+            example['text'],
+            add_special_tokens=False,
+            return_tensors='pt',
+            max_length=self.block_size,
+            truncation=True,
+            padding='max_length',
+            return_attention_mask=False
+        ).input_ids.squeeze(0)
+        
+        ids = ids.to(device='cpu', non_blocking=True)
+        return ids
     
     def get_batch(self):
         """Vectorized batch preparation"""
@@ -133,48 +110,35 @@ class StreamingDataset(IterableDataset):
         with torch.cuda.stream(torch.cuda.Stream()):
             # Fill buffer in chunks
             while self.ptr < self.batch_size * self.block_size * 2:
-                try:
-                    batch = next(self._iterator)
-                except StopIteration:
-                    # Reset iterator if exhausted
-                    self._iterator = iter(self.dataloader)
-                    batch = next(self._iterator)
-                
+                batch = next(self.dataloader)
                 tokens = self.process_example(batch)
                 
                 # Copy to buffer
                 avail = min(tokens.numel(), self.token_buffer.numel() - self.ptr)
                 self.token_buffer[self.ptr:self.ptr+avail] = tokens[:avail]
                 self.ptr += avail
-            
+                
             # Prepare tensors with async copy
             encoder_input = self.token_buffer[:self.batch_size*self.block_size]\
                 .view(self.batch_size, self.block_size)\
-                .to(device=self.device, non_blocking=True)
+                .to(device=self.device, non_blocking=True, memory_format=torch.channels_last)
             
             decoder_input = self.token_buffer[self.batch_size*self.block_size:self.batch_size*self.block_size*2]\
                 .view(self.batch_size, self.block_size)\
-                .to(device=self.device, non_blocking=True)
-            
-            # Create target by shifting decoder input
-            target = decoder_input.clone()
-            target = torch.roll(target, shifts=-1, dims=1)
-            target[:, -1] = -1  # Masquer le dernier token
+                .to(device=self.device, non_blocking=True, memory_format=torch.channels_last)
             
             # Rotate buffer
             self.token_buffer = torch.roll(self.token_buffer, -self.batch_size*self.block_size*2)
             self.ptr -= self.batch_size*self.block_size*2
-            
-            # Update token count
-            self.token_tracker.update(self.batch_size * self.block_size * 2)
         
-        return encoder_input, decoder_input, target
+        end_time = time.time()
+        # print(f"Time to get a batch: {end_time - start_time:.4f} seconds")
 
-    def __iter__(self):
-        return self
+        return encoder_input, decoder_input, target
     
-    def __next__(self):
-        return self.get_batch()
+    def __iter__(self):
+        while True:
+            yield self.get_batch()
     
     def get_total_tokens(self):
         """Return the total number of tokens processed so far."""

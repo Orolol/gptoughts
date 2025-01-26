@@ -52,7 +52,7 @@ torch._inductor.config.trace.enabled = False  # Désactiver le tracing
 # Parse command line arguments
 # -----------------------------------------------------------------------------
 parser = argparse.ArgumentParser(description='Train MoE model')
-parser.add_argument('--size', type=str, choices=['small', 'medium', 'large'], default='small',
+parser.add_argument('--size', type=str, choices=['small', 'medium'], default='small',
                    help='Model size configuration (small or medium)')
 args = parser.parse_args()
 
@@ -143,16 +143,16 @@ if torch.cuda.is_available():
         gradient_accumulation_steps = 2
 
         # Encoder config
-        encoder_n_layer = 16
-        encoder_n_head = 16
-        encoder_n_embd = 1024
-        encoder_ratio_kv = 16
+        encoder_n_layer = 4
+        encoder_n_head = 4
+        encoder_n_embd = 384
+        encoder_ratio_kv = 4
         
         # Decoder config
-        decoder_n_layer = 16
-        decoder_n_head = 16
-        decoder_n_embd = 1024
-        decoder_ratio_kv = 16
+        decoder_n_layer = 4
+        decoder_n_head = 4
+        decoder_n_embd = 384
+        decoder_ratio_kv = 4
     
     router_z_loss_coef = 0.001
     router_aux_loss_coef = 0.001
@@ -604,6 +604,7 @@ if compile:
                 "trace.enabled": False,  # Désactiver le tracing
                 "trace.graph_diagram": False,
                 "debug": False,  # Désactiver le debug
+                "verbose": False  # Désactiver les messages verbeux
             }
         )
     except Exception as e:
@@ -833,7 +834,6 @@ while True:
 
     except Exception as e:
         print(f"Training iteration failed: {e}")
-        print(traceback.format_exc())
         cleanup_memory()
         if ddp:
             dist_barrier()
