@@ -9,6 +9,8 @@ from typing import Optional
 import inspect
 import gc
 import time
+from contextlib import nullcontext
+
 class Router(nn.Module):
     """
     Router module that determines which expert should process each token.
