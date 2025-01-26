@@ -137,24 +137,29 @@ if torch.cuda.is_available():
             torch.backends.cudnn.allow_tf32 = True
             torch.set_float32_matmul_precision('high')
             
-            # Optimisations pour maximiser l'utilisation GPU
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+            # CUDA Graph optimizations
+            torch._inductor.config.triton.cudagraph_trees = True
+            torch._inductor.config.coordinate_descent_tuning = True
+            torch._inductor.config.triton.unique_kernel_names = True
+            torch._inductor.config.fx_graph_cache = True
             
-            # Augmenter la taille des chunks pour le gradient checkpointing
-            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+            # Additional A100 optimizations
+            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+            os.environ["CUDA_MODULE_LOADING"] = "LAZY"
+            os.environ["NCCL_NSOCKS_PERTHREAD"] = "4"
+            os.environ["NCCL_SOCKET_NTHREADS"] = "4"
+            os.environ["NCCL_MIN_NCHANNELS"] = "4"
             
-            # Optimisations mémoire
+            # Memory management
             torch.cuda.empty_cache()
             torch.cuda.memory.set_per_process_memory_fraction(0.95)
             
-            # Désactiver la synchronisation par défaut
-            torch.cuda.set_sync_debug_mode(0)
+            # Disable JIT cache
+            torch.jit.set_fusion_strategy([('DYNAMIC', 3)])
             
-            # Optimisations pour les grands batches
-            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-            os.environ["NCCL_MIN_NCHANNELS"] = "4"
-            os.environ["NCCL_MAX_NCHANNELS"] = "8"
+            # Prefetch and overlap optimizations
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
         elif is_ada:
             # Optimisations 4090
             batch_size = 18
@@ -673,6 +678,10 @@ if compile:
         print(traceback.format_exc())
         compile = False
 
+# Remplacez timing_stats = TimingStats() par:
+timing_stats = AveragedTimingStats(print_interval=100)  # Afficher les stats tous les 10 iterations
+# Après la création du modèle et avant de le déplacer sur le device
+model.set_timing_stats(timing_stats)
 
 # Si vous utilisez DDP, modifiez aussi:
 if ddp:
@@ -753,52 +762,6 @@ window_size = 10   # Taille de la fenêtre pour la moyenne glissante
 
 print(f"Starting training with {num_experts} experts and top-{expert_k} routing")
 print_memory_stats("Initial")
-
-# Ajouter après les imports
-class TimingStats:
-    def __init__(self, print_interval=100):
-        self.timings = defaultdict(list)
-        self.print_interval = print_interval
-        self.current_step = 0
-    
-    @contextmanager
-    def track(self, name):
-        start_time = time.time()
-        try:
-            yield
-        finally:
-            duration = time.time() - start_time
-            self.timings[name].append(duration)
-    
-    def step(self):
-        self.current_step += 1
-    
-    def should_print(self):
-        return self.current_step % self.print_interval == 0
-    
-    def print_stats(self):
-        if not self.timings:
-            return
-        
-        total_time = sum(sum(times) / len(times) for times in self.timings.values())
-        print(f"\nTiming breakdown over last {self.print_interval} iterations:")
-        
-        # Sort by average time
-        avg_times = {
-            name: sum(times) / len(times) 
-            for name, times in self.timings.items()
-        }
-        
-        sorted_times = sorted(avg_times.items(), key=lambda x: x[1], reverse=True)
-        
-        for name, avg_time in sorted_times:
-            percentage = (avg_time / total_time) * 100
-            print(f"{name}: {avg_time*1000:.1f}ms ({percentage:.1f}%)")
-        
-        self.timings.clear()
-
-# Ajouter juste avant l'initialisation du modèle
-timing_stats = TimingStats(print_interval=100)
 
 # training loop
 while True:
@@ -895,33 +858,64 @@ while True:
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0
         total_router_loss = 0
+        skip_optimizer_step = False
 
-        for micro_step in range(gradient_accumulation_steps):
-            with timing_stats.track("forward"):
+        try:
+            for micro_step in range(gradient_accumulation_steps):
+                if ddp:
+                    model.require_backward_grad_sync = (
+                        micro_step == gradient_accumulation_steps - 1
+                    )
+                
+                with timing_stats.track("forward"), torch.amp.autocast(enabled=True, device_type=device_type):
+                    # Libérer la mémoire des tenseurs précédents
+                    if 'encoder_input' in locals(): del encoder_input
+                    if 'decoder_input' in locals(): del decoder_input
+                    if 'target' in locals(): del target
+                    
+                    encoder_input, decoder_input, target = next(train_iterator)
+                    encoder_input, decoder_input, target = pad_sequences(
+                        encoder_input, decoder_input, target
+                    )
+                    
+                    # Forward pass
+                    logits, loss, router_loss = model(encoder_input, decoder_input, target)
+                    batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
+                    total_tokens += batch_tokens
+                    tokens_window.append((time.time(), batch_tokens))
+                    if len(tokens_window) > window_size:
+                        tokens_window.pop(0)
+                    del logits
+                
+                with timing_stats.track("backward"):
+                    if loss is not None:
+                        loss = loss / gradient_accumulation_steps
+                        router_loss = router_loss / gradient_accumulation_steps
+                        combined_loss = loss + router_aux_loss_coef * router_loss
+                        
+                        # Backward pass
+                        scaled_loss = scaler.scale(combined_loss)
+                        scaled_loss.backward()
+                        
+                        total_loss += loss.item()
+                        total_router_loss += router_loss.item()
+                        del loss, router_loss, combined_loss, scaled_loss
 
-                encoder_input, decoder_input, target = next(train_iterator)
-                encoder_input, decoder_input, target = pad_sequences(
-                    encoder_input, decoder_input, target
-                )
-                # Forward pass
-                logits, loss, router_loss = model(encoder_input, decoder_input, target)
-            
-            with timing_stats.track("backward"):
-                # Backward pass
-                if loss is not None:
-                    loss = loss / gradient_accumulation_steps
-                    router_loss = router_loss / gradient_accumulation_steps
-                    combined_loss = loss + router_aux_loss_coef * router_loss
-                    scaled_loss = scaler.scale(combined_loss)
-                    scaled_loss.backward()
-            
-            with timing_stats.track("optimizer"):
-                # Optimizer step
-                if grad_clip != 0.0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+                with timing_stats.track("optimizer_step"):
+                    if grad_clip != 0.0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    
+                    scaler.step(optimizer)
+                    scaler.update()
+
+        except Exception as e:
+            print(f"Training iteration failed: {e}")
+            print(traceback.format_exc())
+            cleanup_memory()
+            if ddp:
+                dist_barrier()
+            continue
 
     # timing and logging
     t1 = time.time()

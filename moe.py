@@ -590,9 +590,8 @@ class MoEEncoderDecoderGPT(nn.Module):
         track = self.timing_stats.track if self.timing_stats is not None else nullcontext
         
         with track("forward"):
-            # Encoder
             with track("encoder"):
-                # Embeddings
+                # Encoder
                 with track("embeddings"):
                     encoder_pos = torch.arange(0, encoder_idx.size(1), device=device)
                     encoder_emb = self.shared_embedding(encoder_idx)
@@ -617,7 +616,6 @@ class MoEEncoderDecoderGPT(nn.Module):
                 with track("final_norm"):
                     encoder_output = self.encoder.ln_f(x)
             
-            # Decoder
             with track("decoder"):
                 # Embeddings
                 with track("embeddings"):
@@ -649,7 +647,6 @@ class MoEEncoderDecoderGPT(nn.Module):
                 with track("final_norm"):
                     x = self.decoder.ln_f(x)
             
-            # Output head
             with track("head"):
                 if targets is not None:
                     logits = self.lm_head(x)
