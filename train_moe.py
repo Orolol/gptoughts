@@ -45,6 +45,9 @@ torch._dynamo.config.cache_size_limit = 16384
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = False
 torch._inductor.config.debug = False
 
+# Au début du fichier, après les imports
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:512"
+
 # -----------------------------------------------------------------------------
 # Parse command line arguments
 # -----------------------------------------------------------------------------
@@ -123,13 +126,12 @@ if torch.cuda.is_available():
         # Ajustements spécifiques selon le GPU
         if is_ampere:
             # Optimisations A100
-            batch_size = 32  # On garde cette taille
+            batch_size = 92  # On garde cette taille
             gradient_accumulation_steps = 1
             
             # Optimisations mémoire et calcul
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            # Optimiser pour le throughput
             torch.set_num_threads(8)
             
             # Nouvelles optimisations A100
@@ -139,6 +141,10 @@ if torch.cuda.is_available():
             os.environ["CUDA_VISIBLE_DEVICES"] = "0"
             os.environ["NCCL_P2P_LEVEL"] = "NVL"
             os.environ["NCCL_NET_GDR_READ"] = "1"
+            
+            # Gestion de la mémoire plus conservatrice
+            torch.cuda.set_per_process_memory_fraction(0.85)  # Réduit pour éviter OOM
+            torch.cuda.empty_cache()
             
             # Optimisations pour les grands batches
             torch._inductor.config.coordinate_descent_tuning = True
@@ -652,7 +658,7 @@ if compile:
             options={
                 "max_autotune": True,
                 "epilogue_fusion": True,
-                "triton.cudagraphs": False,  # Désactivé pour éviter les problèmes de mémoire
+                "triton.cudagraphs": False,
                 "trace.graph_diagram": False,
                 "layout_optimization": True,
                 "max_autotune_gemm": True,
@@ -660,11 +666,9 @@ if compile:
                 "triton.persistent_reductions": True,
                 "triton.unique_kernel_names": True,
                 "triton.store_cubin": True,
-                "max_fusion_size": 128,
-                "triton.cudagraph_trees": True,
-                # "profile_bandwidth": True,
+                "max_fusion_size": 64,
                 "permute_fusion": True,
-                "aggressive_fusion": True,
+                "aggressive_fusion": False,
                 "max_autotune_gemm_backends": "triton",
                 "coordinate_descent_tuning": True,
                 "combo_kernels": True,
