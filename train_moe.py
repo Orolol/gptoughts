@@ -46,7 +46,7 @@ torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = False
 torch._inductor.config.debug = False
 
 # Au début du fichier, après les imports
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:512"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8"
 
 # -----------------------------------------------------------------------------
 # Parse command line arguments
@@ -126,8 +126,8 @@ if torch.cuda.is_available():
         # Ajustements spécifiques selon le GPU
         if is_ampere:
             # Optimisations A100
-            batch_size = 92  # On garde cette taille
-            gradient_accumulation_steps = 1
+            batch_size = 48  # Réduit pour éviter OOM
+            gradient_accumulation_steps = 2  # Augmenté pour compenser
             
             # Optimisations mémoire et calcul
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -142,9 +142,13 @@ if torch.cuda.is_available():
             os.environ["NCCL_P2P_LEVEL"] = "NVL"
             os.environ["NCCL_NET_GDR_READ"] = "1"
             
-            # Gestion de la mémoire plus conservatrice
-            torch.cuda.set_per_process_memory_fraction(0.85)  # Réduit pour éviter OOM
+            # Gestion de la mémoire plus agressive
+            torch.cuda.set_per_process_memory_fraction(0.8)  # Encore plus réduit
             torch.cuda.empty_cache()
+            
+            # Activer le garbage collector périodique
+            gc.enable()
+            gc.collect()
             
             # Optimisations pour les grands batches
             torch._inductor.config.coordinate_descent_tuning = True
@@ -651,7 +655,7 @@ if init_from == 'scratch':
 # Compile model if requested
 if compile:
     print("Compiling model...")
-    model.set_gradient_checkpointing(False)
+    model.set_gradient_checkpointing(True)  # Activé pour économiser la mémoire
     try:
         model = torch.compile(
             model,
@@ -666,12 +670,12 @@ if compile:
                 "triton.persistent_reductions": True,
                 "triton.unique_kernel_names": True,
                 "triton.store_cubin": True,
-                "max_fusion_size": 64,
+                "max_fusion_size": 32,  # Réduit encore plus
                 "permute_fusion": True,
                 "aggressive_fusion": False,
                 "max_autotune_gemm_backends": "triton",
                 "coordinate_descent_tuning": True,
-                "combo_kernels": True,
+                "combo_kernels": False,  # Désactivé pour économiser la mémoire
                 "combo_kernels_autotune": 1
             }
         )
@@ -679,7 +683,6 @@ if compile:
         print(f"Compilation failed: {e}")
         print(traceback.format_exc())
         compile = False
-        model.set_gradient_checkpointing(True)
 
 model.to(device)
 
