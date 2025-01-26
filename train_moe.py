@@ -137,29 +137,24 @@ if torch.cuda.is_available():
             torch.backends.cudnn.allow_tf32 = True
             torch.set_float32_matmul_precision('high')
             
-            # CUDA Graph optimizations
-            torch._inductor.config.triton.cudagraph_trees = True
-            torch._inductor.config.coordinate_descent_tuning = True
-            torch._inductor.config.triton.unique_kernel_names = True
-            torch._inductor.config.fx_graph_cache = True
+            # Optimisations pour maximiser l'utilisation GPU
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
             
-            # Additional A100 optimizations
-            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-            os.environ["CUDA_MODULE_LOADING"] = "LAZY"
-            os.environ["NCCL_NSOCKS_PERTHREAD"] = "4"
-            os.environ["NCCL_SOCKET_NTHREADS"] = "4"
-            os.environ["NCCL_MIN_NCHANNELS"] = "4"
+            # Augmenter la taille des chunks pour le gradient checkpointing
+            os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
             
-            # Memory management
+            # Optimisations mémoire
             torch.cuda.empty_cache()
             torch.cuda.memory.set_per_process_memory_fraction(0.95)
             
-            # Disable JIT cache
-            torch.jit.set_fusion_strategy([('DYNAMIC', 3)])
+            # Désactiver la synchronisation par défaut
+            torch.cuda.set_sync_debug_mode(0)
             
-            # Prefetch and overlap optimizations
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+            # Optimisations pour les grands batches
+            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+            os.environ["NCCL_MIN_NCHANNELS"] = "4"
+            os.environ["NCCL_MAX_NCHANNELS"] = "8"
         elif is_ada:
             # Optimisations 4090
             batch_size = 18
@@ -758,6 +753,52 @@ window_size = 10   # Taille de la fenêtre pour la moyenne glissante
 
 print(f"Starting training with {num_experts} experts and top-{expert_k} routing")
 print_memory_stats("Initial")
+
+# Ajouter après les imports
+class TimingStats:
+    def __init__(self, print_interval=100):
+        self.timings = defaultdict(list)
+        self.print_interval = print_interval
+        self.current_step = 0
+    
+    @contextmanager
+    def track(self, name):
+        start_time = time.time()
+        try:
+            yield
+        finally:
+            duration = time.time() - start_time
+            self.timings[name].append(duration)
+    
+    def step(self):
+        self.current_step += 1
+    
+    def should_print(self):
+        return self.current_step % self.print_interval == 0
+    
+    def print_stats(self):
+        if not self.timings:
+            return
+        
+        total_time = sum(sum(times) / len(times) for times in self.timings.values())
+        print(f"\nTiming breakdown over last {self.print_interval} iterations:")
+        
+        # Sort by average time
+        avg_times = {
+            name: sum(times) / len(times) 
+            for name, times in self.timings.items()
+        }
+        
+        sorted_times = sorted(avg_times.items(), key=lambda x: x[1], reverse=True)
+        
+        for name, avg_time in sorted_times:
+            percentage = (avg_time / total_time) * 100
+            print(f"{name}: {avg_time*1000:.1f}ms ({percentage:.1f}%)")
+        
+        self.timings.clear()
+
+# Ajouter juste avant l'initialisation du modèle
+timing_stats = TimingStats(print_interval=100)
 
 # training loop
 while True:
