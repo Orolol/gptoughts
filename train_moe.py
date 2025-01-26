@@ -38,6 +38,82 @@ from torch.compiler import allow_in_graph
 from collections import defaultdict
 from contextlib import contextmanager
 
+# Ajouter après les imports
+class AveragedTimingStats:
+    def __init__(self, print_interval=100):
+        self.timings = defaultdict(list)
+        self.print_interval = print_interval
+        self.current_step = 0
+        self.current_context = []
+        
+    @contextmanager
+    def track(self, name):
+        self.current_context.append(name)
+        start_time = time.time()
+        try:
+            yield
+        finally:
+            duration = time.time() - start_time
+            # Only track the first level and its immediate children
+            if len(self.current_context) <= 2:
+                full_name = '/'.join(self.current_context)
+                self.timings[full_name].append(duration)
+            self.current_context.pop()
+    
+    def step(self):
+        self.current_step += 1
+    
+    def should_print(self):
+        return self.current_step % self.print_interval == 0
+    
+    def get_averaged_stats(self):
+        if not self.timings:
+            return {}
+        
+        # Calculate averages
+        avg_timings = {}
+        for name, times in self.timings.items():
+            avg_timings[name] = sum(times) / len(times)
+        
+        # Get total time from root operations
+        total_time = sum(avg_timings[name] for name in avg_timings if '/' not in name)
+        
+        # Calculate percentages
+        percentages = {}
+        for name, time in avg_timings.items():
+            percentages[name] = (time / total_time) * 100 if total_time > 0 else 0
+        
+        # Clear timings for next window
+        self.timings.clear()
+        
+        return avg_timings, percentages
+    
+    def print_stats(self):
+        timings, percentages = self.get_averaged_stats()
+        if not timings:
+            return
+        
+        print(f"\nTiming breakdown over last {self.print_interval} iterations:")
+        
+        # Sort by time spent (descending)
+        sorted_timings = sorted(
+            timings.items(), 
+            key=lambda x: x[1], 
+            reverse=True
+        )
+        
+        # Print root operations first
+        print("\nMain operations:")
+        for name, time in sorted_timings:
+            if '/' not in name:
+                print(f"{name}: {time*1000:.1f}ms ({percentages[name]:.1f}%)")
+        
+        # Print sub-operations
+        print("\nDetailed breakdown:")
+        for name, time in sorted_timings:
+            if '/' in name:
+                print(f"{name}: {time*1000:.1f}ms ({percentages[name]:.1f}%)") 
+
 # Permettre time.time() dans le graphe
 allow_in_graph(time.time)
 
@@ -974,4 +1050,5 @@ if device_type == 'cuda':
     torch.cuda.synchronize()
 
 if master_process:
-    print("Training finished!") 
+    print("Training finished!")
+
