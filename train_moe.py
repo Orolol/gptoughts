@@ -668,7 +668,7 @@ if compile:
                 "max_autotune_gemm_backends": "triton",
                 "coordinate_descent_tuning": True,
                 "combo_kernels": True,
-                "combo_kernels_autotune": True
+                "combo_kernels_autotune": 1
             }
         )
     except Exception as e:
