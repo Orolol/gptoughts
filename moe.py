@@ -856,7 +856,7 @@ class MoEEncoderDecoderGPT(nn.Module):
             {
                 'params': router_params,
                 'weight_decay': 0.0,  # No weight decay for router
-                'lr': learning_rate * 0.1  # Lower learning rate for stability
+                'lr': learning_rate  # Lower learning rate for stability
             },
             # Other parameters
             {
