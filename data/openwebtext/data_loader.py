@@ -43,7 +43,7 @@ class StreamingDataset(IterableDataset):
         self.token_tracker = TokenTracker()
         
         # Ajouter un buffer préfetch plus grand
-        self.prefetch_buffer_size = 20_000  # Augmenté pour réduire les pauses
+        self.prefetch_buffer_size = 200  # Augmenté pour réduire les pauses
         self.token_buffer = []
         
         # Créer un stream CUDA dédié pour le préfetch
