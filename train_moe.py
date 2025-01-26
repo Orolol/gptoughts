@@ -768,6 +768,30 @@ print(f"Starting training with {num_experts} experts and top-{expert_k} routing"
 print_memory_stats("Initial")
 
 # Après la classe TimingStats, ajoutez:
+class TimingStats:
+    def __init__(self):
+        self.timings = defaultdict(float)
+        self._start_times = {}
+    
+    @contextmanager
+    def track(self, name):
+        try:
+            self._start_times[name] = time.time()
+            yield
+        finally:
+            if name in self._start_times:
+                self.timings[name] += time.time() - self._start_times[name]
+                del self._start_times[name]
+    
+    def get_stats(self):
+        total_time = sum(self.timings.values())
+        percentages = {k: (v/total_time)*100 for k, v in self.timings.items()}
+        return self.timings, percentages
+    
+    def reset(self):
+        self.timings.clear()
+        self._start_times.clear()
+
 class AveragedTimingStats:
     def __init__(self, print_interval=10):
         self.print_interval = print_interval
