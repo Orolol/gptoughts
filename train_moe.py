@@ -144,8 +144,10 @@ if torch.cuda.is_available():
             torch._inductor.config.coordinate_descent_tuning = True
             torch._inductor.config.triton.unique_kernel_names = True
             torch._inductor.config.fx_graph_cache = True
-            # Optimiser pour le débit plutôt que la latence
-            torch._inductor.config.optimize_for_throughput = True
+            # Optimisations spécifiques pour A100
+            torch._inductor.config.triton.cudagraph_trees = True
+            torch._inductor.config.profile_bandwidth = True
+            torch._inductor.config.permute_fusion = True
         elif is_ada:
             # Optimisations 4090
             batch_size = 18
