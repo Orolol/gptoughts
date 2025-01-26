@@ -898,6 +898,11 @@ while True:
 
         for micro_step in range(gradient_accumulation_steps):
             with timing_stats.track("forward"):
+
+                encoder_input, decoder_input, target = next(train_iterator)
+                encoder_input, decoder_input, target = pad_sequences(
+                    encoder_input, decoder_input, target
+                )
                 # Forward pass
                 logits, loss, router_loss = model(encoder_input, decoder_input, target)
             
