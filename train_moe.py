@@ -123,7 +123,7 @@ if torch.cuda.is_available():
         # Ajustements spécifiques selon le GPU
         if is_ampere:
             # Optimisations A100
-            batch_size = 48  # Augmenté pour mieux utiliser la bande passante
+            batch_size = 64  # Augmenté pour mieux utiliser la bande passante
             gradient_accumulation_steps = 1
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
