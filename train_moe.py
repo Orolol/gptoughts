@@ -52,7 +52,7 @@ torch._inductor.config.trace.enabled = False  # Désactiver le tracing
 # Parse command line arguments
 # -----------------------------------------------------------------------------
 parser = argparse.ArgumentParser(description='Train MoE model')
-parser.add_argument('--size', type=str, choices=['small', 'medium'], default='small',
+parser.add_argument('--size', type=str, choices=['small', 'medium', 'large'], default='small',
                    help='Model size configuration (small or medium)')
 args = parser.parse_args()
 
