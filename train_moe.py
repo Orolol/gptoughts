@@ -665,7 +665,7 @@ if compile:
                 "profile_bandwidth": True,
                 "permute_fusion": True,
                 "aggressive_fusion": True,
-                "max_autotune_gemm_backends": ["triton"],
+                "max_autotune_gemm_backends": "triton",
                 "coordinate_descent_tuning": True,
                 "combo_kernels": True,
                 "combo_kernels_autotune": True
@@ -707,19 +707,14 @@ if device_type == 'cuda':
         
         # Optimiser pour le throughput
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-        torch.cuda.set_per_process_memory_fraction(0.98)  # Augmenté
-        
-        # Nouvelles optimisations
-        torch.backends.cuda.matmul.allow_tf32_reduced_precision_reduction = True
-        torch.backends.cudnn.allow_tf32_reduced_precision_reduction = True
-        torch.backends.cuda.preferred_linalg_library = "cusolver"
+        torch.cuda.set_per_process_memory_fraction(0.98)
         
         # Configuration des streams
-        torch.cuda.Stream(priority=-1)  # Stream basse priorité pour les opérations non critiques
+        torch.cuda.Stream(priority=-1)
         
         # Optimisation de la mémoire
         torch.cuda.memory.set_per_process_memory_fraction(0.98)
-        torch.cuda.memory.set_per_process_memory_fraction(0.98, 0)  # Pour le device 0
+        torch.cuda.memory.set_per_process_memory_fraction(0.98, 0)
         
         # Désactiver le garbage collector pendant l'entraînement
         gc.disable()
