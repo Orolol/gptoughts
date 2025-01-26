@@ -112,6 +112,7 @@ class StreamingDataset(IterableDataset):
         max_retries = 3
         retry_count = 0
         
+        batch_start_time = time.time()
         print("Getting batch")
         required_tokens = self.block_size * self.batch_size * 2
         print(f"Required tokens for batch: {required_tokens}")
@@ -121,10 +122,11 @@ class StreamingDataset(IterableDataset):
                 print("Starting prefetch stream", retry_count)
                 with torch.cuda.stream(self.prefetch_stream):
                     # Remplir le buffer en arrière-plan
+                    fill_start_time = time.time()
                     print("Filling token buffer")
                     
                     fill_attempts = 0
-                    max_fill_attempts = 1000  # Augmenté car nous avons besoin de plus de tokens
+                    max_fill_attempts = 1000
                     
                     while len(self.token_buffer) < required_tokens and fill_attempts < max_fill_attempts:
                         try:
@@ -141,15 +143,20 @@ class StreamingDataset(IterableDataset):
                             self.token_buffer.extend(new_tokens)
                             self.token_tracker.update(len(new_tokens))
                             
-                            # Afficher la progression
                             if fill_attempts % 10 == 0:
-                                print(f"Buffer size: {len(self.token_buffer)}/{required_tokens}")
+                                elapsed = time.time() - fill_start_time
+                                tokens_per_sec = len(self.token_buffer) / elapsed if elapsed > 0 else 0
+                                print(f"Buffer size: {len(self.token_buffer)}/{required_tokens} "
+                                      f"({tokens_per_sec:.0f} tokens/s)")
                                 
                         except StopIteration:
                             print("Reached end of dataset, resetting")
                             self.reset_dataset()
                         
                         fill_attempts += 1
+                    
+                    fill_time = time.time() - fill_start_time
+                    print(f"Buffer filling took {fill_time:.2f}s")
                     
                     if fill_attempts >= max_fill_attempts:
                         print(f"Failed to fill buffer after {max_fill_attempts} attempts")
@@ -162,9 +169,11 @@ class StreamingDataset(IterableDataset):
                     
                     print(f"Got enough tokens: {len(self.token_buffer)}")
                     
+                    # Timing pour les opérations de copie
+                    copy_start = time.time()
                     total_length = self.block_size * self.batch_size
                     
-                    # Copier d'abord dans les buffers CPU
+                    # Copier vers CPU
                     self.encoder_buffer_cpu.copy_(
                         torch.tensor(
                             self.token_buffer[:total_length], 
@@ -187,18 +196,26 @@ class StreamingDataset(IterableDataset):
                     )
                     print("Copied target buffer")
                     
-                    # Transférer de manière asynchrone vers GPU
+                    cpu_copy_time = time.time() - copy_start
+                    print(f"CPU copy took {cpu_copy_time:.3f}s")
+                    
+                    # Timing pour le transfert GPU
+                    gpu_start = time.time()
                     self.encoder_buffer.copy_(self.encoder_buffer_cpu, non_blocking=True)
                     self.decoder_buffer.copy_(self.decoder_buffer_cpu, non_blocking=True)
                     self.target_buffer.copy_(self.target_buffer_cpu, non_blocking=True)
-                    print("Copied buffers to GPU")
+                    
                     # Nettoyer le buffer
                     self.token_buffer = self.token_buffer[total_length*2:]
                     
-                    # Synchroniser le stream de préfetch
+                    # Synchroniser et mesurer le temps de transfert GPU
                     self.prefetch_stream.synchronize()
+                    gpu_time = time.time() - gpu_start
+                    print(f"GPU transfer took {gpu_time:.3f}s")
                     
-                    print("Returning batch")
+                    total_time = time.time() - batch_start_time
+                    print(f"Total batch preparation took {total_time:.2f}s")
+                    
                     return (
                         self.encoder_buffer.clone(), 
                         self.decoder_buffer.clone(), 
