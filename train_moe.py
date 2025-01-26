@@ -768,30 +768,26 @@ window_size = 10   # Taille de la fenêtre pour la moyenne glissante
 print(f"Starting training with {num_experts} experts and top-{expert_k} routing")
 print_memory_stats("Initial")
 
-# Après la classe TimingStats, ajoutez:
+# Modifiez la classe TimingStats pour supporter le nested timing
 class TimingStats:
     def __init__(self):
         self.timings = defaultdict(float)
         self._start_times = {}
+        self._active_scopes = []
     
     @contextmanager
     def track(self, name):
+        # Construire le nom complet avec le scope
+        full_name = "/".join(self._active_scopes + [name]) if self._active_scopes else name
         try:
-            self._start_times[name] = time.time()
+            self._start_times[full_name] = time.time()
+            self._active_scopes.append(name)
             yield
         finally:
-            if name in self._start_times:
-                self.timings[name] += time.time() - self._start_times[name]
-                del self._start_times[name]
-    
-    def get_stats(self):
-        total_time = sum(self.timings.values())
-        percentages = {k: (v/total_time)*100 for k, v in self.timings.items()}
-        return self.timings, percentages
-    
-    def reset(self):
-        self.timings.clear()
-        self._start_times.clear()
+            if full_name in self._start_times:
+                self.timings[full_name] += time.time() - self._start_times[full_name]
+                del self._start_times[full_name]
+            self._active_scopes.pop()
 
 class AveragedTimingStats:
     def __init__(self, print_interval=10):

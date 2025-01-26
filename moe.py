@@ -9,6 +9,8 @@ from typing import Optional
 import inspect
 import gc
 import time
+from collections import defaultdict
+
 class Router(nn.Module):
     """
     Router module that determines which expert should process each token.
@@ -549,85 +551,86 @@ class MoEEncoderDecoderGPT(nn.Module):
             router_loss: Combined routing loss from all MoE layers
         """
         device = encoder_idx.device
-        
-        # Ensure input has correct shape
-        if encoder_idx.dim() == 1:
-            encoder_idx = encoder_idx.unsqueeze(0)
-        if decoder_idx.dim() == 1:
-            decoder_idx = decoder_idx.unsqueeze(0)
-        
-        # Process encoder input
-        encoder_pos = torch.arange(0, encoder_idx.size(1), device=device)
-        encoder_emb = self.shared_embedding(encoder_idx)
-        encoder_pos_emb = self.shared_pos_embedding(encoder_pos)
-        
-        # Adjust dimensions for broadcasting
-        encoder_pos_emb = encoder_pos_emb.unsqueeze(0).expand(encoder_idx.size(0), -1, -1)
-        
-        x = self.encoder.drop(encoder_emb + encoder_pos_emb)
-        
         total_router_loss = torch.tensor(0.0, device=device)
         
-        # Encoder forward pass
-        for block in self.encoder.h:
-            x, router_loss = block(x)
-            total_router_loss = total_router_loss + router_loss
+        with timing_stats.track("encoder"):
+            # Process encoder input
+            with timing_stats.track("embeddings"):
+                encoder_pos = torch.arange(0, encoder_idx.size(1), device=device)
+                encoder_emb = self.shared_embedding(encoder_idx)
+                encoder_pos_emb = self.shared_pos_embedding(encoder_pos)
+                encoder_pos_emb = encoder_pos_emb.unsqueeze(0).expand(encoder_idx.size(0), -1, -1)
+                x = self.encoder.drop(encoder_emb + encoder_pos_emb)
             
-        encoder_output = self.encoder.ln_f(x)
+            # Encoder forward pass
+            for i, block in enumerate(self.encoder.h):
+                with timing_stats.track(f"layer_{i}"):
+                    with timing_stats.track("attention"):
+                        attn_output = block.attn(block.ln_1(x))
+                        x = x + attn_output
+                    
+                    with timing_stats.track("moe"):
+                        with timing_stats.track("router"):
+                            moe_input = block.ln_2(x)
+                            routing_logits = block.router(moe_input)
+                        
+                        with timing_stats.track("experts"):
+                            expert_outputs = block.expert_group(moe_input, routing_logits)
+                            x = x + expert_outputs
+                        
+                        router_loss = block.router_z_loss * routing_logits.pow(2).mean()
+                        total_router_loss = total_router_loss + router_loss
+            
+            with timing_stats.track("final_norm"):
+                encoder_output = self.encoder.ln_f(x)
         
-        # Process decoder input
-        decoder_pos = torch.arange(0, decoder_idx.size(1), device=device)
-        decoder_emb = self.shared_embedding(decoder_idx)
-        decoder_pos_emb = self.shared_pos_embedding(decoder_pos)
+        with timing_stats.track("decoder"):
+            # Process decoder input
+            with timing_stats.track("embeddings"):
+                decoder_pos = torch.arange(0, decoder_idx.size(1), device=device)
+                decoder_emb = self.shared_embedding(decoder_idx)
+                decoder_pos_emb = self.shared_pos_embedding(decoder_pos)
+                decoder_pos_emb = decoder_pos_emb.unsqueeze(0).expand(decoder_idx.size(0), -1, -1)
+                x = self.decoder.drop(decoder_emb + decoder_pos_emb)
+            
+            # Decoder forward pass
+            for i, (block, cross_attn) in enumerate(zip(self.decoder.h, self.cross_attention)):
+                with timing_stats.track(f"layer_{i}"):
+                    with timing_stats.track("self_attention"):
+                        attn_output = block.attn(block.ln_1(x))
+                        x = x + attn_output
+                    
+                    with timing_stats.track("cross_attention"):
+                        cross_x = self.cross_ln[i](x)
+                        cross_output = cross_attn(cross_x, key_value=encoder_output)
+                        x = x + cross_output
+                    
+                    with timing_stats.track("moe"):
+                        with timing_stats.track("router"):
+                            moe_input = block.ln_2(x)
+                            routing_logits = block.router(moe_input)
+                        
+                        with timing_stats.track("experts"):
+                            expert_outputs = block.expert_group(moe_input, routing_logits)
+                            x = x + expert_outputs
+                        
+                        router_loss = block.router_z_loss * routing_logits.pow(2).mean()
+                        total_router_loss = total_router_loss + router_loss
+            
+            with timing_stats.track("final_norm"):
+                x = self.decoder.ln_f(x)
         
-        # Adjust dimensions for broadcasting
-        decoder_pos_emb = decoder_pos_emb.unsqueeze(0).expand(decoder_idx.size(0), -1, -1)
-        
-        x = self.decoder.drop(decoder_emb + decoder_pos_emb)
-        
-        # Decoder forward pass with cross-attention
-        for i, (block, cross_attn) in enumerate(zip(self.decoder.h, self.cross_attention)):
-            # Self-attention
-            attn_output = block.attn(block.ln_1(x))
-            x = x + attn_output
-            
-            # Cross-attention
-            cross_x = self.cross_ln[i](x)
-            cross_output = cross_attn(cross_x, key_value=encoder_output)
-            x = x + cross_output
-            
-            # MoE layer
-            moe_input = block.ln_2(x)
-            moe_out, router_loss = block.moe(moe_input)
-            x = x + moe_out
-            total_router_loss = total_router_loss + router_loss
-            
-        x = self.decoder.ln_f(x)
-        
-        # Calculate logits and loss
-        if targets is not None:
-            logits = self.lm_head(x)
-            
-            # Scale down the router loss by the number of MoE layers
-            num_moe_layers = len(self.encoder.h) + len(self.decoder.h)
-            avg_router_loss = total_router_loss / num_moe_layers
-            
-            # Calculate cross entropy loss using reshape instead of view
-            logits_2d = logits.reshape(-1, logits.size(-1))
-            targets_1d = targets.reshape(-1)
-            
-            ce_loss = F.cross_entropy(
-                logits_2d,
-                targets_1d,
-                ignore_index=-1
-            )
-            
-            # Combine losses with a very small coefficient for router loss
-            loss = ce_loss + 0.0001 * avg_router_loss
-        else:
-            # For generation, only compute logits for the last position
-            logits = self.lm_head(x[:, [-1], :])
-            loss = None
+        with timing_stats.track("head"):
+            if targets is not None:
+                logits = self.lm_head(x)
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1),
+                    ignore_index=-1
+                )
+            else:
+                logits = self.lm_head(x[:, [-1], :])
+                loss = None
         
         return logits, loss, total_router_loss
 
