@@ -424,6 +424,10 @@ def estimate_loss():
     out = {}
     model.eval()
     
+    # Activer le mode évaluation pour les datasets
+    train_dataset.set_eval_mode(True)
+    val_dataset.set_eval_mode(True)
+    
     # Temporarily disable compilation for evaluation
     if hasattr(model, '_orig_mod'):
         eval_model = model._orig_mod
@@ -458,6 +462,10 @@ def estimate_loss():
                 out[split] = float('inf')
                 out[f'{split}_router'] = float('inf')
                 out[f'{split}_ppl'] = float('inf')
+    
+    # Désactiver le mode évaluation
+    train_dataset.set_eval_mode(False)
+    val_dataset.set_eval_mode(False)
     
     model.train()
     return out

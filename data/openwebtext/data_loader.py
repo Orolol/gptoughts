@@ -7,6 +7,8 @@ from torch.utils.data import IterableDataset
 import numpy as np
 import pickle
 import time
+import threading
+from queue import Queue
 
 class TokenTracker:
     def __init__(self):
@@ -15,9 +17,48 @@ class TokenTracker:
     def update(self, new_tokens):
         self.total_tokens += new_tokens
 
+class TokenCache:
+    def __init__(self, cache_dir='data/token_cache'):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        self.current_cache = None
+        self.cache_index = 0
+        self.preload_thread = None
+        self.next_cache = None
+        self.cache_ready = threading.Event()
+        self.cache_queue = Queue(maxsize=2)  # Pour stocker le cache actuel et le suivant
+
+    def get_cache_path(self, split, start_iter):
+        return os.getenv('HF_TOKEN')
+
+    def save_cache(self, tokens, split, start_iter):
+        cache_path = self.get_cache_path(split, start_iter)
+        with open(cache_path, 'wb') as f:
+            pickle.dump(tokens, f)
+
+    def load_cache(self, split, start_iter):
+        cache_path = self.get_cache_path(split, start_iter)
+        if os.path.exists(cache_path):
+            with open(cache_path, 'rb') as f:
+                return pickle.load(f)
+        return None
+
+    def preload_next_cache(self, split, start_iter):
+        """Précharge le prochain cache dans un thread séparé"""
+        def _preload():
+            next_cache = self.load_cache(split, start_iter)
+            if next_cache is not None:
+                self.cache_queue.put(next_cache)
+                self.cache_ready.set()
+
+        self.preload_thread = threading.Thread(target=_preload)
+        self.preload_thread.daemon = True
+        self.preload_thread.start()
+
 class StreamingDataset(IterableDataset):
     def __init__(self, block_size, batch_size, dataset_name="HuggingFaceFW/fineweb-edu", 
-                 dataset_config="CC-MAIN-2024-10", split="train", device='cuda'):
+                 dataset_config="CC-MAIN-2024-10", split="train", device='cuda',
+                 cache_size=1000, eval_cache_size=100):
         super().__init__()
         self.block_size = block_size
         self.batch_size = batch_size
@@ -46,6 +87,16 @@ class StreamingDataset(IterableDataset):
         
         # Save tokenizer metadata
         self.save_meta()
+        
+        self.cache_size = cache_size
+        self.eval_cache_size = eval_cache_size
+        self.token_cache = TokenCache()
+        self.current_iter = 0
+        self.is_eval_mode = False
+        
+        # Précharger le premier cache au démarrage
+        if split == 'train':
+            self.prepare_initial_cache()
     
     def save_meta(self):
         meta = {
@@ -64,8 +115,60 @@ class StreamingDataset(IterableDataset):
         ids.append(self.tokenizer.eos_token_id)
         return ids
     
+    def prepare_initial_cache(self):
+        """Prépare le cache initial s'il n'existe pas"""
+        cache_path = self.token_cache.get_cache_path(self.split, 0)
+        if not os.path.exists(cache_path):
+            print(f"Preparing initial cache for {self.split}...")
+            tokens = []
+            for _ in range(self.cache_size):
+                example = next(self.dataset_iterator)
+                tokens.append(self.process_example(example))
+            self.token_cache.save_cache(tokens, self.split, 0)
+            print("Initial cache prepared")
+        
+        # Précharger le premier cache
+        self.token_cache.preload_next_cache(self.split, 0)
+
+    def set_eval_mode(self, is_eval):
+        """Bascule entre mode évaluation et entraînement"""
+        self.is_eval_mode = is_eval
+        if is_eval:
+            # Charger le cache d'évaluation si nécessaire
+            eval_cache = self.token_cache.load_cache(f"{self.split}_eval", 0)
+            if eval_cache is None:
+                print("Preparing eval cache...")
+                eval_tokens = []
+                for _ in range(self.eval_cache_size):
+                    example = next(self.dataset_iterator)
+                    eval_tokens.append(self.process_example(example))
+                self.token_cache.save_cache(eval_tokens, f"{self.split}_eval", 0)
+                print("Eval cache prepared")
+
     def get_batch(self):
         """Get a batch of token sequences of length block_size."""
+        cache_size = self.eval_cache_size if self.is_eval_mode else self.cache_size
+        
+        # Si on arrive à la fin du cache actuel
+        if self.current_iter % cache_size == 0:
+            # Attendre que le prochain cache soit prêt
+            self.token_cache.cache_ready.wait()
+            self.token_cache.cache_ready.clear()
+            
+            # Récupérer le cache
+            self.current_cache = self.token_cache.cache_queue.get()
+            
+            # Précharger le prochain cache si on n'est pas en mode eval
+            if not self.is_eval_mode:
+                next_start_iter = self.current_iter + cache_size
+                self.token_cache.preload_next_cache(self.split, next_start_iter)
+        
+        # Utiliser les tokens du cache
+        cache_index = self.current_iter % cache_size
+        tokens = self.current_cache[cache_index]
+        self.token_buffer.extend(tokens)
+        self.token_tracker.update(len(tokens))
+        
         # On s'assure d'avoir assez de tokens dans le buffer
         # tracking time to get a batch
         start_time = time.time()
@@ -119,6 +222,7 @@ class StreamingDataset(IterableDataset):
         end_time = time.time()
         # print(f"Time to get a batch: {end_time - start_time:.4f} seconds")
 
+        self.current_iter += 1
         return encoder_input, decoder_input, target
     
     def __iter__(self):
