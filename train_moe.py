@@ -13,8 +13,6 @@ import argparse
 from queue import Queue
 from contextlib import nullcontext
 import random
-import logging
-import warnings
 
 import torch
 import torch.nn.functional as F
@@ -24,7 +22,7 @@ from torch.serialization import add_safe_globals
 
 from transformers import AutoTokenizer
 from model import GPTConfig
-from moe import MoEEncoderDecoderGPT, timing_stats
+from moe import MoEEncoderDecoderGPT
 from data.openwebtext.data_loader import StreamingDataset
 from run_train import get_datasets
 
@@ -36,17 +34,11 @@ console = Console()
 import torch._inductor.config
 import torch._dynamo.config
 
-# Supprimer les warnings de torch inductor
-logging.getLogger("torch._inductor.debug").setLevel(logging.ERROR)
-warnings.filterwarnings("ignore", category=UserWarning)
-os.environ["TORCHINDUCTOR_CACHE_DIR"] = "/tmp/torch_inductor_cache"  # Éviter d'écrire dans le workspace
-
 # Configuration optimisée pour les modèles avec dimensions dynamiques
 torch._dynamo.config.suppress_errors = True
-torch._dynamo.config.cache_size_limit = 16384
-torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = False
-torch._inductor.config.debug = False  # Désactiver le debug
-torch._inductor.config.trace.enabled = False  # Désactiver le tracing
+torch._dynamo.config.cache_size_limit = 16384  # Augmenté pour gérer plus de cas
+torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = False  # Permettre les graphes dynamiques
+torch._inductor.config.debug = False
 
 # -----------------------------------------------------------------------------
 # Parse command line arguments
@@ -597,14 +589,14 @@ if compile:
     try:
         model = torch.compile(
             model,
+            # mode="reduce-overhead",
             options={
                 "max_autotune": True,
                 "epilogue_fusion": True,
-                "triton.cudagraphs": False,
-                "trace.enabled": False,  # Désactiver le tracing
+                "triton.cudagraphs": False,  # Désactivé pour plus de stabilité
+                "trace.enabled": True,
                 "trace.graph_diagram": False,
-                "debug": False,  # Désactiver le debug
-                "verbose": False  # Désactiver les messages verbeux
+                "triton.cudagraphs": True,
             }
         )
     except Exception as e:
@@ -679,9 +671,6 @@ print_memory_stats("Initial")
 
 # training loop
 while True:
-    # Reset timing stats au début de chaque itération
-    timing_stats.reset()
-    
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
@@ -809,12 +798,9 @@ while True:
                     router_loss = router_loss / gradient_accumulation_steps
                     combined_loss = loss + router_aux_loss_coef * router_loss
                     
-                    # Mesurer le temps du backward
-                    backward_start = time.time()
+                    # Backward pass
                     scaled_loss = scaler.scale(combined_loss)
                     scaled_loss.backward()
-                    backward_end = time.time()
-                    timing_stats.backward_time += backward_end - backward_start
                     
                     # Stocker les scalaires et libérer les tenseurs
                     total_loss += loss.item()
@@ -842,7 +828,6 @@ while True:
     # timing and logging
     t1 = time.time()
     dt = t1 - t0
-    timing_stats.total_time = dt
     t0 = t1
     
     if iter_num % log_interval == 0:
@@ -867,9 +852,8 @@ while True:
             mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
 
-        # Ajouter les stats de timing au log
-        print(f"iter {iter_num}: loss {lossf:.4f}, router_loss {router_lossf:.4f}, "
-              f"time {dt*1000:.2f}ms {timing_stats}, lr {lr:.2e}, "
+        print(f"iter {iter_num}: loss {lossf:.4f}, router_loss {router_lossf:.4f}, " 
+              f"time {dt*1000:.2f}ms, lr {lr:.2e}, "
               f"tt {total_tokens:,}, "
               f"t/s {current_tokens_per_sec:.2f}, "
               f"avgt/s {avg_tokens_per_sec:.2f}")

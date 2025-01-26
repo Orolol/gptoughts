@@ -9,27 +9,6 @@ from typing import Optional
 import inspect
 import gc
 import time
-
-class TimingStats:
-    def __init__(self):
-        self.reset()
-    
-    def reset(self):
-        self.router_time = 0.0
-        self.expert_time = 0.0
-        self.attention_time = 0.0
-        self.backward_time = 0.0
-        self.total_time = 0.0
-    
-    def __str__(self):
-        return (f"[R: {self.router_time*1000:.1f}ms "
-                f"E: {self.expert_time*1000:.1f}ms "
-                f"A: {self.attention_time*1000:.1f}ms "
-                f"B: {self.backward_time*1000:.1f}ms]")
-
-# Variable globale pour stocker les stats
-timing_stats = TimingStats()
-
 class Router(nn.Module):
     """
     Router module that determines which expert should process each token.
@@ -85,7 +64,6 @@ class Router(nn.Module):
         self.training_mode = True
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        start_time = time.time()
         batch_size, seq_len, _ = x.shape
         combined_batch_size = batch_size * seq_len
         
@@ -99,6 +77,9 @@ class Router(nn.Module):
         # Réinitialiser les buffers
         self._dispatch_buffer.zero_()
         self._zeros_buffer.zero_()
+        
+        # Time the forward pass
+        start_time = time.time()
         
         # Compute router logits avec normalisation et clipping
         x_reshaped = x.view(combined_batch_size, -1)
@@ -185,8 +166,9 @@ class Router(nn.Module):
         else:
             router_loss = torch.tensor(0.0, device=x.device)
         
+        # Time the forward pass
         end_time = time.time()
-        timing_stats.router_time += end_time - start_time
+        print(f"Forward pass time: {end_time - start_time:.4f} seconds")
         
         return routing_weights.detach(), normalized_dispatch_mask, router_loss
 
@@ -222,7 +204,6 @@ class SharedExpertMLP(nn.Module):
         self._init_weights()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        start_time = time.time()
         B, S, D = x.shape
         
         # Main computation with shared weights
@@ -249,9 +230,6 @@ class SharedExpertMLP(nn.Module):
         
         # Combine main path with adaptation
         hidden = hidden + adapt
-        
-        end_time = time.time()
-        timing_stats.expert_time += end_time - start_time
         
         return self.dropout(self.shared_down(hidden))
 
@@ -476,12 +454,8 @@ class MoEBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, key_value: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
         # Attention
-        start_time = time.time()
         attn_output = self.attn(self.ln_1(x), key_value=key_value)
         x = x + attn_output
-        
-        end_time = time.time()
-        timing_stats.attention_time += end_time - start_time
         
         # MoE
         if self.use_checkpoint and self.training:
