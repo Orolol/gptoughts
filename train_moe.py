@@ -626,11 +626,10 @@ class AveragedTimingStats:
     
     def get_averaged_stats(self):
         if not self.timings:
-            return {}, {}
+            return {}, {}, {}
         
         # Calculate averages
         avg_timings = {}
-        total_time = 0
         
         # First, calculate main categories
         main_categories = {
@@ -639,41 +638,48 @@ class AveragedTimingStats:
             'optimization': 0.0
         }
         
+        # Calculate average for each timing
         for name, times in self.timings.items():
             avg_time = sum(times) / len(times)
             avg_timings[name] = avg_time
             
             # Aggregate into main categories
-            if name.startswith('optimization/forward/forward/encoder'):
+            if 'forward/forward/encoder' in name:
                 main_categories['encoder'] += avg_time
-            elif name.startswith('optimization/forward/forward/decoder'):
+            elif 'forward/forward/decoder' in name:
                 main_categories['decoder'] += avg_time
-            elif name.startswith('optimization'):
+            elif 'optimization' in name:
                 main_categories['optimization'] += avg_time
-            
-            total_time += avg_time
+        
+        # Calculate total time for main categories only
+        total_main_time = sum(main_categories.values())
+        
+        # Calculate total time for detailed breakdown
+        total_detailed_time = avg_timings.get('optimization', 0.0)  # Use root optimization time
         
         # Calculate percentages
-        percentages = {}
-        for name, time in avg_timings.items():
-            percentages[name] = (time / total_time) * 100 if total_time > 0 else 0
-            
-        # Add main category percentages
-        for category, time in main_categories.items():
-            percentages[category] = (time / total_time) * 100 if total_time > 0 else 0
+        main_percentages = {
+            category: (time / total_main_time) * 100 if total_main_time > 0 else 0
+            for category, time in main_categories.items()
+        }
+        
+        detailed_percentages = {
+            name: (time / total_detailed_time) * 100 if total_detailed_time > 0 else 0
+            for name, time in avg_timings.items()
+        }
         
         # Clear timings for next window
         self.timings.clear()
         
-        return main_categories, avg_timings, percentages
+        return main_categories, avg_timings, main_percentages, detailed_percentages
     
     def print_stats(self):
-        main_cats, detailed_timings, percentages = self.get_averaged_stats()
+        main_cats, detailed_timings, main_percentages, detailed_percentages = self.get_averaged_stats()
         
-        print("\nTiming breakdown over last {} iterations:".format(self.print_interval))
+        print(f"\nTiming breakdown over last {self.print_interval} iterations:")
         # Print main categories first
         for category, time in main_cats.items():
-            print(f"{category.capitalize()}: {time*1000:.1f}ms ({percentages[category]:.1f}%)\n")
+            print(f"{category.capitalize()}: {time*1000:.1f}ms ({main_percentages[category]:.1f}%)\n")
         
         print("Detailed timing breakdown:")
         # Sort by time spent (descending)
@@ -684,7 +690,7 @@ class AveragedTimingStats:
         )
         
         for name, time in sorted_timings:
-            print(f"{name}: {time*1000:.1f}ms ({percentages[name]:.1f}%)")
+            print(f"{name}: {time*1000:.1f}ms ({detailed_percentages[name]:.1f}%)")
 
 # Model initialization
 iter_num = 1
