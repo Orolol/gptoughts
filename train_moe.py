@@ -564,134 +564,6 @@ model_args = {
     'expert_k': expert_k
 }
 
-
-# Modifiez la classe TimingStats pour supporter le nested timing
-class TimingStats:
-    def __init__(self):
-        self.timings = defaultdict(float)
-        self._start_times = {}
-        self._active_scopes = []
-    
-    @contextmanager
-    def track(self, name):
-        # Construire le nom complet avec le scope
-        full_name = "/".join(self._active_scopes + [name]) if self._active_scopes else name
-        try:
-            self._start_times[full_name] = time.time()
-            self._active_scopes.append(name)
-            yield
-        finally:
-            if full_name in self._start_times:
-                self.timings[full_name] += time.time() - self._start_times[full_name]
-                del self._start_times[full_name]
-            self._active_scopes.pop()
-    
-    def get_stats(self):
-        """Retourne les timings et les pourcentages"""
-        total_time = sum(self.timings.values())
-        percentages = {k: (v/total_time)*100 for k, v in self.timings.items()}
-        return self.timings, percentages
-    
-    def reset(self):
-        """Réinitialise les timings"""
-        self.timings.clear()
-        self._start_times.clear()
-        self._active_scopes.clear()
-
-class AveragedTimingStats:
-    def __init__(self, print_interval=10):
-        self.timings = defaultdict(list)
-        self.print_interval = print_interval
-        self.current_step = 0
-        self.current_context = []
-        self.start_times = {}
-        
-    @contextmanager
-    def track(self, name):
-        full_name = '/'.join(self.current_context + [name])
-        self.current_context.append(name)
-        start_time = time.time()
-        try:
-            yield
-        finally:
-            duration = time.time() - start_time
-            self.timings[full_name].append(duration)
-            self.current_context.pop()
-    
-    def step(self):
-        self.current_step += 1
-    
-    def should_print(self):
-        return self.current_step % self.print_interval == 0
-    
-    def get_averaged_stats(self):
-        if not self.timings:
-            return {}, {}, {}
-        
-        # Calculate averages
-        avg_timings = {}
-        
-        # First, calculate main categories
-        main_categories = {
-            'encoder': 0.0,
-            'decoder': 0.0,
-            'optimization': 0.0
-        }
-        
-        # Calculate average for each timing
-        for name, times in self.timings.items():
-            avg_time = sum(times) / len(times)
-            avg_timings[name] = avg_time
-            
-            # Aggregate into main categories
-            if 'forward/forward/encoder' in name:
-                main_categories['encoder'] += avg_time
-            elif 'forward/forward/decoder' in name:
-                main_categories['decoder'] += avg_time
-            elif 'optimization' in name:
-                main_categories['optimization'] += avg_time
-        
-        # Calculate total time for main categories only
-        total_main_time = sum(main_categories.values())
-        
-        # Calculate total time for detailed breakdown
-        total_detailed_time = avg_timings.get('optimization', 0.0)  # Use root optimization time
-        
-        # Calculate percentages
-        main_percentages = {
-            category: (time / total_main_time) * 100 if total_main_time > 0 else 0
-            for category, time in main_categories.items()
-        }
-        
-        detailed_percentages = {
-            name: (time / total_detailed_time) * 100 if total_detailed_time > 0 else 0
-            for name, time in avg_timings.items()
-        }
-        
-        # Clear timings for next window
-        self.timings.clear()
-        
-        return main_categories, avg_timings, main_percentages, detailed_percentages
-    
-    def print_stats(self):
-        main_cats, detailed_timings, main_percentages, detailed_percentages = self.get_averaged_stats()
-        
-        print(f"\nTiming breakdown over last {self.print_interval} iterations:")
-        # Print main categories first
-        for category, time in main_cats.items():
-            print(f"{category.capitalize()}: {time*1000:.1f}ms ({main_percentages[category]:.1f}%)\n")
-        
-        print("Detailed timing breakdown:")
-        # Sort by time spent (descending)
-        sorted_timings = sorted(
-            detailed_timings.items(), 
-            key=lambda x: x[1], 
-            reverse=True
-        )
-        
-        for name, time in sorted_timings:
-            print(f"{name}: {time*1000:.1f}ms ({detailed_percentages[name]:.1f}%)")
-
 # Model initialization
 iter_num = 1
 best_val_loss = float('inf')
@@ -807,7 +679,7 @@ if compile:
         compile = False
 
 # Remplacez timing_stats = TimingStats() par:
-timing_stats = AveragedTimingStats(print_interval=10)  # Afficher les stats tous les 10 iterations
+timing_stats = AveragedTimingStats(print_interval=100)  # Afficher les stats tous les 10 iterations
 # Après la création du modèle et avant de le déplacer sur le device
 model.set_timing_stats(timing_stats)
 
@@ -890,8 +762,6 @@ window_size = 10   # Taille de la fenêtre pour la moyenne glissante
 
 print(f"Starting training with {num_experts} experts and top-{expert_k} routing")
 print_memory_stats("Initial")
-
-
 
 # training loop
 while True:
@@ -988,64 +858,28 @@ while True:
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0
         total_router_loss = 0
-        skip_optimizer_step = False
 
-        try:
-            for micro_step in range(gradient_accumulation_steps):
-                if ddp:
-                    model.require_backward_grad_sync = (
-                        micro_step == gradient_accumulation_steps - 1
-                    )
-                
-                with timing_stats.track("forward"), torch.amp.autocast(enabled=True, device_type=device_type):
-                    # Libérer la mémoire des tenseurs précédents
-                    if 'encoder_input' in locals(): del encoder_input
-                    if 'decoder_input' in locals(): del decoder_input
-                    if 'target' in locals(): del target
-                    
-                    encoder_input, decoder_input, target = next(train_iterator)
-                    encoder_input, decoder_input, target = pad_sequences(
-                        encoder_input, decoder_input, target
-                    )
-                    
-                    # Forward pass
-                    logits, loss, router_loss = model(encoder_input, decoder_input, target)
-                    batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
-                    total_tokens += batch_tokens
-                    tokens_window.append((time.time(), batch_tokens))
-                    if len(tokens_window) > window_size:
-                        tokens_window.pop(0)
-                    del logits
-                
-                with timing_stats.track("backward"):
-                    if loss is not None:
-                        loss = loss / gradient_accumulation_steps
-                        router_loss = router_loss / gradient_accumulation_steps
-                        combined_loss = loss + router_aux_loss_coef * router_loss
-                        
-                        # Backward pass
-                        scaled_loss = scaler.scale(combined_loss)
-                        scaled_loss.backward()
-                        
-                        total_loss += loss.item()
-                        total_router_loss += router_loss.item()
-                        del loss, router_loss, combined_loss, scaled_loss
-
-                with timing_stats.track("optimizer_step"):
-                    if grad_clip != 0.0:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    
-                    scaler.step(optimizer)
-                    scaler.update()
-
-        except Exception as e:
-            print(f"Training iteration failed: {e}")
-            print(traceback.format_exc())
-            cleanup_memory()
-            if ddp:
-                dist_barrier()
-            continue
+        for micro_step in range(gradient_accumulation_steps):
+            with timing_stats.track("forward"):
+                # Forward pass
+                logits, loss, router_loss = model(encoder_input, decoder_input, target)
+            
+            with timing_stats.track("backward"):
+                # Backward pass
+                if loss is not None:
+                    loss = loss / gradient_accumulation_steps
+                    router_loss = router_loss / gradient_accumulation_steps
+                    combined_loss = loss + router_aux_loss_coef * router_loss
+                    scaled_loss = scaler.scale(combined_loss)
+                    scaled_loss.backward()
+            
+            with timing_stats.track("optimizer"):
+                # Optimizer step
+                if grad_clip != 0.0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
 
     # timing and logging
     t1 = time.time()
