@@ -1061,3 +1061,37 @@ if device_type == 'cuda':
 if master_process:
     print("Training finished!")
 
+def get_datasets(block_size, batch_size, device):
+    train_dataset = StreamingDataset(
+        block_size=block_size,
+        batch_size=batch_size,
+        split='train',
+        device=device
+    )
+    
+    val_dataset = StreamingDataset(
+        block_size=block_size,
+        batch_size=batch_size,
+        split='validation',
+        device=device
+    )
+    
+    # Wrap avec DataLoader pour le parallélisme
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=None,  # Dataset gère déjà le batching
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2
+    )
+    
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=None,
+        num_workers=2,
+        pin_memory=True,
+        prefetch_factor=2
+    )
+    
+    return train_loader, val_loader
+

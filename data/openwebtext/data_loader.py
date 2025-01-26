@@ -17,23 +17,21 @@ class TokenTracker:
 
 class StreamingDataset(IterableDataset):
     def __init__(self, block_size, batch_size, dataset_name="HuggingFaceFW/fineweb-edu", 
-                 dataset_config="CC-MAIN-2024-10", split="train", device='cuda'):
+                 dataset_config="CC-MAIN-2024-10", split="train", device='cuda',
+                 num_workers=4):
         super().__init__()
         self.block_size = block_size
         self.batch_size = batch_size
         self.device = device
         self.dataset_config = dataset_config
         self.split = split
+        self.num_workers = num_workers
         
         access_token = os.getenv('HF_TOKEN')
         
         # Initialize tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True, access_token=access_token)
         self.tokenizer.pad_token = self.tokenizer.eos_token
-        
-        # Initialize dataset
-        self.dataset = load_dataset(dataset_name, name=dataset_config, split=split, streaming=True)
-        self.dataset = self.dataset.shuffle(buffer_size=10_000)
         
         # Initialize token tracker
         tracker_dir = os.path.join('data', 'token_tracking')
@@ -93,11 +91,12 @@ class StreamingDataset(IterableDataset):
     
     def reset_dataset(self):
         """Reset the dataset iterator"""
-        self.dataset = load_dataset("HuggingFaceFW/fineweb-2", 
-                                  num_proc=4,
-                                  name=self.dataset_config,
-                                  split=self.split,
-                                  streaming=True)
+        self.dataset = load_dataset(
+            "HuggingFaceFW/fineweb-2", 
+            name=self.dataset_config,
+            split=self.split,
+            streaming=True
+        )
         self.dataset = self.dataset.shuffle(buffer_size=10_000)
         self.dataset_iterator = iter(self.dataset)
         self.token_buffer = []
