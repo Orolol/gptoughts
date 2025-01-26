@@ -114,7 +114,7 @@ class StreamingDataset(IterableDataset):
         
         while retry_count < max_retries:
             try:
-                print("Starting prefetch stream")
+                print("Starting prefetch stream", retry_count)
                 with torch.cuda.stream(self.prefetch_stream):
                     # Remplir le buffer en arrière-plan
                     print("Filling token buffer")
