@@ -600,158 +600,91 @@ class TimingStats:
 
 class AveragedTimingStats:
     def __init__(self, print_interval=10):
+        self.timings = defaultdict(list)
         self.print_interval = print_interval
-        self.current_stats = TimingStats()
-        self.accumulated_timings = defaultdict(list)
-        self.iter_count = 0
-    
+        self.current_step = 0
+        self.current_context = []
+        self.start_times = {}
+        
     @contextmanager
     def track(self, name):
-        with self.current_stats.track(name):
+        full_name = '/'.join(self.current_context + [name])
+        self.current_context.append(name)
+        start_time = time.time()
+        try:
             yield
+        finally:
+            duration = time.time() - start_time
+            self.timings[full_name].append(duration)
+            self.current_context.pop()
     
     def step(self):
-        """Appelé à la fin de chaque itération"""
-        timings, _ = self.current_stats.get_stats()
-        for name, time_value in timings.items():
-            self.accumulated_timings[name].append(time_value)
-        self.iter_count += 1
-        self.current_stats.reset()
+        self.current_step += 1
     
     def should_print(self):
-        return self.iter_count >= self.print_interval
+        return self.current_step % self.print_interval == 0
     
-    def _format_timing_stats(self, avg_timings, percentages):
-        """Format timing stats in a hierarchical and readable way"""
-        # Regrouper les statistiques par type d'opération
-        stats = {
-            'encoder': {
-                'attention': [],
-                'moe': {
-                    'router': [],
-                    'experts': []
-                },
-                'other': 0.0,
-                'total': 0.0
-            },
-            'decoder': {
-                'self_attention': [],
-                'cross_attention': [],
-                'moe': {
-                    'router': [],
-                    'experts': []
-                },
-                'other': 0.0,
-                'total': 0.0
-            },
-            'other': 0.0
-        }
-        
-        for name, time in avg_timings.items():
-            parts = name.split('/')
-            if 'optimization' in parts:
-                parts = parts[1:]  # Ignorer le préfixe optimization
-            
-            if not parts:
-                continue
-                
-            if parts[0] == 'encoder':
-                stats['encoder']['total'] += time
-                if 'attention' in name:
-                    stats['encoder']['attention'].append(time)
-                elif 'moe/router' in name:
-                    stats['encoder']['moe']['router'].append(time)
-                elif 'moe/experts' in name:
-                    stats['encoder']['moe']['experts'].append(time)
-                elif not any(x in name for x in ['layer', 'moe', 'attention']):
-                    stats['encoder']['other'] += time
-                
-            elif parts[0] == 'decoder':
-                stats['decoder']['total'] += time
-                if 'self_attention' in name:
-                    stats['decoder']['self_attention'].append(time)
-                elif 'cross_attention' in name:
-                    stats['decoder']['cross_attention'].append(time)
-                elif 'moe/router' in name:
-                    stats['decoder']['moe']['router'].append(time)
-                elif 'moe/experts' in name:
-                    stats['decoder']['moe']['experts'].append(time)
-                elif not any(x in name for x in ['layer', 'moe', 'attention']):
-                    stats['decoder']['other'] += time
-            else:
-                stats['other'] += time
-        
-        # Formatter la sortie
-        lines = []
-        total_time = sum(avg_timings.values())
-        
-        def format_time(time_value, total=total_time):
-            return f"{time_value*1000:.1f}ms ({time_value/total*100:.1f}%)"
-        
-        def avg_time(times):
-            if not times:
-                return 0.0
-            return sum(times) / len(times)
-        
-        # Encoder stats
-        enc = stats['encoder']
-        lines.append(f"Encoder: {format_time(enc['total'])}")
-        if enc['attention']:
-            lines.append(f"  Attention: {format_time(avg_time(enc['attention']))} (per layer)")
-        if enc['moe']['router']:
-            lines.append(f"  Router: {format_time(avg_time(enc['moe']['router']))} (per layer)")
-        if enc['moe']['experts']:
-            lines.append(f"  Experts: {format_time(avg_time(enc['moe']['experts']))} (per layer)")
-        if enc['other'] > 0:
-            lines.append(f"  Other: {format_time(enc['other'])}")
-        
-        # Decoder stats
-        dec = stats['decoder']
-        lines.append(f"\nDecoder: {format_time(dec['total'])}")
-        if dec['self_attention']:
-            lines.append(f"  Self-Attention: {format_time(avg_time(dec['self_attention']))} (per layer)")
-        if dec['cross_attention']:
-            lines.append(f"  Cross-Attention: {format_time(avg_time(dec['cross_attention']))} (per layer)")
-        if dec['moe']['router']:
-            lines.append(f"  Router: {format_time(avg_time(dec['moe']['router']))} (per layer)")
-        if dec['moe']['experts']:
-            lines.append(f"  Experts: {format_time(avg_time(dec['moe']['experts']))} (per layer)")
-        if dec['other'] > 0:
-            lines.append(f"  Other: {format_time(dec['other'])}")
-        
-        # Other stats
-        if stats['other'] > 0:
-            lines.append(f"\nOther: {format_time(stats['other'])}")
-        
-        return "\n".join(lines)
-
     def get_averaged_stats(self):
-        """Retourne les statistiques moyennes et réinitialise l'accumulateur"""
-        if not self.accumulated_timings:
+        if not self.timings:
             return {}, {}
+        
+        # Calculate averages
+        avg_timings = {}
+        total_time = 0
+        
+        # First, calculate main categories
+        main_categories = {
+            'encoder': 0.0,
+            'decoder': 0.0,
+            'optimization': 0.0
+        }
+        
+        for name, times in self.timings.items():
+            avg_time = sum(times) / len(times)
+            avg_timings[name] = avg_time
             
-        avg_timings = {
-            name: sum(values) / len(values) 
-            for name, values in self.accumulated_timings.items()
-        }
+            # Aggregate into main categories
+            if name.startswith('optimization/forward/forward/encoder'):
+                main_categories['encoder'] += avg_time
+            elif name.startswith('optimization/forward/forward/decoder'):
+                main_categories['decoder'] += avg_time
+            elif name.startswith('optimization'):
+                main_categories['optimization'] += avg_time
+            
+            total_time += avg_time
         
-        total_time = sum(avg_timings.values())
-        percentages = {
-            k: (v/total_time)*100 
-            for k, v in avg_timings.items()
-        }
+        # Calculate percentages
+        percentages = {}
+        for name, time in avg_timings.items():
+            percentages[name] = (time / total_time) * 100 if total_time > 0 else 0
+            
+        # Add main category percentages
+        for category, time in main_categories.items():
+            percentages[category] = (time / total_time) * 100 if total_time > 0 else 0
         
-        # Formater les statistiques
-        formatted_stats = self._format_timing_stats(avg_timings, percentages)
-        print(f"\nTiming breakdown over last {self.print_interval} iterations:")
-        print(formatted_stats)
+        # Clear timings for next window
+        self.timings.clear()
         
-        # Réinitialiser les accumulateurs
-        self.accumulated_timings.clear()
-        self.iter_count = 0
+        return main_categories, avg_timings, percentages
+    
+    def print_stats(self):
+        main_cats, detailed_timings, percentages = self.get_averaged_stats()
         
-        return avg_timings, percentages
-
+        print("\nTiming breakdown over last {} iterations:".format(self.print_interval))
+        # Print main categories first
+        for category, time in main_cats.items():
+            print(f"{category.capitalize()}: {time*1000:.1f}ms ({percentages[category]:.1f}%)\n")
+        
+        print("Detailed timing breakdown:")
+        # Sort by time spent (descending)
+        sorted_timings = sorted(
+            detailed_timings.items(), 
+            key=lambda x: x[1], 
+            reverse=True
+        )
+        
+        for name, time in sorted_timings:
+            print(f"{name}: {time*1000:.1f}ms ({percentages[name]:.1f}%)")
 
 # Model initialization
 iter_num = 1
@@ -1143,14 +1076,7 @@ while True:
         
         # Afficher les statistiques détaillées de timing uniquement tous les X iterations
         if timing_stats.should_print():
-            avg_timings, percentages = timing_stats.get_averaged_stats()
-            if avg_timings:  # Si nous avons des données à afficher
-                timing_str = " | ".join([
-                    f"{k}: {v*1000:.1f}ms ({percentages[k]:.1f}%)" 
-                    for k, v in sorted(avg_timings.items(), key=lambda x: x[1], reverse=True)
-                ])
-                print(f"Average timing over last {timing_stats.print_interval} iterations:")
-                print(f"Timing breakdown: {timing_str}")
+            timing_stats.print_stats()
 
     iter_num += 1
     local_iter_num += 1
