@@ -121,13 +121,15 @@ if torch.cuda.is_available():
             batch_size = 24  # Augmenté pour mieux utiliser la bande passante
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            # Utiliser plus de streams pour le parallélisme
-            torch.cuda.set_num_threads(8)
+            # Optimiser pour le throughput
+            torch.set_num_threads(8)  # CPU threads pour les opérations host
+            os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
         elif is_ada:
             # Optimisations 4090
             batch_size = 18
             # La 4090 a une meilleure latence mais moins de bande passante
-            torch.cuda.set_num_threads(4)
+            torch.set_num_threads(4)  # Moins de CPU threads
+            os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
         else:
             batch_size = 16
         
@@ -155,13 +157,15 @@ if torch.cuda.is_available():
             gradient_accumulation_steps = 1  # Réduit car batch_size plus grand
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            # Utiliser plus de streams pour le parallélisme
-            torch.cuda.set_num_threads(8)
+            # Optimiser pour le throughput
+            torch.set_num_threads(8)  # CPU threads pour les opérations host
+            os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
         elif is_ada:
             # Optimisations 4090
             batch_size = 32
             # La 4090 a une meilleure latence mais moins de bande passante
-            torch.cuda.set_num_threads(4)
+            torch.set_num_threads(4)  # Moins de CPU threads
+            os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
         else:
             batch_size = 24
             gradient_accumulation_steps = 3
