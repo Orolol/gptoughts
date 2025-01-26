@@ -42,8 +42,10 @@ class StreamingDataset(IterableDataset):
         os.makedirs(tracker_dir, exist_ok=True)
         self.token_tracker = TokenTracker()
         
-        # Ajouter un buffer préfetch plus grand
-        self.prefetch_buffer_size = 200  # Augmenté pour réduire les pauses
+        # Calculer la taille minimale du buffer de préfetch
+        min_tokens_needed = block_size * batch_size * 2  # Pour encoder et decoder
+        self.prefetch_buffer_size = max(min_tokens_needed * 2, 50_000)  # Au moins 2x la taille nécessaire
+        print(f"Prefetch buffer size: {self.prefetch_buffer_size}")
         self.token_buffer = []
         
         # Créer un stream CUDA dédié pour le préfetch
@@ -111,6 +113,8 @@ class StreamingDataset(IterableDataset):
         retry_count = 0
         
         print("Getting batch")
+        required_tokens = self.block_size * self.batch_size * 2
+        print(f"Required tokens for batch: {required_tokens}")
         
         while retry_count < max_retries:
             try:
@@ -119,11 +123,10 @@ class StreamingDataset(IterableDataset):
                     # Remplir le buffer en arrière-plan
                     print("Filling token buffer")
                     
-                    # Ajouter une limite au nombre de tentatives de remplissage
                     fill_attempts = 0
-                    max_fill_attempts = 100  # Limite raisonnable
+                    max_fill_attempts = 1000  # Augmenté car nous avons besoin de plus de tokens
                     
-                    while len(self.token_buffer) < self.prefetch_buffer_size and fill_attempts < max_fill_attempts:
+                    while len(self.token_buffer) < required_tokens and fill_attempts < max_fill_attempts:
                         try:
                             example = next(self.dataset_iterator)
                             if not example or 'text' not in example:
@@ -140,7 +143,7 @@ class StreamingDataset(IterableDataset):
                             
                             # Afficher la progression
                             if fill_attempts % 10 == 0:
-                                print(f"Buffer size: {len(self.token_buffer)}/{self.prefetch_buffer_size}")
+                                print(f"Buffer size: {len(self.token_buffer)}/{required_tokens}")
                                 
                         except StopIteration:
                             print("Reached end of dataset, resetting")
@@ -152,8 +155,6 @@ class StreamingDataset(IterableDataset):
                         print(f"Failed to fill buffer after {max_fill_attempts} attempts")
                         raise RuntimeError("Failed to fill token buffer")
                     
-                    # Vérifier qu'on a assez de tokens pour un batch
-                    required_tokens = self.block_size * self.batch_size * 2
                     if len(self.token_buffer) < required_tokens:
                         print(f"Not enough tokens: {len(self.token_buffer)}/{required_tokens}")
                         retry_count += 1
