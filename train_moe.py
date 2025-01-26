@@ -654,19 +654,21 @@ if compile:
                 "epilogue_fusion": True,
                 "triton.cudagraphs": True,
                 "trace.graph_diagram": False,
-                # Ajouter des options pour mieux gérer les formes dynamiques
-                # "dynamic_shapes": True,
-                "dynamic_memory": True,
-                "max_parallel_block_sizes": 8,
-                "max_autotune_gemm": True,
-                "triton.cudagraphs_auto": True,
-                "triton.store_cache": True,
-                "triton.persistent_reductions": True,
-                "triton.persistent_kernels": True,
-                "triton.skip_cudagraphs_on_divergent": False,
-                "max_autotune_pointwise": True,
-                "max_fused_kernel_size": 128,
                 "layout_optimization": True,
+                "max_autotune_gemm": True,
+                "max_autotune_pointwise": True,
+                "triton.persistent_reductions": True,
+                "triton.unique_kernel_names": True,
+                "triton.store_cubin": True,
+                "max_fusion_size": 128,
+                "triton.cudagraph_trees": True,
+                "profile_bandwidth": True,
+                "permute_fusion": True,
+                "aggressive_fusion": True,
+                "max_autotune_gemm_backends": ["triton"],
+                "coordinate_descent_tuning": True,
+                "combo_kernels": True,
+                "combo_kernels_autotune": True
             }
         )
     except Exception as e:
