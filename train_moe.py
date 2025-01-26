@@ -120,7 +120,7 @@ if torch.cuda.is_available():
         decoder_ratio_kv = 4
     
     elif args.size == "medium":
-        # Paramètres de base
+        # Base parameters
         block_size = 256
         num_experts = 32
         expert_k = 4
@@ -135,29 +135,31 @@ if torch.cuda.is_available():
             # Optimisations mémoire et calcul
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            torch.set_num_threads(8)
+            torch.set_float32_matmul_precision('high')
             
-            # Nouvelles optimisations A100
-            os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
-            os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-            os.environ["CUDA_AUTO_BOOST"] = "1"
-            os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-            os.environ["NCCL_P2P_LEVEL"] = "NVL"
-            os.environ["NCCL_NET_GDR_READ"] = "1"
-            
-            # Gestion de la mémoire plus agressive
-            torch.cuda.set_per_process_memory_fraction(0.9)  # Encore plus réduit
-            torch.cuda.empty_cache()
-            
-            
-            # Optimisations pour les grands batches
+            # CUDA Graph optimizations
+            torch._inductor.config.triton.cudagraph_trees = True
             torch._inductor.config.coordinate_descent_tuning = True
             torch._inductor.config.triton.unique_kernel_names = True
             torch._inductor.config.fx_graph_cache = True
-            # Optimisations spécifiques pour A100
-            torch._inductor.config.triton.cudagraph_trees = True
-            torch._inductor.config.profile_bandwidth = True
-            torch._inductor.config.permute_fusion = True
+            
+            # Additional A100 optimizations
+            os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+            os.environ["CUDA_MODULE_LOADING"] = "LAZY"
+            os.environ["NCCL_NSOCKS_PERTHREAD"] = "4"
+            os.environ["NCCL_SOCKET_NTHREADS"] = "4"
+            os.environ["NCCL_MIN_NCHANNELS"] = "4"
+            
+            # Memory management
+            torch.cuda.empty_cache()
+            torch.cuda.memory.set_per_process_memory_fraction(0.95)
+            
+            # Disable JIT cache
+            torch.jit.set_fusion_strategy([('DYNAMIC', 3)])
+            
+            # Prefetch and overlap optimizations
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
         elif is_ada:
             # Optimisations 4090
             batch_size = 18

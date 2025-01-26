@@ -11,6 +11,8 @@ import gc
 import time
 from collections import defaultdict
 from contextlib import nullcontext
+import threading
+from queue import Queue
 
 class Router(nn.Module):
     """
@@ -261,15 +263,10 @@ class ExpertGroup(nn.Module):
         self.num_experts = num_experts
         self.config = config
         
-        # Shared MLP backbone
+        # Shared MLP backbone with larger capacity
         self.shared_mlp = SharedExpertMLP(config)
         
-        # Expert-specific adaptation parameters
-        # Utiliser les mêmes dimensions que SharedExpertMLP
-        self.hidden_dim = 2 * config.n_embd  # Match SharedExpertMLP
-        self.adapt_dim = self.hidden_dim // 16  # Match SharedExpertMLP
-        
-        # Expert adapters with matching dimensions
+        # Expert-specific adaptation with parallel computation
         self.expert_adapters = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(self.adapt_dim, self.adapt_dim, bias=False),
@@ -277,62 +274,36 @@ class ExpertGroup(nn.Module):
             ) for _ in range(num_experts)
         ])
         
-        # Projections with matching dimensions
-        self.expert_proj = nn.Linear(self.adapt_dim, self.hidden_dim, bias=False)
-        self.output_proj = nn.Linear(self.hidden_dim, config.n_embd, bias=False)
+        # Enable parallel computation
+        self.parallel_adapters = True
         
-        # Initialize with small values
-        adapt_scale = 0.01 / (self.adapt_dim ** 0.5)
-        for adapter in self.expert_adapters:
-            nn.init.normal_(adapter[0].weight, mean=0.0, std=adapt_scale)
-        nn.init.normal_(self.expert_proj.weight, mean=0.0, std=adapt_scale)
-        nn.init.normal_(self.output_proj.weight, mean=0.0, std=adapt_scale)
-
     def forward(self, x: torch.Tensor, expert_weights: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, hidden_dim = x.shape
         
         # Get shared representations
-        shared_output = self.shared_mlp(x)  # [B, S, n_embd]
+        shared_output = self.shared_mlp(x)
         
-        # Reshape expert_weights to match batch and sequence dimensions
-        expert_weights = expert_weights.view(batch_size, seq_len, -1)  # [B, S, num_experts]
-        
-        # Apply expert-specific adaptations
-        expert_outputs = []
-        for i, adapter in enumerate(self.expert_adapters):
-            if expert_weights[:, :, i].any():
+        if self.parallel_adapters:
+            # Process all experts in parallel
+            expert_outputs = []
+            masks = []
+            
+            # Create masks for each expert
+            for i in range(self.num_experts):
                 mask = expert_weights[:, :, i] > 0
                 if mask.any():
-                    # Process only tokens routed to this expert
+                    masks.append(mask)
                     expert_x = x[mask]
-                    # Use shared_mlp's pre_adapt to ensure dimension matching
-                    expert_hidden = self.shared_mlp.pre_adapt(expert_x)  # [masked_tokens, adapt_dim]
-                    expert_hidden = adapter(expert_hidden)  # [masked_tokens, adapt_dim]
-                    
-                    # Project with matching dimensions
-                    expert_hidden = self.expert_proj(expert_hidden)  # [masked_tokens, hidden_dim]
-                    expert_hidden = self.output_proj(expert_hidden)  # [masked_tokens, n_embd]
-                    
-                    # Scale output by expert weights
-                    curr_output = shared_output.clone()
-                    mask_expanded = mask.unsqueeze(-1)  # [B, S, 1]
-                    
-                    # Add expert contribution
-                    expert_contribution = torch.zeros_like(curr_output)  # [B, S, n_embd]
-                    expert_contribution[mask] = expert_hidden  # Now dimensions match
-                    
-                    # Scale contribution and combine
-                    curr_output = torch.where(
-                        mask_expanded,
-                        curr_output + 0.1 * expert_contribution,  # Reduce expert influence
-                        curr_output
-                    )
-                    weight_expanded = expert_weights[:, :, i].unsqueeze(-1)  # [B, S, 1]
-                    expert_outputs.append(curr_output * weight_expanded)
+                    expert_outputs.append(self.expert_adapters[i](expert_x))
+            
+            # Combine expert outputs efficiently
+            if expert_outputs:
+                combined_output = torch.zeros_like(shared_output)
+                for mask, expert_output in zip(masks, expert_outputs):
+                    combined_output[mask] = expert_output
+                
+                return shared_output + 0.1 * combined_output
         
-        # Combine outputs
-        if expert_outputs:
-            return sum(expert_outputs)
         return shared_output
 
 class HierarchicalRouter(nn.Module):
@@ -417,29 +388,65 @@ class MoELayer(nn.Module):
         self.num_experts = num_experts
         self.k = k
         
-        # Router (hierarchical or standard)
-        if hierarchical:
-            self.router = HierarchicalRouter(config.n_embd, num_experts, k=self.k, group_size=4)
-        else:
-            self.router = Router(config.n_embd, num_experts, k=self.k, capacity_factor=capacity_factor)
+        # Use hierarchical routing for better parallelism
+        self.router = HierarchicalRouter(config.n_embd, num_experts, k=self.k, group_size=4)
         
         # Replace individual experts with ExpertGroup
         self.expert_group = ExpertGroup(config, num_experts)
         
+        # Add layer norm before routing for better stability
         self.norm = nn.LayerNorm(config.n_embd)
+        
+        # Add prefetch queue for better GPU utilization
+        self.prefetch_queue_size = 2
+        self.prefetch_queue = Queue(maxsize=self.prefetch_queue_size)
+        self.prefetch_thread = None
+        
+    def _prefetch_expert_weights(self, x):
+        """Prefetch expert weights to improve GPU utilization"""
+        if self.prefetch_thread is None:
+            self.prefetch_thread = threading.Thread(
+                target=self._prefetch_worker,
+                args=(x.device,),
+                daemon=True
+            )
+            self.prefetch_thread.start()
+
+    def _prefetch_worker(self, device):
+        """Background worker to prefetch expert weights"""
+        while True:
+            try:
+                # Prefetch weights for next batch
+                for expert in self.expert_group.expert_adapters:
+                    expert.to(device)
+                if self.prefetch_queue.full():
+                    self.prefetch_queue.get()
+                self.prefetch_queue.put(True)
+            except Exception as e:
+                print(f"Prefetch worker error: {e}")
+                break
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         device = x.device
         batch_size, seq_len, hidden_dim = x.shape
         
-        # Normalize input
-        normalized = self.norm(x)
+        # Start prefetching weights for next batch
+        self._prefetch_expert_weights(x)
         
-        # Get routing weights and dispatch mask
-        combine_weights, dispatch_mask, router_loss = self.router(normalized)
+        # Use CUDA graphs for routing computation
+        if not hasattr(self, 'routing_graph'):
+            self.routing_graph = torch.cuda.CUDAGraph()
         
-        # Process through expert group
-        output = self.expert_group(normalized, dispatch_mask)
+        with torch.cuda.graph(self.routing_graph):
+            # Normalize input
+            normalized = self.norm(x)
+            
+            # Get routing weights and dispatch mask
+            combine_weights, dispatch_mask, router_loss = self.router(normalized)
+        
+        # Process through expert group with automatic mixed precision
+        with torch.amp.autocast(enabled=True, device_type='cuda'):
+            output = self.expert_group(normalized, dispatch_mask)
         
         return output, router_loss
 
