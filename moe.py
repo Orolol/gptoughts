@@ -33,14 +33,16 @@ class Router(nn.Module):
         )
         
         # Better initialization for routing
-        nn.init.normal_(self.router[0].weight, mean=0.0, std=0.01)
+        nn.init.kaiming_normal_(self.router[0].weight, mode='fan_out', nonlinearity='linear')
+        with torch.no_grad():
+            self.router[0].weight.data *= 0.1  # Reduce initial magnitude
         
         # Increased temperature for softer routing decisions
         self.temperature = nn.Parameter(torch.ones(1) * 0.1)
         
-        # Adjusted loss coefficients
-        self.router_z_loss_coef = 0.01  # Increased from 0.001
-        self.load_balance_coef = 0.01   # Increased from 0.001
+        # Modified loss coefficients
+        self.router_z_loss_coef = 0.001  # Reduced from 0.01
+        self.load_balance_coef = 0.1      # Increased from 0.01
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
@@ -60,7 +62,18 @@ class Router(nn.Module):
         expert_load = dispatch_mask.sum(dim=1).mean(0)
         load_balance_loss = expert_load.var()  # Equivalent to MSE from mean
         
-        return routing_weights.detach(), dispatch_mask, self.load_balance_coef * load_balance_loss
+        # Add back z-loss for stability
+        router_z_loss = torch.square(router_logits).mean()
+        total_loss = (
+            self.router_z_loss_coef * router_z_loss +
+            self.load_balance_coef * load_balance_loss
+        )
+        
+        # Constrain temperature to prevent extreme values
+        with torch.no_grad():
+            self.temperature.data.clamp_(min=0.01, max=1.0)
+        
+        return routing_weights.detach(), dispatch_mask, total_loss
 
 class SharedExpertMLP(nn.Module):
     """
@@ -196,7 +209,8 @@ class ExpertGroup(nn.Module):
         expert_outputs = expert_outputs.view(batch_size, seq_len, self.num_experts, -1)
         combined = torch.einsum('bse,bsed->bsd', expert_weights, expert_outputs)
         
-        return shared_output + 0.1 * combined
+        # Increase expert contribution gradually
+        return shared_output + 0.3 * combined
 
 class HierarchicalRouter(nn.Module):
     """
@@ -687,19 +701,19 @@ class MoEEncoderDecoderGPT(nn.Module):
         #     else:
         #         print(f"Other param: {name} - {param.numel():,} parameters")
         
-        # Create optimizer groups with different hyperparameters
+        # Create optimizer groups with different learning rates
         optim_groups = [
             # Expert parameters
             {
                 'params': expert_params,
                 'weight_decay': weight_decay,
-                'lr': learning_rate
+                'lr': learning_rate * 0.5  # Reduced learning rate
             },
             # Router parameters (lower learning rate)
             {
                 'params': router_params,
-                'weight_decay': 0.0,  # No weight decay for router
-                'lr': learning_rate  # Lower learning rate for stability
+                'weight_decay': 0.0,
+                'lr': learning_rate * 0.1  # Significantly reduced
             },
             # Other parameters
             {
