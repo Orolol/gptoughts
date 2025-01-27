@@ -49,6 +49,7 @@ class AveragedTimingStats:
         self.last_tokens = 0
         self.last_time = time.time()
         self.cycle_start_time = time.time()
+        self.batch_count = 0
         
     @contextmanager
     def track(self, name):
@@ -72,6 +73,31 @@ class AveragedTimingStats:
         total_time = sum(self.timings['total_batch'])
         total_tokens = sum(self.timings['tokens'])
         return total_tokens / total_time if total_time > 0 else 0
+
+    def get_averaged_stats(self):
+        """Calculate average timings and percentages for all tracked operations"""
+        if not self.timings:
+            return {}, {}
+
+        # Calculate averages for each timing category
+        avg_timings = {}
+        total_time = 0.0
+        for name, times in self.timings.items():
+            if name == 'tokens':
+                continue  # Skip token counts
+            avg = sum(times) / len(times) if times else 0
+            avg_timings[name] = avg
+            if name != 'total_batch':  # Exclude total batch time from individual ops
+                total_time += avg * len(times)
+
+        # Calculate percentages relative to total tracked time
+        percentages = {}
+        for name, avg in avg_timings.items():
+            if name == 'total_batch' or name == 'tokens':
+                continue
+            percentages[name] = (avg / total_time) * 100 if total_time > 0 else 0
+
+        return avg_timings, percentages
 
 # Permettre time.time() dans le graphe
 allow_in_graph(time.time)
@@ -932,8 +958,8 @@ while True:
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0
         total_router_loss = 0
+        batch_tokens = 0  # Track total tokens for this batch
         
-        # Start tracking batch timing
         timing_stats.start_batch()
         
         try:
@@ -958,11 +984,12 @@ while True:
                 total_loss += loss_val
                 total_router_loss += router_loss_val
                 
-                batch_tokens = gradient_accumulation_steps * batch_size * block_size
-                total_tokens += batch_tokens
+                # Accumulate tokens (per microstep)
+                micro_batch_tokens = batch_size * block_size  # Tokens per microstep
+                batch_tokens += micro_batch_tokens  # Sum across microsteps
                 
-                # End of batch processing
-                timing_stats.end_batch(batch_tokens)
+                # End of batch processing - call once per batch
+                timing_stats.end_batch(batch_tokens)  # Pass total tokens for full batch
 
         except Exception as e:
             print(f"Training failed at iter {iter_num}: {e}")
