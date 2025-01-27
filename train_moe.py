@@ -206,8 +206,8 @@ if torch.cuda.is_available():
         # Ajustements spécifiques selon le GPU
         if is_ampere:
             # Optimisations A100
-            batch_size = 50  # Réduit pour éviter OOM
-            gradient_accumulation_steps = 4  # Augmenté pour compenser
+            batch_size = 54  # Réduit pour éviter OOM
+            gradient_accumulation_steps = 2  # Augmenté pour compenser
             
             # Optimisations mémoire et calcul
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -880,6 +880,7 @@ def forward_backward_step(micro_step, total_steps):
 
 # training loop
 while True:
+    print("Starting training loop, iter_num:", iter_num)
     # determine and set the learning rate for this iteration
     with timing_stats.track("lr_update"):
         lr = get_lr(iter_num) if decay_lr else learning_rate
