@@ -977,12 +977,13 @@ while True:
                 
                 with timing_stats.track("forward"), torch.amp.autocast(enabled=True, device_type=device_type):
                     # Libérer la mémoire des tenseurs précédents
-                    if 'encoder_input' in locals(): del encoder_input
-                    if 'decoder_input' in locals(): del decoder_input
-                    if 'target' in locals(): del target
+                    # if 'encoder_input' in locals(): del encoder_input
+                    # if 'decoder_input' in locals(): del decoder_input
+                    # if 'target' in locals(): del target
                     
                     loss, router_loss = forward_backward_step()
-                    batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
+                    # batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
+                    batch_tokens = gradient_accumulation_steps * batch_size * block_size
                     total_tokens += batch_tokens
                     tokens_window.append((time.time(), batch_tokens))
                     if len(tokens_window) > window_size:
