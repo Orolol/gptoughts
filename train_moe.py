@@ -851,20 +851,12 @@ def forward_backward_step(micro_step, total_steps):
 
         # Backward pass
         with timing_stats.track("backward"):
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-        
-        # Free unused memory immediately
-        del logits, loss, router_loss
-        torch.cuda.empty_cache()
+            scaler.scale(combined_loss).backward()  # Main backward pass
         
         return combined_loss.item(), router_loss.item()
     
     except Exception as e:
         print(f"Microstep {micro_step} failed: {e}")
-        optimizer.zero_grad(set_to_none=True)
         return 0.0, 0.0
 
 # training loop
@@ -1001,6 +993,13 @@ while True:
             if ddp:
                 torch.distributed.destroy_process_group()
             sys.exit(1)
+
+    # After all microsteps:
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
     t1 = time.time()
