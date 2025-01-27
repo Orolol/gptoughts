@@ -55,22 +55,38 @@ class StreamingDataset(IterableDataset):
         self.dataset_config = dataset_config
         self.split = split
         
+        # Prefetch queue size
+        self.prefetch_factor = 3
+        self.prefetch_queue = Queue(maxsize=self.prefetch_factor)
+        self.shutdown_event = threading.Event()
+        
         access_token = os.getenv('HF_TOKEN')
         
-        # Initialize tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True, access_token=access_token)
+        # Initialize tokenizer with faster tokenization
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            "meta-llama/Llama-3.2-1B-Instruct", 
+            use_fast=True,
+            access_token=access_token,
+            model_max_length=block_size,
+            padding_side='right'
+        )
         self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        # Initialize dataset
-        self.dataset = load_dataset(dataset_name, name=dataset_config, split=split, streaming=True)
-        self.dataset = self.dataset.shuffle(buffer_size=10_000)
+        # Initialize dataset with multiple processes
+        self.dataset = load_dataset(
+            dataset_name, 
+            name=dataset_config, 
+            split=split, 
+            streaming=True,
+            num_proc=4
+        )
+        self.dataset = self.dataset.shuffle(buffer_size=20_000)
         
         # Initialize token tracker
         tracker_dir = os.path.join('data', 'token_tracking')
         os.makedirs(tracker_dir, exist_ok=True)
         self.token_tracker = TokenTracker()
         
-        # Modifions la façon dont nous gérons le dataset
         self.dataset_iterator = iter(self.dataset)
         self.token_buffer = []
         
@@ -83,10 +99,14 @@ class StreamingDataset(IterableDataset):
         self.current_iter = 0
         self.is_eval_mode = False
         
-        # Précharger le premier cache au démarrage
+        # Start prefetch thread
+        self.prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
+        self.prefetch_thread.start()
+        
+        # Prepare initial cache
         if split == 'train':
             self.prepare_initial_cache()
-    
+            
     def save_meta(self):
         meta = {
             'vocab_size': len(self.tokenizer),
@@ -133,76 +153,72 @@ class StreamingDataset(IterableDataset):
                 self.token_cache.save_cache(eval_tokens, f"{self.split}_eval", 0)
                 print("Eval cache prepared")
 
-    def get_batch(self):
-        """Get a batch of token sequences of length block_size."""
-        cache_size = self.eval_cache_size if self.is_eval_mode else self.cache_size
-        
-        # If we're at the end of current cache
-        if self.current_iter % cache_size == 0:
-            # Wait for next cache to be ready
-            self.token_cache.cache_ready.wait()
-            self.token_cache.cache_ready.clear()
-            
-            # Get cache
-            self.current_cache = self.token_cache.cache_queue.get()
-            
-            # Preload next cache if not in eval mode
-            if not self.is_eval_mode:
-                next_start_iter = self.current_iter + cache_size
-                self.token_cache.preload_next_cache(self.split, next_start_iter)
-        
-        # Use tokens from cache more efficiently
-        cache_index = self.current_iter % cache_size
-        tokens = self.current_cache[cache_index]
-        
-        # Process in larger chunks for better GPU utilization
-        chunk_size = self.block_size * self.batch_size * 4  # Increased chunk size
-        
-        while len(self.token_buffer) < chunk_size:
+    def _prefetch_worker(self):
+        """Worker thread to prefetch and prepare batches"""
+        while not self.shutdown_event.is_set():
             try:
-                example = next(self.dataset_iterator)
-                new_tokens = self.process_example(example)
-                self.token_buffer.extend(new_tokens)
-                self.token_tracker.update(len(new_tokens))
-            except StopIteration:
-                self.dataset = load_dataset(self.dataset_name,
-                                          name=self.dataset_config,
-                                          split=self.split,
-                                          streaming=True)
-                self.dataset = self.dataset.shuffle(buffer_size=10_000)
-                self.dataset_iterator = iter(self.dataset)
-                if len(self.token_buffer) == 0:
-                    continue
-                break
-
-        # Process tokens in chunks
-        total_length = self.block_size * self.batch_size
-        
-        # Prepare tensors on CPU first then transfer to GPU in one go
-        encoder_input = torch.tensor(self.token_buffer[:total_length], 
-                                   dtype=torch.long)
-        decoder_input = torch.tensor(self.token_buffer[total_length:total_length*2], 
-                                   dtype=torch.long)
-        target = torch.tensor(self.token_buffer[total_length+1:total_length*2+1], 
-                             dtype=torch.long)
-        
-        # Transfer to GPU in parallel using a separate CUDA stream
-        with torch.cuda.stream(torch.cuda.Stream()):
-            encoder_input = encoder_input.to(self.device, non_blocking=True)
-            decoder_input = decoder_input.to(self.device, non_blocking=True)
-            target = target.to(self.device, non_blocking=True)
-
-        # Reshape with proper contiguous memory layout
-        encoder_input = encoder_input.view(self.batch_size, self.block_size).contiguous()
-        decoder_input = decoder_input.view(self.batch_size, self.block_size).contiguous()
-        target = target.view(self.batch_size, self.block_size).contiguous()
-
-        # Clean buffer
-        self.token_buffer = self.token_buffer[total_length*2:]
-        
-        self.current_iter += 1
-        return encoder_input, decoder_input, target
-    
+                if self.prefetch_queue.qsize() < self.prefetch_factor:
+                    # Prepare next batch
+                    batch = self._prepare_batch()
+                    if batch is not None:
+                        self.prefetch_queue.put(batch)
+            except Exception as e:
+                print(f"Prefetch worker error: {e}")
+                continue
+            time.sleep(0.001)  # Small sleep to prevent busy waiting
+            
+    def _prepare_batch(self):
+        """Prepare a single batch in the background"""
+        try:
+            # Get data from cache or dataset
+            if self.current_iter % self.cache_size == 0:
+                self.token_cache.cache_ready.wait()
+                self.current_cache = self.token_cache.cache_queue.get()
+                if not self.is_eval_mode:
+                    next_start_iter = self.current_iter + self.cache_size
+                    self.token_cache.preload_next_cache(self.split, next_start_iter)
+            
+            # Process batch
+            cache_index = self.current_iter % self.cache_size
+            tokens = self.current_cache[cache_index]
+            
+            # Prepare tensors on CPU first
+            encoder_input = torch.tensor(tokens[:self.block_size], dtype=torch.long)
+            decoder_input = torch.tensor(tokens[self.block_size:self.block_size*2], dtype=torch.long)
+            target = torch.tensor(tokens[self.block_size+1:self.block_size*2+1], dtype=torch.long)
+            
+            # Pin memory for faster transfer
+            if self.device != 'cpu':
+                encoder_input = encoder_input.pin_memory()
+                decoder_input = decoder_input.pin_memory()
+                target = target.pin_memory()
+            
+            return encoder_input, decoder_input, target
+            
+        except Exception as e:
+            print(f"Batch preparation error: {e}")
+            return None
+            
+    def get_batch(self):
+        """Get a batch with prefetching"""
+        try:
+            # Get pre-fetched batch
+            encoder_input, decoder_input, target = self.prefetch_queue.get()
+            
+            # Transfer to device in parallel with next batch preparation
+            if self.device != 'cpu':
+                encoder_input = encoder_input.to(self.device, non_blocking=True)
+                decoder_input = decoder_input.to(self.device, non_blocking=True)
+                target = target.to(self.device, non_blocking=True)
+            
+            self.current_iter += 1
+            return encoder_input, decoder_input, target
+            
+        except Exception as e:
+            print(f"Error getting batch: {e}")
+            # Fallback to synchronous batch preparation
+            return self._prepare_batch()
+            
     def __iter__(self):
         while True:
             yield self.get_batch()
@@ -210,6 +226,11 @@ class StreamingDataset(IterableDataset):
     def get_total_tokens(self):
         """Return the total number of tokens processed so far."""
         return self.token_tracker.total_tokens
+
+    def __del__(self):
+        self.shutdown_event.set()
+        if hasattr(self, 'prefetch_thread'):
+            self.prefetch_thread.join(timeout=1.0)
 
 # Example usage:
 if __name__ == "__main__":
