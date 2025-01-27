@@ -198,7 +198,7 @@ if torch.cuda.is_available():
     elif args.size == "medium":
         # Base parameters
         block_size = 256
-        num_experts = 32
+        num_experts = 64
         expert_k = 4
         
         
