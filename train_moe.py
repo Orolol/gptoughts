@@ -38,20 +38,6 @@ from torch.compiler import allow_in_graph
 from collections import defaultdict
 from contextlib import contextmanager
 
-# Set multiprocessing start method
-if torch.cuda.is_available():
-    try:
-        torch.multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
-
-# Set environment variables for tokenizer
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-# Ensure CUDA is initialized in the main process only
-if torch.cuda.is_available():
-    torch.cuda.init()
-
 # Ajouter après les imports
 class AveragedTimingStats:
     def __init__(self, print_interval=100):
@@ -799,32 +785,54 @@ model.to(device)
 # CUDA optimizations
 if device_type == 'cuda':
     print("CUDA optimizations")
-    # Create CUDA streams for overlapping
     default_stream = torch.cuda.current_stream()
     copy_stream = torch.cuda.Stream()
-    compute_stream = torch.cuda.Stream()
     
-    # Set stream priorities
-    if hasattr(torch.cuda, 'Stream'):
-        copy_stream = torch.cuda.Stream(priority=-1)  # Higher priority for data transfer
-        compute_stream = torch.cuda.Stream(priority=0)  # Normal priority for computation
-
-    # Optimize memory allocation
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    
+    device_index = 0 if isinstance(device, str) else device
+    if isinstance(device, str) and ':' in device:
+        device_index = int(device.split(':')[1])
+    torch.cuda.set_device(device_index)
     torch.cuda.empty_cache()
+    
+    pin_memory = True
+    
+    gc.enable()
+    
+    torch.cuda.set_per_process_memory_fraction(0.95)
+
     if is_ampere:
-        # A100 specific optimizations
-        torch.cuda.memory.set_per_process_memory_fraction(0.95)
-        torch.cuda.memory_stats(device=None)
-    else:
-        # Other GPUs
+        # Optimisations spécifiques A100
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+        torch.backends.cudnn.benchmark = True
+        
+        # Optimiser pour le throughput
+        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+        torch.cuda.set_per_process_memory_fraction(0.98)
+        
+        # Configuration des streams
+        torch.cuda.Stream(priority=-1)
+        
+        # Optimisation de la mémoire
+        torch.cuda.memory.set_per_process_memory_fraction(0.98)
+        torch.cuda.memory.set_per_process_memory_fraction(0.98, 0)
+        
+        # Désactiver le garbage collector pendant l'entraînement
+        gc.disable()
+    elif is_ada:
+        # Optimisations spécifiques 4090
+        # Privilégier la latence
+        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
         torch.cuda.set_per_process_memory_fraction(0.85)
 
 # Configure gradient scaler
 scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
 
 # Initialize datasets
-train_loader, val_loader = get_datasets(block_size, batch_size, device)
-train_iterator = iter(train_loader)
+train_dataset, val_dataset = get_datasets(block_size, batch_size, device)
+train_iterator = iter(train_dataset)
 
 # Initialize timing
 t0 = time.time()
@@ -850,6 +858,7 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process and iter_num > 0:
         with timing_stats.track("validation"):
+            print("Validation")
             losses = estimate_loss()
             print(f"step {iter_num}: train loss {losses['train']:.4f}, "
                   f"train router loss {losses['train_router']:.4f}, "
@@ -933,6 +942,7 @@ while True:
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0
         total_router_loss = 0
+        skip_optimizer_step = False
 
         try:
             for micro_step in range(gradient_accumulation_steps):
@@ -941,29 +951,20 @@ while True:
                         micro_step == gradient_accumulation_steps - 1
                     )
                 
-                # Use CUDA streams for overlapping
-                with torch.cuda.stream(copy_stream):
-                    try:
-                        # Get next batch (this will happen in parallel with computation)
-                        next_encoder_input, next_decoder_input, next_target = next(train_iterator)
-                    except StopIteration:
-                        # Reset iterator when it's exhausted
-                        train_iterator = iter(train_loader)
-                        next_encoder_input, next_decoder_input, next_target = next(train_iterator)
-                    
-                    # Move to device in the copy stream
-                    if device_type == 'cuda':
-                        next_encoder_input = next_encoder_input.to(device, non_blocking=True)
-                        next_decoder_input = next_decoder_input.to(device, non_blocking=True)
-                        next_target = next_target.to(device, non_blocking=True)
-                
-                # Synchronize copy stream before computation
-                copy_stream.synchronize()
-                
                 with timing_stats.track("forward"), torch.amp.autocast(enabled=True, device_type=device_type):
+                    # Libérer la mémoire des tenseurs précédents
+                    if 'encoder_input' in locals(): del encoder_input
+                    if 'decoder_input' in locals(): del decoder_input
+                    if 'target' in locals(): del target
+                    
+                    encoder_input, decoder_input, target = next(train_iterator)
+                    encoder_input, decoder_input, target = pad_sequences(
+                        encoder_input, decoder_input, target
+                    )
+                    
                     # Forward pass
-                    logits, loss, router_loss = model(next_encoder_input, next_decoder_input, next_target)
-                    batch_tokens = next_encoder_input.ne(tokenizer.pad_token_id).sum().item() + next_decoder_input.ne(tokenizer.pad_token_id).sum().item()
+                    logits, loss, router_loss = model(encoder_input, decoder_input, target)
+                    batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
                     total_tokens += batch_tokens
                     tokens_window.append((time.time(), batch_tokens))
                     if len(tokens_window) > window_size:
@@ -989,19 +990,8 @@ while True:
                         scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                     
-                    # Overlap parameter updates with next iteration's data loading
-                    with torch.cuda.stream(compute_stream):
-                        scaler.step(optimizer)
-                        scaler.update()
-                
-                # Clean up memory
-                if 'next_encoder_input' in locals(): del next_encoder_input
-                if 'next_decoder_input' in locals(): del next_decoder_input
-                if 'next_target' in locals(): del next_target
-                
-                # Synchronize streams before next iteration
-                torch.cuda.current_stream().wait_stream(compute_stream)
-                torch.cuda.current_stream().wait_stream(copy_stream)
+                    scaler.step(optimizer)
+                    scaler.update()
 
         except Exception as e:
             print(f"Training iteration failed: {e}")

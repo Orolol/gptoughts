@@ -210,42 +210,28 @@ class ExpertGroup(nn.Module):
         nn.init.normal_(self.output_proj.weight, mean=0.0, std=adapt_scale)
 
     def forward(self, x: torch.Tensor, expert_weights: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, hidden_dim = x.shape
+        # Vectorized expert computation
+        B, S, D = x.shape
+        x_flat = x.view(-1, D)
+        weights_flat = expert_weights.view(-1, self.num_experts)
         
-        # Get shared representations
-        shared_output = self.shared_mlp(x)
+        # Parallel expert processing
+        expert_outputs = []
+        for expert_idx in range(self.num_experts):
+            mask = weights_flat[:, expert_idx] > 0
+            if mask.any():
+                expert_x = x_flat[mask]
+                expert_hidden = self.shared_mlp.pre_adapt(expert_x)
+                expert_hidden = self.expert_adapters[expert_idx](expert_hidden)
+                expert_outputs.append((expert_hidden, mask))
         
-        if self.parallel_adapters:
-            # Process all experts in parallel
-            expert_outputs = []
-            masks = []
-            
-            # Ensure expert_weights has correct shape [batch_size, seq_len, num_experts]
-            if expert_weights.dim() == 2:
-                expert_weights = expert_weights.view(batch_size, seq_len, -1)
-            
-            # Create masks for each expert
-            for i in range(self.num_experts):
-                mask = expert_weights[:, :, i] > 0
-                if mask.any():
-                    masks.append(mask)
-                    expert_x = x[mask]
-                    # Process through adapter and projections
-                    expert_hidden = self.shared_mlp.pre_adapt(expert_x)
-                    expert_hidden = self.expert_adapters[i](expert_hidden)
-                    expert_hidden = self.expert_proj(expert_hidden)
-                    expert_hidden = self.output_proj(expert_hidden)
-                    expert_outputs.append(expert_hidden)
-            
-            # Combine expert outputs efficiently
-            if expert_outputs:
-                combined_output = torch.zeros_like(shared_output)
-                for mask, expert_output in zip(masks, expert_outputs):
-                    combined_output[mask] = expert_output
-                
-                return shared_output + 0.1 * combined_output
+        # Combine outputs using index_add
+        combined = torch.zeros_like(x_flat)
+        for expert_hidden, mask in expert_outputs:
+            indices = torch.where(mask)[0]
+            combined.index_add_(0, indices, self.expert_proj(expert_hidden))
         
-        return shared_output
+        return self.output_proj(combined.view(B, S, -1)) + self.shared_mlp(x)
 
 class HierarchicalRouter(nn.Module):
     """
