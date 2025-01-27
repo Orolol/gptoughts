@@ -18,30 +18,19 @@ class TokenTracker:
         self.total_tokens += new_tokens
 
 class TokenCache:
-    def __init__(self, cache_dir='data/token_cache'):
-        self.cache_dir = cache_dir
-        os.makedirs(cache_dir, exist_ok=True)
-        self.current_cache = None
-        self.cache_index = 0
+    def __init__(self):
+        self.cache_dict = {}
         self.preload_thread = None
-        self.next_cache = None
         self.cache_ready = threading.Event()
-        self.cache_queue = Queue(maxsize=2)  # Pour stocker le cache actuel et le suivant
-
-    def get_cache_path(self, split, start_iter):
-        return os.getenv('HF_TOKEN')
+        self.cache_queue = Queue(maxsize=2)
 
     def save_cache(self, tokens, split, start_iter):
-        cache_path = self.get_cache_path(split, start_iter)
-        with open(cache_path, 'wb') as f:
-            pickle.dump(tokens, f)
+        cache_key = f"{split}_{start_iter}"
+        self.cache_dict[cache_key] = tokens
 
     def load_cache(self, split, start_iter):
-        cache_path = self.get_cache_path(split, start_iter)
-        if os.path.exists(cache_path):
-            with open(cache_path, 'rb') as f:
-                return pickle.load(f)
-        return None
+        cache_key = f"{split}_{start_iter}"
+        return self.cache_dict.get(cache_key)
 
     def preload_next_cache(self, split, start_iter):
         """Précharge le prochain cache dans un thread séparé"""
@@ -117,8 +106,7 @@ class StreamingDataset(IterableDataset):
     
     def prepare_initial_cache(self):
         """Prépare le cache initial s'il n'existe pas"""
-        cache_path = self.token_cache.get_cache_path(self.split, 0)
-        if not os.path.exists(cache_path):
+        if self.token_cache.load_cache(self.split, 0) is None:
             print(f"Preparing initial cache for {self.split}...")
             tokens = []
             for _ in range(self.cache_size):
@@ -149,79 +137,69 @@ class StreamingDataset(IterableDataset):
         """Get a batch of token sequences of length block_size."""
         cache_size = self.eval_cache_size if self.is_eval_mode else self.cache_size
         
-        # Si on arrive à la fin du cache actuel
+        # If we're at the end of current cache
         if self.current_iter % cache_size == 0:
-            # Attendre que le prochain cache soit prêt
+            # Wait for next cache to be ready
             self.token_cache.cache_ready.wait()
             self.token_cache.cache_ready.clear()
             
-            # Récupérer le cache
+            # Get cache
             self.current_cache = self.token_cache.cache_queue.get()
             
-            # Précharger le prochain cache si on n'est pas en mode eval
+            # Preload next cache if not in eval mode
             if not self.is_eval_mode:
                 next_start_iter = self.current_iter + cache_size
                 self.token_cache.preload_next_cache(self.split, next_start_iter)
         
-        # Utiliser les tokens du cache
+        # Use tokens from cache more efficiently
         cache_index = self.current_iter % cache_size
         tokens = self.current_cache[cache_index]
-        self.token_buffer.extend(tokens)
-        self.token_tracker.update(len(tokens))
         
-        # On s'assure d'avoir assez de tokens dans le buffer
-        # tracking time to get a batch
-        start_time = time.time()
-        while len(self.token_buffer) < (self.block_size * self.batch_size * 2 + 1):
+        # Process in larger chunks for better GPU utilization
+        chunk_size = self.block_size * self.batch_size * 4  # Increased chunk size
+        
+        while len(self.token_buffer) < chunk_size:
             try:
                 example = next(self.dataset_iterator)
                 new_tokens = self.process_example(example)
                 self.token_buffer.extend(new_tokens)
                 self.token_tracker.update(len(new_tokens))
             except StopIteration:
-                # Quand on arrive à la fin du dataset, on crée un nouvel itérateur
-                self.dataset = load_dataset("HuggingFaceFW/fineweb-2", 
-                                         num_proc=4,
-                                         name=self.dataset_config,
-                                         split=self.split,
-                                         streaming=True)
+                self.dataset = load_dataset(self.dataset_name,
+                                          name=self.dataset_config,
+                                          split=self.split,
+                                          streaming=True)
                 self.dataset = self.dataset.shuffle(buffer_size=10_000)
                 self.dataset_iterator = iter(self.dataset)
-                # Si le buffer est vide après avoir atteint la fin du dataset,
-                # on continue à charger des données
                 if len(self.token_buffer) == 0:
                     continue
-                # Sinon, on peut utiliser ce qu'il reste dans le buffer
                 break
 
-        # Si après avoir essayé de remplir le buffer, on n'a toujours pas assez de tokens,
-        # on utilise ce qu'on a en ajustant la taille du batch
-        available_sequences = len(self.token_buffer) // self.block_size
-        if available_sequences == 0:
-            raise RuntimeError("Not enough tokens to create even one sequence")
+        # Process tokens in chunks
+        total_length = self.block_size * self.batch_size
         
-        actual_batch_size = min(self.batch_size, available_sequences // 2)  # Divise par 2 car on a besoin d'input et target
-        total_length = self.block_size * actual_batch_size
-
-        # Prepare les tensors comme avant, mais avec la taille de batch ajustée
+        # Prepare tensors on CPU first then transfer to GPU in one go
         encoder_input = torch.tensor(self.token_buffer[:total_length], 
-                                   dtype=torch.long, device=self.device)
+                                   dtype=torch.long)
         decoder_input = torch.tensor(self.token_buffer[total_length:total_length*2], 
-                                   dtype=torch.long, device=self.device)
+                                   dtype=torch.long)
         target = torch.tensor(self.token_buffer[total_length+1:total_length*2+1], 
-                            dtype=torch.long, device=self.device)
+                             dtype=torch.long)
+        
+        # Transfer to GPU in parallel using a separate CUDA stream
+        with torch.cuda.stream(torch.cuda.Stream()):
+            encoder_input = encoder_input.to(self.device, non_blocking=True)
+            decoder_input = decoder_input.to(self.device, non_blocking=True)
+            target = target.to(self.device, non_blocking=True)
 
-        # Reshape avec la taille de batch ajustée
-        encoder_input = encoder_input.view(actual_batch_size, self.block_size)
-        decoder_input = decoder_input.view(actual_batch_size, self.block_size)
-        target = target.view(actual_batch_size, self.block_size)
+        # Reshape with proper contiguous memory layout
+        encoder_input = encoder_input.view(self.batch_size, self.block_size).contiguous()
+        decoder_input = decoder_input.view(self.batch_size, self.block_size).contiguous()
+        target = target.view(self.batch_size, self.block_size).contiguous()
 
-        # Nettoie le buffer
+        # Clean buffer
         self.token_buffer = self.token_buffer[total_length*2:]
         
-        end_time = time.time()
-        # print(f"Time to get a batch: {end_time - start_time:.4f} seconds")
-
         self.current_iter += 1
         return encoder_input, decoder_input, target
     
