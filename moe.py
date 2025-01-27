@@ -193,26 +193,21 @@ class ExpertGroup(nn.Module):
         nn.init.normal_(self.output_proj.weight, mean=0.0, std=adapt_scale)
 
     def forward(self, x: torch.Tensor, expert_weights: torch.Tensor) -> torch.Tensor:
+        # Process all experts in parallel using grouped matrix multiplications
         batch_size, seq_len, hidden_dim = x.shape
-        
-        shared_output = self.shared_mlp(x)
-        
-        # Process all experts in parallel using group convolution approach
-        expert_mask = expert_weights.transpose(1, 2).unsqueeze(-1)  # [B, num_experts, S, 1]
         x_flat = x.view(-1, hidden_dim)
         
-        # Process all adapters in parallel
-        adapter_input = self.shared_mlp.pre_adapt(x_flat)
-        adapter_output = torch.stack([adapter(adapter_input) for adapter in self.expert_adapters], dim=1)
-        expert_outputs = self.expert_proj(adapter_output)
-        expert_outputs = self.output_proj(expert_outputs)
+        # Fused expert computation
+        expert_outputs = torch.bmm(
+            expert_weights.unsqueeze(1),
+            self.expert_proj(
+                self.adapt_norm(
+                    torch.mm(x_flat, self.shared_mlp.pre_adapt.weight.t())
+                ).view(batch_size*seq_len, self.num_experts, -1)
+            )
+        ).squeeze(1)
         
-        # Combine using expert weights
-        expert_outputs = expert_outputs.view(batch_size, seq_len, self.num_experts, -1)
-        combined = torch.einsum('bse,bsed->bsd', expert_weights, expert_outputs)
-        
-        # Increase expert contribution gradually
-        return shared_output + 0.5 * combined + 0.1 * x
+        return self.shared_mlp(x) + expert_outputs.view_as(x)
 
 class HierarchicalRouter(nn.Module):
     """
