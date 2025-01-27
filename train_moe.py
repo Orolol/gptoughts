@@ -859,16 +859,18 @@ def forward_backward_step(micro_step, total_steps):
             encoder_input, decoder_input, target = next(train_iterator)
             encoder_input, decoder_input, target = pad_sequences(encoder_input, decoder_input, target)
 
-        # Overlap data transfer with computation
+        # Forward pass with gradient tracking
         with torch.amp.autocast(enabled=True, device_type=device_type):
             logits, loss, router_loss = model(encoder_input, decoder_input, target)
             combined_loss = (loss + router_aux_loss_coef * router_loss) / total_steps
 
-        # Retain graph only for gradient accumulation steps
+        # Backward pass with proper graph retention
         scaler.scale(combined_loss).backward(
             retain_graph=micro_step != (total_steps - 1)
         )
-        return combined_loss.detach(), router_loss.detach()
+        
+        # Return scalar values for logging while preserving graph
+        return combined_loss.item(), router_loss.item()
     except Exception as e:
         print(f"Training iteration failed: {e}")
         return None, None
@@ -977,15 +979,17 @@ while True:
                         micro_step == gradient_accumulation_steps - 1
                     )
                 
-                combined_loss, router_loss = forward_backward_step(
+                # Get losses and perform backward pass
+                loss_val, router_loss_val = forward_backward_step(
                     micro_step, 
                     gradient_accumulation_steps
                 )
-                if combined_loss is None:
+                if loss_val is None:
                     continue
                 
-                total_loss += combined_loss
-                total_router_loss += router_loss if router_loss is not None else 0.0
+                # Accumulate scalar values
+                total_loss += loss_val
+                total_router_loss += router_loss_val
                 
                 batch_tokens = gradient_accumulation_steps * batch_size * block_size
                 total_tokens += batch_tokens
@@ -994,11 +998,11 @@ while True:
                     tokens_window.pop(0)
                 
                 with timing_stats.track("backward"):
-                    if combined_loss is not None:
+                    if loss_val is not None:
                         # Backward pass
-                        scaler.scale(combined_loss).backward()
+                        scaler.scale(loss_val).backward()
                         
-                        del combined_loss, router_loss
+                        del loss_val, router_loss_val
 
                 with timing_stats.track("optimizer_step"):
                     if grad_clip != 0.0:
