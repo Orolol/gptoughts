@@ -835,6 +835,11 @@ torch._inductor.config.force_fuse_int_mm_with_mul = False
 torch._inductor.config.use_mixed_mm = True
 torch._inductor.config.epilogue_fusion = True
 
+# Disable problematic optimizations
+torch._inductor.config.triton.cudagraph_trees = False
+torch._inductor.config.triton.store_cubin = False
+torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
+
 # Modify the training loop
 def forward_backward_step(micro_step, total_steps):
     try:
@@ -851,7 +856,8 @@ def forward_backward_step(micro_step, total_steps):
 
         # Backward pass
         with timing_stats.track("backward"):
-            scaler.scale(combined_loss).backward()  # Main backward pass
+            scaled_loss = scaler.scale(combined_loss)
+            scaled_loss.backward()
         
         return combined_loss.item(), router_loss.item()
     

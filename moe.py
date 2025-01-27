@@ -46,6 +46,9 @@ class Router(nn.Module):
         self.router_z_loss_coef = 0.001  # Reduced from 0.01
         self.load_balance_coef = 0.1      # Increased from 0.01
 
+        # Add explicit device and dtype initialization
+        self.register_buffer('dummy', torch.tensor(0), persistent=False)
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
         x_flat = x.view(-1, self.input_dim)
@@ -66,11 +69,11 @@ class Router(nn.Module):
             # Clamp indices to valid range
             top_k_indices = top_k_indices % self.num_experts  # Add modulo operation
             
-            # Create dispatch mask with proper bounds
+            # Create dispatch mask with proper tensor initialization
             dispatch_mask = torch.zeros(
-                *routing_weights.shape,
-                device=routing_weights.device,
-                dtype=routing_weights.dtype,
+                routing_weights.shape,
+                device=self.dummy.device,
+                dtype=self.dummy.dtype,
                 memory_format=torch.contiguous_format
             )
             dispatch_mask.scatter_(-1, top_k_indices, top_k_weights)
