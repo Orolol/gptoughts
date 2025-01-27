@@ -9,27 +9,42 @@ def get_gpu_count():
     return torch.cuda.device_count()
 
 def get_datasets(block_size, batch_size, device):
-    """
-    Retourne les datasets (train + val) déjà initialisés.
-    """
+    """Get train and validation datasets"""
+    
+    # Create base datasets
     train_dataset = StreamingDataset(
         block_size=block_size,
         batch_size=batch_size,
-        dataset_name="HuggingFaceFW/fineweb-edu",
-        dataset_config="CC-MAIN-2024-10",
-        split="train",
+        split='train',
         device=device
     )
     
     val_dataset = StreamingDataset(
         block_size=block_size,
         batch_size=batch_size,
-        dataset_name="HuggingFaceFW/fineweb-edu",
-        dataset_config="CC-MAIN-2024-10",
-        split="train",
+        split='validation',
         device=device
     )
-    return train_dataset, val_dataset
+    
+    # Determine optimal number of workers
+    num_workers = min(8, os.cpu_count() // 2) if os.cpu_count() else 4
+    
+    # Create optimized DataLoaders
+    train_loader = StreamingDataset.get_dataloader(
+        train_dataset,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True
+    )
+    
+    val_loader = StreamingDataset.get_dataloader(
+        val_dataset,
+        num_workers=2,  # Fewer workers for validation
+        pin_memory=True,
+        persistent_workers=True
+    )
+    
+    return train_loader, val_loader
 
 def main():
     world_size = get_gpu_count()

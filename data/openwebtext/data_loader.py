@@ -72,13 +72,12 @@ class StreamingDataset(IterableDataset):
         )
         self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        # Initialize dataset with multiple processes
+        # Initialize dataset without num_proc for streaming
         self.dataset = load_dataset(
             dataset_name, 
             name=dataset_config, 
             split=split, 
-            streaming=True,
-            num_proc=4
+            streaming=True
         )
         self.dataset = self.dataset.shuffle(buffer_size=20_000)
         
@@ -231,6 +230,30 @@ class StreamingDataset(IterableDataset):
         self.shutdown_event.set()
         if hasattr(self, 'prefetch_thread'):
             self.prefetch_thread.join(timeout=1.0)
+
+    def worker_init_fn(worker_id):
+        """Initialize worker with unique seed"""
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            # Set different seed for each worker
+            torch.manual_seed(worker_info.seed % 2**32)
+            np.random.seed(worker_info.seed % 2**32)
+            
+            # Each worker should get its own iterator
+            dataset = worker_info.dataset
+            dataset.dataset_iterator = iter(dataset.dataset)
+            
+    @staticmethod
+    def get_dataloader(dataset, num_workers=4, pin_memory=True, persistent_workers=True):
+        """Create an optimized DataLoader for the streaming dataset"""
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=None,  # Dataset already handles batching
+            num_workers=num_workers,
+            worker_init_fn=StreamingDataset.worker_init_fn,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers
+        )
 
 # Example usage:
 if __name__ == "__main__":

@@ -809,8 +809,8 @@ if device_type == 'cuda':
 scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
 
 # Initialize datasets
-train_dataset, val_dataset = get_datasets(block_size, batch_size, device)
-train_iterator = iter(train_dataset)
+train_loader, val_loader = get_datasets(block_size, batch_size, device)
+train_iterator = iter(train_loader)
 
 # Initialize timing
 t0 = time.time()
@@ -931,8 +931,14 @@ while True:
                 
                 # Use CUDA streams for overlapping
                 with torch.cuda.stream(copy_stream):
-                    # Get next batch (this will happen in parallel with computation)
-                    next_encoder_input, next_decoder_input, next_target = next(train_iterator)
+                    try:
+                        # Get next batch (this will happen in parallel with computation)
+                        next_encoder_input, next_decoder_input, next_target = next(train_iterator)
+                    except StopIteration:
+                        # Reset iterator when it's exhausted
+                        train_iterator = iter(train_loader)
+                        next_encoder_input, next_decoder_input, next_target = next(train_iterator)
+                    
                     next_encoder_input, next_decoder_input, next_target = pad_sequences(
                         next_encoder_input, next_decoder_input, next_target
                     )
