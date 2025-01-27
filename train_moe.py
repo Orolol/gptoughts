@@ -191,7 +191,7 @@ if torch.cuda.is_available():
         if is_ampere:
             # Optimisations A100
             batch_size = 54  # Réduit pour éviter OOM
-            gradient_accumulation_steps = 2  # Augmenté pour compenser
+            gradient_accumulation_steps = 4  # Augmenté pour compenser
             
             # Optimisations mémoire et calcul
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -1021,15 +1021,17 @@ while True:
               f"time {dt*1000:.2f}ms, lr {lr:.2e}, t/s {tps:.2f}, avg t/s {total_tps:.2f}")
         
         # Print timing breakdown
-        print("\nTiming breakdown:")
-        for name in ['data_loading', 'forward', 'backward', 'optimizer_step']:
-            if name in avg_timings:
-                print(f"{name}: {avg_timings[name]*1000:.1f}ms ({percentages[name]:.1f}%)")
+     
 
     iter_num += 1
     local_iter_num += 1
     
-    # if iter_num % 50 == 0:  # Monitoring plus fréquent
+    if iter_num % 50 == 0:  # Monitoring plus fréquent
+        print("\nTiming breakdown:")
+        for name in ['data_loading', 'forward', 'backward', 'optimizer_step']:
+            if name in avg_timings:
+                print(f"{name}: {avg_timings[name]*1000:.1f}ms ({percentages[name]:.1f}%)")
+        
     #     print_memory_stats(f"Iter {iter_num}")
     #     cleanup_memory()
 
