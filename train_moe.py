@@ -206,7 +206,7 @@ if torch.cuda.is_available():
         if is_ampere:
             # Optimisations A100
             batch_size = 48  # Réduit pour éviter OOM
-            gradient_accumulation_steps = 1  # Augmenté pour compenser
+            gradient_accumulation_steps = 4  # Augmenté pour compenser
             
             # Optimisations mémoire et calcul
             torch.backends.cuda.matmul.allow_tf32 = True
