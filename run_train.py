@@ -22,7 +22,7 @@ def get_datasets(block_size, batch_size, device):
     val_dataset = StreamingDataset(
         block_size=block_size,
         batch_size=batch_size,
-        split='validation',
+        split='train',
         device=device
     )
     
