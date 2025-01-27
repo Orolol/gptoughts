@@ -841,9 +841,30 @@ torch._inductor.config.triton.single_node_patterns = True
 torch._inductor.config.coordinate_descent_tuning = True
 
 # Modify the training loop
+
 @torch.compile(mode="max-autotune")
-def training_step(x, targets):
-    # Existing forward/backward code...
+def forward_backward_step(micro_step, total_steps):
+    try:
+        with timing_stats.track("data_loading"):
+            with torch.no_grad():
+                encoder_input, decoder_input, target = next(train_iterator)
+                encoder_input, decoder_input, target = pad_sequences(encoder_input, decoder_input, target)
+
+        # Forward pass
+        with timing_stats.track("forward"):
+            with torch.amp.autocast(enabled=True, device_type=device_type):
+                logits, loss, router_loss = model(encoder_input, decoder_input, target)
+                combined_loss = (loss + router_aux_loss_coef * router_loss) / total_steps
+
+        # Backward pass
+        with timing_stats.track("backward"):
+            scaler.scale(combined_loss).backward()  # Main backward pass
+        
+        return combined_loss.item(), router_loss.item()
+    
+    except Exception as e:
+        print(f"Microstep {micro_step} failed: {e}")
+        return 0.0, 0.0
 
 # training loop
 while True:
