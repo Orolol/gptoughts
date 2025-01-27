@@ -52,14 +52,29 @@ class Router(nn.Module):
         
         with torch.amp.autocast(enabled=True, device_type='cuda'):
             router_logits = self.router(x_flat)
+            
+            # Add expert parallelism aware constraints
+            if hasattr(self, 'expert_parallelism'):
+                # Split experts across devices
+                local_num_experts = self.num_experts // self.expert_parallelism
+                router_logits = router_logits[..., :local_num_experts]
+            
+            # Ensure valid indices
             routing_weights = F.softmax(router_logits / (self.temperature + 1e-6), dim=-1)
             top_k_weights, top_k_indices = torch.topk(routing_weights, self.k, dim=-1)
             
-            # Fused mask creation
-            dispatch_mask = torch.zeros_like(routing_weights, memory_format=torch.contiguous_format)
+            # Clamp indices to valid range
+            top_k_indices = top_k_indices % self.num_experts  # Add modulo operation
+            
+            # Create dispatch mask with proper bounds
+            dispatch_mask = torch.zeros(
+                *routing_weights.shape,
+                device=routing_weights.device,
+                dtype=routing_weights.dtype,
+                memory_format=torch.contiguous_format
+            )
             dispatch_mask.scatter_(-1, top_k_indices, top_k_weights)
-            dispatch_mask = dispatch_mask.view(batch_size, seq_len, -1)
-
+            
         # Modified temperature constraint
         with torch.no_grad():
             self.temperature.data.clamp_(min=self.min_temp, max=self.max_temp)
