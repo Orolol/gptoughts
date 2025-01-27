@@ -870,7 +870,7 @@ def forward_backward_step(micro_step, total_steps):
         )
         
         # Return scalar values for logging while preserving graph
-        return combined_loss, router_loss
+        return combined_loss.item(), router_loss.item()
     except Exception as e:
         print(f"Training iteration failed: {e}")
         return None, None
@@ -987,10 +987,9 @@ while True:
                 if loss_val is None:
                     continue
                 
-                
                 # Accumulate scalar values
-                total_loss += loss_val.item()
-                total_router_loss += router_loss_val.item()
+                total_loss += loss_val
+                total_router_loss += router_loss_val
                 
                 batch_tokens = gradient_accumulation_steps * batch_size * block_size
                 total_tokens += batch_tokens
@@ -998,12 +997,12 @@ while True:
                 if len(tokens_window) > window_size:
                     tokens_window.pop(0)
                 
-                with timing_stats.track("backward"):
-                    if loss_val is not None:
-                        # Backward pass
-                        scaler.scale(loss_val).backward()
+                # with timing_stats.track("backward"):
+                #     if loss_val is not None:
+                #         # Backward pass
+                #         scaler.scale(loss_val).backward()
                         
-                        del loss_val, router_loss_val
+                #         del loss_val, router_loss_val
 
                 with timing_stats.track("optimizer_step"):
                     if grad_clip != 0.0:
