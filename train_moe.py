@@ -866,10 +866,10 @@ def forward_backward_step():
 
         # Overlap backward with next forward
         scaler.scale(combined_loss).backward(create_graph=False)
-        return combined_loss.item(), router_loss.item()
+        return combined_loss, router_loss
     except Exception as e:
         print(f"Training iteration failed: {e}")
-        return 0.0, 0.0
+        return None, None
 
 # training loop
 while True:
@@ -981,8 +981,10 @@ while True:
                     # if 'decoder_input' in locals(): del decoder_input
                     # if 'target' in locals(): del target
                     
-                    loss, router_loss = forward_backward_step()
-                    # batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
+                    combined_loss, router_loss = forward_backward_step()
+                    if combined_loss is None:
+                        continue
+                    
                     batch_tokens = gradient_accumulation_steps * batch_size * block_size
                     total_tokens += batch_tokens
                     tokens_window.append((time.time(), batch_tokens))
@@ -990,18 +992,11 @@ while True:
                         tokens_window.pop(0)
                 
                 with timing_stats.track("backward"):
-                    if loss is not None:
-                        loss = loss / gradient_accumulation_steps
-                        router_loss = router_loss / gradient_accumulation_steps
-                        combined_loss = loss + router_aux_loss_coef * router_loss
-                        
+                    if combined_loss is not None:
                         # Backward pass
-                        scaled_loss = scaler.scale(combined_loss)
-                        scaled_loss.backward()
+                        scaler.scale(combined_loss).backward()
                         
-                        total_loss += loss.item()
-                        total_router_loss += router_loss.item()
-                        del loss, router_loss, combined_loss, scaled_loss
+                        del combined_loss, router_loss
 
                 with timing_stats.track("optimizer_step"):
                     if grad_clip != 0.0:
