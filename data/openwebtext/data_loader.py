@@ -49,6 +49,17 @@ class StreamingDataset(IterableDataset):
                  dataset_config="CC-MAIN-2024-10", split="train", device='cuda',
                  cache_size=1000, eval_cache_size=100):
         super().__init__()
+        
+        # Set multiprocessing method to spawn for CUDA compatibility
+        if device == 'cuda' and torch.multiprocessing.get_start_method() != 'spawn':
+            try:
+                torch.multiprocessing.set_start_method('spawn', force=True)
+            except RuntimeError:
+                pass
+                
+        # Set tokenizer parallelism explicitly
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        
         self.block_size = block_size
         self.batch_size = batch_size
         self.device = device
@@ -62,13 +73,14 @@ class StreamingDataset(IterableDataset):
         
         access_token = os.getenv('HF_TOKEN')
         
-        # Initialize tokenizer with faster tokenization
+        # Initialize tokenizer with proper max length
         self.tokenizer = AutoTokenizer.from_pretrained(
             "meta-llama/Llama-3.2-1B-Instruct", 
             use_fast=True,
             access_token=access_token,
             model_max_length=block_size,
-            padding_side='right'
+            padding_side='right',
+            truncation=True
         )
         self.tokenizer.pad_token = self.tokenizer.eos_token
         
@@ -118,10 +130,24 @@ class StreamingDataset(IterableDataset):
             pickle.dump(meta, f)
     
     def process_example(self, example):
-        """Tokenize a single example."""
-        ids = self.tokenizer.encode(example['text'], add_special_tokens=False)
-        ids.append(self.tokenizer.eos_token_id)
-        return ids
+        """Tokenize a single example with proper truncation."""
+        # Tokenize with truncation
+        tokens = self.tokenizer.encode(
+            example['text'],
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.block_size * 2  # Double block size to account for both encoder and decoder
+        )
+        
+        # Add EOS token
+        tokens.append(self.tokenizer.eos_token_id)
+        
+        # Ensure we have enough tokens
+        if len(tokens) < self.block_size * 2:
+            # Pad with EOS tokens if needed
+            tokens.extend([self.tokenizer.eos_token_id] * (self.block_size * 2 - len(tokens)))
+        
+        return tokens[:self.block_size * 2]  # Ensure exact length
     
     def prepare_initial_cache(self):
         """Prépare le cache initial s'il n'existe pas"""
@@ -246,13 +272,15 @@ class StreamingDataset(IterableDataset):
     @staticmethod
     def get_dataloader(dataset, num_workers=4, pin_memory=True, persistent_workers=True):
         """Create an optimized DataLoader for the streaming dataset"""
+        # Create a context for the dataloader that ensures proper CUDA behavior
         return torch.utils.data.DataLoader(
             dataset,
             batch_size=None,  # Dataset already handles batching
             num_workers=num_workers,
             worker_init_fn=StreamingDataset.worker_init_fn,
             pin_memory=pin_memory,
-            persistent_workers=persistent_workers
+            persistent_workers=persistent_workers,
+            multiprocessing_context='spawn'  # Force spawn for CUDA compatibility
         )
 
 # Example usage:

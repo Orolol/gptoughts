@@ -38,6 +38,20 @@ from torch.compiler import allow_in_graph
 from collections import defaultdict
 from contextlib import contextmanager
 
+# Set multiprocessing start method
+if torch.cuda.is_available():
+    try:
+        torch.multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+
+# Set environment variables for tokenizer
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Ensure CUDA is initialized in the main process only
+if torch.cuda.is_available():
+    torch.cuda.init()
+
 # Ajouter après les imports
 class AveragedTimingStats:
     def __init__(self, print_interval=100):

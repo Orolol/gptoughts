@@ -2,6 +2,7 @@ import os
 import sys
 import torch
 import subprocess
+import signal
 
 from data.openwebtext.data_loader import StreamingDataset
 
@@ -47,6 +48,16 @@ def get_datasets(block_size, batch_size, device):
     return train_loader, val_loader
 
 def main():
+    # Set multiprocessing start method
+    if torch.cuda.is_available():
+        try:
+            torch.multiprocessing.set_start_method('spawn', force=True)
+        except RuntimeError:
+            pass
+    
+    # Set environment variables
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    
     world_size = get_gpu_count()
     if world_size == 0:
         print("No GPUs found. Running on CPU")
@@ -60,24 +71,40 @@ def main():
     current_env["MASTER_PORT"] = "29500"
     current_env["WORLD_SIZE"] = str(world_size)
     
+    # Create process group with spawn method
     processes = []
     for rank in range(world_size):
         current_env["RANK"] = str(rank)
         current_env["LOCAL_RANK"] = str(rank)
         
         cmd = [sys.executable, "train.py"]
-        process = subprocess.Popen(cmd, env=current_env)
+        # Use spawn method for process creation
+        process = subprocess.Popen(
+            cmd, 
+            env=current_env,
+            start_new_session=True  # Ensure clean process creation
+        )
         processes.append(process)
     
-    for process in processes:
-        process.wait()
-        if process.returncode != 0:
-            print(f"Training failed with return code {process.returncode}")
-            # Kill all remaining processes
-            for p in processes:
-                if p.poll() is None:  # If process is still running
+    try:
+        for process in processes:
+            process.wait()
+            if process.returncode != 0:
+                print(f"Training failed with return code {process.returncode}")
+                raise RuntimeError("Training failed")
+    except:
+        # Clean up on error
+        for p in processes:
+            if p.poll() is None:  # If process is still running
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                except:
                     p.kill()
-            sys.exit(1)
+        raise
+    finally:
+        # Clean up CUDA
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     main() 
