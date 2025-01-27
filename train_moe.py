@@ -850,11 +850,8 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process and iter_num > 0:
         with timing_stats.track("validation"):
-            print("Validation")
             losses = estimate_loss()
             print(f"step {iter_num}: train loss {losses['train']:.4f}, "
-                  f"train router loss {losses['train_router']:.4f}, "
-                  f"train ppl {losses['train_ppl']:.2f}, "
                   f"val loss {losses['val']:.4f}, "
                   f"val router loss {losses['val_router']:.4f}, "
                   f"val ppl {losses['val_ppl']:.2f}")
@@ -953,9 +950,11 @@ while True:
                         train_iterator = iter(train_loader)
                         next_encoder_input, next_decoder_input, next_target = next(train_iterator)
                     
-                    next_encoder_input, next_decoder_input, next_target = pad_sequences(
-                        next_encoder_input, next_decoder_input, next_target
-                    )
+                    # Move to device
+                    if device_type == 'cuda':
+                        next_encoder_input = next_encoder_input.to(device, non_blocking=True)
+                        next_decoder_input = next_decoder_input.to(device, non_blocking=True)
+                        next_target = next_target.to(device, non_blocking=True)
                 
                 # Synchronize copy stream before computation
                 copy_stream.synchronize()
