@@ -110,7 +110,7 @@ torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = False
 torch._inductor.config.debug = False
 
 # Au début du fichier, après les imports
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.9,backend:cudaMallocAsync"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8"
 
 # -----------------------------------------------------------------------------
 # Parse command line arguments
@@ -141,7 +141,7 @@ wandb_run_name = 'moe_run'
 # data
 dataset = 'openwebtext'
 data_dir = 'data/openwebtext'
-gradient_accumulation_steps = 2
+gradient_accumulation_steps = 1
 dropout = 0.0
 bias = False
 attention_backend = "flash_attn_2" # "sdpa"
@@ -565,7 +565,7 @@ if ddp:
     os.environ["NCCL_MIN_NCHANNELS"] = "4"
     os.environ["NCCL_SOCKET_IFNAME"] = "^docker0,lo"
     os.environ["NCCL_BUFFSIZE"] = "2097152"
-    os.environ["NCCL_ALGO"] = "Tree"
+    os.environ["NCCL_ALGO"] = "Ring"
     os.environ["NCCL_PROTO"] = "Simple"
     os.environ["NCCL_BLOCKING_WAIT"] = "0"
     os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
@@ -730,7 +730,7 @@ if compile:
     try:
         model = torch.compile(
             model,
-            mode="default",
+            mode="reduce-overhead",
             # options={
             #     "max_autotune": True,
             #     "epilogue_fusion": True,
@@ -835,14 +835,7 @@ torch._inductor.config.force_fuse_int_mm_with_mul = False
 torch._inductor.config.use_mixed_mm = True
 torch._inductor.config.epilogue_fusion = True
 
-# Add at the top after imports
-torch._inductor.config.triton.cudagraph_trees = True
-torch._inductor.config.triton.single_node_patterns = True
-torch._inductor.config.coordinate_descent_tuning = True
-
 # Modify the training loop
-
-@torch.compile(mode="max-autotune")
 def forward_backward_step(micro_step, total_steps):
     try:
         with timing_stats.track("data_loading"):
@@ -977,7 +970,7 @@ while True:
                 )
                 
                 # Get losses and perform backward pass
-                loss_val, router_loss_val = training_step(
+                loss_val, router_loss_val = forward_backward_step(
                     micro_step, 
                     gradient_accumulation_steps
                 )
@@ -1077,16 +1070,4 @@ if master_process:
 # At the top of the file:
 torch._inductor.config.triton.cudagraph_trees = False  # Disable tree reduction
 torch._inductor.config.triton.store_cubin = False  # Disable cubin caching
-
-# Add after model initialization
-if device_type == 'cuda':
-    torch.cuda.memory.set_per_process_memory_fraction(0.99)
-    torch.cuda.set_per_process_memory_fraction(0.99, 0)
-    torch.cuda.memory.set_allocator(torch.cuda.get_allocator_backend())
-
-# For A100 80GB
-batch_size = 128  # Increased from 92
-gradient_accumulation_steps = 2  # Reduced from 4
-block_size = 512  # Increased context length
-expert_capacity_factor = 1.1  # Reduced from 1.25
 
