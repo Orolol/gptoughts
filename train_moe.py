@@ -46,74 +46,32 @@ class AveragedTimingStats:
         self.print_interval = print_interval
         self.current_step = 0
         self.current_context = []
+        self.last_tokens = 0
+        self.last_time = time.time()
+        self.cycle_start_time = time.time()
         
     @contextmanager
     def track(self, name):
-        self.current_context.append(name)
         start_time = time.time()
         try:
             yield
         finally:
             duration = time.time() - start_time
-            # Only track the first level and its immediate children
-            if len(self.current_context) <= 2:
-                full_name = '/'.join(self.current_context)
-                self.timings[full_name].append(duration)
-            self.current_context.pop()
-    
-    def step(self):
-        self.current_step += 1
-    
-    def should_print(self):
-        return self.current_step % self.print_interval == 0
-    
-    def get_averaged_stats(self):
-        if not self.timings:
-            return {}
+            self.timings[name].append(duration)
+            
+    def start_batch(self):
+        self.cycle_start_time = time.time()
+        self.last_tokens = 0
         
-        # Calculate averages
-        avg_timings = {}
-        for name, times in self.timings.items():
-            avg_timings[name] = sum(times) / len(times)
+    def end_batch(self, tokens):
+        batch_time = time.time() - self.cycle_start_time
+        self.timings['total_batch'].append(batch_time)
+        self.timings['tokens'].append(tokens)
         
-        # Get total time from root operations
-        total_time = sum(avg_timings[name] for name in avg_timings if '/' not in name)
-        
-        # Calculate percentages
-        percentages = {}
-        for name, time in avg_timings.items():
-            percentages[name] = (time / total_time) * 100 if total_time > 0 else 0
-        
-        # Clear timings for next window
-        self.timings.clear()
-        
-        return avg_timings, percentages
-    
-    def print_stats(self):
-        timings, percentages = self.get_averaged_stats()
-        if not timings:
-            return
-        
-        print(f"\nTiming breakdown over last {self.print_interval} iterations:")
-        
-        # Sort by time spent (descending)
-        sorted_timings = sorted(
-            timings.items(), 
-            key=lambda x: x[1], 
-            reverse=True
-        )
-        
-        # Print root operations first
-        print("\nMain operations:")
-        for name, time in sorted_timings:
-            if '/' not in name:
-                print(f"{name}: {time*1000:.1f}ms ({percentages[name]:.1f}%)")
-        
-        # Print sub-operations
-        print("\nDetailed breakdown:")
-        for name, time in sorted_timings:
-            if '/' in name:
-                print(f"{name}: {time*1000:.1f}ms ({percentages[name]:.1f}%)") 
+    def get_throughput(self):
+        total_time = sum(self.timings['total_batch'])
+        total_tokens = sum(self.timings['tokens'])
+        return total_tokens / total_time if total_time > 0 else 0
 
 # Permettre time.time() dans le graphe
 allow_in_graph(time.time)
@@ -842,8 +800,6 @@ running_mfu = -1.0
 train_start_time = time.time()
 tokens_per_iter = batch_size * block_size * gradient_accumulation_steps
 total_tokens = 0
-tokens_window = []  # Pour calculer une moyenne glissante des tokens/s
-window_size = 10   # Taille de la fenêtre pour la moyenne glissante
 
 print(f"Starting training with {num_experts} experts and top-{expert_k} routing")
 print_memory_stats("Initial")
@@ -856,31 +812,33 @@ torch._inductor.config.epilogue_fusion = True
 # Modify the training loop
 def forward_backward_step(micro_step, total_steps):
     try:
-        with torch.amp.autocast(enabled=True, device_type=device_type), torch.no_grad():
-            encoder_input, decoder_input, target = next(train_iterator)
-            encoder_input, decoder_input, target = pad_sequences(encoder_input, decoder_input, target)
+        with timing_stats.track("data_loading"):
+            with torch.no_grad():
+                encoder_input, decoder_input, target = next(train_iterator)
+                encoder_input, decoder_input, target = pad_sequences(encoder_input, decoder_input, target)
 
-        # Forward pass with gradient tracking
-        with torch.amp.autocast(enabled=True, device_type=device_type):
-            logits, loss, router_loss = model(encoder_input, decoder_input, target)
-            combined_loss = (loss + router_aux_loss_coef * router_loss) / total_steps
+        # Forward pass
+        with timing_stats.track("forward"):
+            with torch.amp.autocast(enabled=True, device_type=device_type):
+                logits, loss, router_loss = model(encoder_input, decoder_input, target)
+                combined_loss = (loss + router_aux_loss_coef * router_loss) / total_steps
 
-        # Backward pass with proper graph retention
-        scaler.scale(combined_loss).backward(
-            retain_graph=micro_step != (total_steps - 1)
-        )
+        # Backward pass
+        with timing_stats.track("backward"):
+            scaler.scale(combined_loss).backward(
+                retain_graph=micro_step != (total_steps - 1)
+            )
         
-        # Return scalar values for logging while preserving graph
         return combined_loss.item(), router_loss.item()
+    
     except Exception as e:
         print(f"Microstep {micro_step} failed: {e}")
-        # Reset gradients and return zero loss
         optimizer.zero_grad(set_to_none=True)
         return 0.0, 0.0
 
 # training loop
 while True:
-    print("Starting training loop, iter_num:", iter_num)
+    # print("Starting training loop, iter_num:", iter_num)
     # determine and set the learning rate for this iteration
     with timing_stats.track("lr_update"):
         lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -974,8 +932,10 @@ while True:
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0
         total_router_loss = 0
-        skip_optimizer_step = False
-
+        
+        # Start tracking batch timing
+        timing_stats.start_batch()
+        
         try:
             for micro_step in range(gradient_accumulation_steps):
                 # Add NCCL synchronization check
@@ -1000,24 +960,9 @@ while True:
                 
                 batch_tokens = gradient_accumulation_steps * batch_size * block_size
                 total_tokens += batch_tokens
-                tokens_window.append((time.time(), batch_tokens))
-                if len(tokens_window) > window_size:
-                    tokens_window.pop(0)
                 
-                # with timing_stats.track("backward"):
-                #     if loss_val is not None:
-                #         # Backward pass
-                #         scaler.scale(loss_val).backward()
-                        
-                #         del loss_val, router_loss_val
-
-                with timing_stats.track("optimizer_step"):
-                    if grad_clip != 0.0:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    
-                    scaler.step(optimizer)
-                    scaler.update()
+                # End of batch processing
+                timing_stats.end_batch(batch_tokens)
 
         except Exception as e:
             print(f"Training failed at iter {iter_num}: {e}")
@@ -1034,33 +979,25 @@ while True:
         lossf = total_loss
         router_lossf = total_router_loss
         
-        # Calculer le taux de tokens/s sur la fenêtre glissante
-        if len(tokens_window) > 1:
-            window_time = tokens_window[-1][0] - tokens_window[0][0]
-            window_tokens = sum(tokens for _, tokens in tokens_window)
-            current_tokens_per_sec = window_tokens / window_time if window_time > 0 else 0
-        else:
-            current_tokens_per_sec = 0
+        # Get detailed timing breakdown
+        avg_timings, percentages = timing_stats.get_averaged_stats()
         
-        total_time = time.time() - train_start_time
-        avg_tokens_per_sec = total_tokens / total_time if total_time > 0 else 0
+        # Calculate precise tokens per second
+        tps = timing_stats.get_throughput()
+        total_tps = sum(timing_stats.timings['tokens']) / sum(timing_stats.timings['total_batch'])
         
         if local_iter_num >= 5:
             mfu = model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         
-        # Afficher toujours les métriques de base
         print(f"iter {iter_num}: loss {lossf:.4f}, router_loss {router_lossf:.4f}, "
-              f"time {dt*1000:.2f}ms, lr {lr:.2e}, "
-              f"tt {total_tokens:,}, t/s {current_tokens_per_sec:.2f}, "
-              f"avgt/s {avg_tokens_per_sec:.2f}")
+              f"time {dt*1000:.2f}ms, lr {lr:.2e}, t/s {tps:.2f}, avg t/s {total_tps:.2f}")
         
-        # Accumuler les stats de timing
-        timing_stats.step()
-        
-        # Afficher les statistiques détaillées de timing uniquement tous les X iterations
-        if timing_stats.should_print():
-            timing_stats.print_stats()
+        # Print timing breakdown
+        print("\nTiming breakdown:")
+        for name in ['data_loading', 'forward', 'backward', 'optimizer_step']:
+            if name in avg_timings:
+                print(f"{name}: {avg_timings[name]*1000:.1f}ms ({percentages[name]:.1f}%)")
 
     iter_num += 1
     local_iter_num += 1
