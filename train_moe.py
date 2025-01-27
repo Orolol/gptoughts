@@ -13,6 +13,7 @@ import argparse
 from queue import Queue
 from contextlib import nullcontext
 import random
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -205,7 +206,7 @@ if torch.cuda.is_available():
         # Ajustements spécifiques selon le GPU
         if is_ampere:
             # Optimisations A100
-            batch_size = 52  # Réduit pour éviter OOM
+            batch_size = 50  # Réduit pour éviter OOM
             gradient_accumulation_steps = 4  # Augmenté pour compenser
             
             # Optimisations mémoire et calcul
@@ -798,7 +799,7 @@ if device_type == 'cuda':
     
     pin_memory = True
     
-    gc.enable()
+    # gc.enable()
     
     torch.cuda.set_per_process_memory_fraction(0.95)
 
@@ -872,8 +873,10 @@ def forward_backward_step(micro_step, total_steps):
         # Return scalar values for logging while preserving graph
         return combined_loss.item(), router_loss.item()
     except Exception as e:
-        print(f"Training iteration failed: {e}")
-        return None, None
+        print(f"Microstep {micro_step} failed: {e}")
+        # Reset gradients and return zero loss
+        optimizer.zero_grad(set_to_none=True)
+        return 0.0, 0.0
 
 # training loop
 while True:
@@ -974,10 +977,13 @@ while True:
 
         try:
             for micro_step in range(gradient_accumulation_steps):
+                # Add NCCL synchronization check
                 if ddp:
-                    model.require_backward_grad_sync = (
-                        micro_step == gradient_accumulation_steps - 1
-                    )
+                    torch.distributed.barrier(timeout=torch.timedelta(seconds=30))
+                
+                model.require_backward_grad_sync = (
+                    micro_step == gradient_accumulation_steps - 1
+                )
                 
                 # Get losses and perform backward pass
                 loss_val, router_loss_val = forward_backward_step(
@@ -1013,12 +1019,10 @@ while True:
                     scaler.update()
 
         except Exception as e:
-            print(f"Training iteration failed: {e}")
-            print(traceback.format_exc())
-            cleanup_memory()
+            print(f"Training failed at iter {iter_num}: {e}")
             if ddp:
-                dist_barrier()
-            continue
+                torch.distributed.destroy_process_group()
+            sys.exit(1)
 
     # timing and logging
     t1 = time.time()
@@ -1068,6 +1072,12 @@ while True:
     if iter_num > max_iters:
         break
 
+    if iter_num % 10 == 0:
+        print(f"Training alive check - iter {iter_num}")
+        if device_type == 'cuda':
+            print(f"GPU mem: {torch.cuda.memory_allocated()/1e9:.2f}GB / {torch.cuda.max_memory_allocated()/1e9:.2f}GB")
+            torch.cuda.synchronize()  # Force CUDA sync
+
 if ddp:
     destroy_process_group()
 
@@ -1084,4 +1094,8 @@ if device_type == 'cuda':
 
 if master_process:
     print("Training finished!")
+
+# At the top of the file:
+torch._inductor.config.triton.cudagraph_trees = False  # Disable tree reduction
+torch._inductor.config.triton.store_cubin = False  # Disable cubin caching
 
