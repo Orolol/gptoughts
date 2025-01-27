@@ -56,10 +56,9 @@ class Router(nn.Module):
             dispatch_mask.scatter_(-1, top_k_indices, top_k_weights)
             dispatch_mask = dispatch_mask.view(batch_size, seq_len, -1)
 
-        # Simplified load balancing
+        # Vectorized load balancing using variance
         expert_load = dispatch_mask.sum(dim=1).mean(0)
-        target_load = expert_load.mean().item()
-        load_balance_loss = F.mse_loss(expert_load, torch.full_like(expert_load, target_load))
+        load_balance_loss = expert_load.var()  # Equivalent to MSE from mean
         
         return routing_weights.detach(), dispatch_mask, self.load_balance_coef * load_balance_loss
 
