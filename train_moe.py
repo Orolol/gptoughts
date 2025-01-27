@@ -870,7 +870,7 @@ def forward_backward_step(micro_step, total_steps):
         )
         
         # Return scalar values for logging while preserving graph
-        return combined_loss.item(), router_loss.item()
+        return combined_loss, router_loss
     except Exception as e:
         print(f"Training iteration failed: {e}")
         return None, None
@@ -987,9 +987,10 @@ while True:
                 if loss_val is None:
                     continue
                 
+                
                 # Accumulate scalar values
-                total_loss += loss_val
-                total_router_loss += router_loss_val
+                total_loss += loss_val.item()
+                total_router_loss += router_loss_val.item()
                 
                 batch_tokens = gradient_accumulation_steps * batch_size * block_size
                 total_tokens += batch_tokens
