@@ -61,7 +61,7 @@ class Router(nn.Module):
         # Normalize top-k weights
         top_k_weights = top_k_weights / (top_k_weights.sum(dim=-1, keepdim=True) + 1e-6)
         
-        # Create dispatch mask
+        # Create dispatch mask.
         dispatch_mask = torch.zeros_like(routing_weights)
         dispatch_mask.scatter_(
             dim=-1,
