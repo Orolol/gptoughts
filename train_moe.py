@@ -782,26 +782,50 @@ if ddp:
 
 model.to(device)
 
-# After model initialization
+# CUDA optimizations
 if device_type == 'cuda':
-    # Set optimal CUDA settings
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.allow_tf32 = True
+    print("CUDA optimizations")
+    default_stream = torch.cuda.current_stream()
+    copy_stream = torch.cuda.Stream()
     
-    # Set memory allocator settings
+    torch.multiprocessing.set_sharing_strategy('file_system')
+    
+    device_index = 0 if isinstance(device, str) else device
+    if isinstance(device, str) and ':' in device:
+        device_index = int(device.split(':')[1])
+    torch.cuda.set_device(device_index)
+    torch.cuda.empty_cache()
+    
+    pin_memory = True
+    
+    gc.enable()
+    
     torch.cuda.set_per_process_memory_fraction(0.95)
-    
-    # Enable async memory allocation
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
-    
-    # Optimize tensor memory layout
-    torch._C._jit_set_profiling_executor(True)
-    torch._C._jit_set_profiling_mode(True)
-    
-    # Set optimal thread settings
-    torch.set_num_threads(6)  # Adjust based on your CPU
-    torch.set_num_interop_threads(6)
+
+    if is_ampere:
+        # Optimisations spécifiques A100
+        torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+        torch.backends.cudnn.benchmark = True
+        
+        # Optimiser pour le throughput
+        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+        torch.cuda.set_per_process_memory_fraction(0.98)
+        
+        # Configuration des streams
+        torch.cuda.Stream(priority=-1)
+        
+        # Optimisation de la mémoire
+        torch.cuda.memory.set_per_process_memory_fraction(0.98)
+        torch.cuda.memory.set_per_process_memory_fraction(0.98, 0)
+        
+        # Désactiver le garbage collector pendant l'entraînement
+        gc.disable()
+    elif is_ada:
+        # Optimisations spécifiques 4090
+        # Privilégier la latence
+        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
+        torch.cuda.set_per_process_memory_fraction(0.85)
 
 # Configure gradient scaler
 scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
