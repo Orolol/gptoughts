@@ -831,7 +831,7 @@ print(f"Starting training with {num_experts} experts and top-{expert_k} routing"
 print_memory_stats("Initial")
 
 # Add after model initialization
-torch._inductor.config.force_fuse_int_mm_with_mul = True
+torch._inductor.config.force_fuse_int_mm_with_mul = False
 torch._inductor.config.use_mixed_mm = True
 torch._inductor.config.epilogue_fusion = True
 
@@ -851,9 +851,14 @@ def forward_backward_step(micro_step, total_steps):
 
         # Backward pass
         with timing_stats.track("backward"):
-            scaler.scale(combined_loss).backward(
-                retain_graph=micro_step != (total_steps - 1)
-            )
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        
+        # Free unused memory immediately
+        del logits, loss, router_loss
+        torch.cuda.empty_cache()
         
         return combined_loss.item(), router_loss.item()
     

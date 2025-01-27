@@ -33,13 +33,15 @@ class Router(nn.Module):
         )
         
         # Better initialization for routing
-        nn.init.kaiming_normal_(self.router[0].weight, mode='fan_out', nonlinearity='linear')
+        nn.init.kaiming_normal_(self.router[0].weight, mode='fan_in', nonlinearity='linear')
         with torch.no_grad():
-            self.router[0].weight.data *= 0.1  # Reduce initial magnitude
+            self.router[0].weight.data *= 0.01  # Reduced from 0.1
         
-        # Increased temperature for softer routing decisions
-        self.temperature = nn.Parameter(torch.ones(1) * 0.1)
-        
+        # Adjust temperature constraints
+        self.temperature = nn.Parameter(torch.ones(1) * 0.5)  # Increased initial temperature
+        self.min_temp = 0.1
+        self.max_temp = 2.0
+
         # Modified loss coefficients
         self.router_z_loss_coef = 0.001  # Reduced from 0.01
         self.load_balance_coef = 0.1      # Increased from 0.01
@@ -58,9 +60,13 @@ class Router(nn.Module):
             dispatch_mask.scatter_(-1, top_k_indices, top_k_weights)
             dispatch_mask = dispatch_mask.view(batch_size, seq_len, -1)
 
-        # Vectorized load balancing using variance
-        expert_load = dispatch_mask.sum(dim=1).mean(0)
-        load_balance_loss = expert_load.var()  # Equivalent to MSE from mean
+        # Modified temperature constraint
+        with torch.no_grad():
+            self.temperature.data.clamp_(min=self.min_temp, max=self.max_temp)
+        
+        # Simplified load balancing loss
+        expert_load = dispatch_mask.mean(dim=1)  # [batch_size, num_experts]
+        load_balance_loss = (expert_load.std() / expert_load.mean()) * 10  # Relative std
         
         # Add back z-loss for stability
         router_z_loss = torch.square(router_logits).mean()
@@ -68,10 +74,6 @@ class Router(nn.Module):
             self.router_z_loss_coef * router_z_loss +
             self.load_balance_coef * load_balance_loss
         )
-        
-        # Constrain temperature to prevent extreme values
-        with torch.no_grad():
-            self.temperature.data.clamp_(min=0.01, max=1.0)
         
         return routing_weights.detach(), dispatch_mask, total_loss
 
@@ -210,7 +212,7 @@ class ExpertGroup(nn.Module):
         combined = torch.einsum('bse,bsed->bsd', expert_weights, expert_outputs)
         
         # Increase expert contribution gradually
-        return shared_output + 0.3 * combined
+        return shared_output + 0.5 * combined + 0.1 * x
 
 class HierarchicalRouter(nn.Module):
     """
@@ -707,13 +709,13 @@ class MoEEncoderDecoderGPT(nn.Module):
             {
                 'params': expert_params,
                 'weight_decay': weight_decay,
-                'lr': learning_rate * 0.5  # Reduced learning rate
+                'lr': learning_rate * 0.8  # Increased from 0.5
             },
-            # Router parameters (lower learning rate)
+            # Router parameters
             {
                 'params': router_params,
                 'weight_decay': 0.0,
-                'lr': learning_rate * 0.1  # Significantly reduced
+                'lr': learning_rate * 0.05  # Reduced from 0.1
             },
             # Other parameters
             {
