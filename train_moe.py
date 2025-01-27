@@ -852,6 +852,8 @@ while True:
         with timing_stats.track("validation"):
             losses = estimate_loss()
             print(f"step {iter_num}: train loss {losses['train']:.4f}, "
+                  f"train router loss {losses['train_router']:.4f}, "
+                  f"train ppl {losses['train_ppl']:.2f}, "
                   f"val loss {losses['val']:.4f}, "
                   f"val router loss {losses['val_router']:.4f}, "
                   f"val ppl {losses['val_ppl']:.2f}")
@@ -931,7 +933,6 @@ while True:
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0
         total_router_loss = 0
-        skip_optimizer_step = False
 
         try:
             for micro_step in range(gradient_accumulation_steps):
@@ -950,7 +951,7 @@ while True:
                         train_iterator = iter(train_loader)
                         next_encoder_input, next_decoder_input, next_target = next(train_iterator)
                     
-                    # Move to device
+                    # Move to device in the copy stream
                     if device_type == 'cuda':
                         next_encoder_input = next_encoder_input.to(device, non_blocking=True)
                         next_decoder_input = next_decoder_input.to(device, non_blocking=True)
