@@ -58,7 +58,7 @@ class Router(nn.Module):
 
         # Simplified load balancing
         expert_load = dispatch_mask.sum(dim=1).mean(0)
-        target_load = expert_load.mean()
+        target_load = expert_load.mean().item()
         load_balance_loss = F.mse_loss(expert_load, torch.full_like(expert_load, target_load))
         
         return routing_weights.detach(), dispatch_mask, self.load_balance_coef * load_balance_loss
