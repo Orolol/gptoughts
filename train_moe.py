@@ -853,7 +853,7 @@ torch._inductor.config.use_mixed_mm = True
 torch._inductor.config.epilogue_fusion = True
 
 # Modify the training loop
-def forward_backward_step():
+def forward_backward_step(micro_step, total_steps):
     try:
         with torch.amp.autocast(enabled=True, device_type=device_type), torch.no_grad():
             encoder_input, decoder_input, target = next(train_iterator)
@@ -862,11 +862,13 @@ def forward_backward_step():
         # Overlap data transfer with computation
         with torch.amp.autocast(enabled=True, device_type=device_type):
             logits, loss, router_loss = model(encoder_input, decoder_input, target)
-            combined_loss = (loss + router_aux_loss_coef * router_loss) / gradient_accumulation_steps
+            combined_loss = (loss + router_aux_loss_coef * router_loss) / total_steps
 
-        # Overlap backward with next forward
-        scaler.scale(combined_loss).backward(create_graph=False)
-        return combined_loss, router_loss
+        # Retain graph only for gradient accumulation steps
+        scaler.scale(combined_loss).backward(
+            retain_graph=micro_step != (total_steps - 1)
+        )
+        return combined_loss.detach(), router_loss.detach()
     except Exception as e:
         print(f"Training iteration failed: {e}")
         return None, None
@@ -975,21 +977,21 @@ while True:
                         micro_step == gradient_accumulation_steps - 1
                     )
                 
-                with timing_stats.track("forward"), torch.amp.autocast(enabled=True, device_type=device_type):
-                    # Libérer la mémoire des tenseurs précédents
-                    # if 'encoder_input' in locals(): del encoder_input
-                    # if 'decoder_input' in locals(): del decoder_input
-                    # if 'target' in locals(): del target
-                    
-                    combined_loss, router_loss = forward_backward_step()
-                    if combined_loss is None:
-                        continue
-                    
-                    batch_tokens = gradient_accumulation_steps * batch_size * block_size
-                    total_tokens += batch_tokens
-                    tokens_window.append((time.time(), batch_tokens))
-                    if len(tokens_window) > window_size:
-                        tokens_window.pop(0)
+                combined_loss, router_loss = forward_backward_step(
+                    micro_step, 
+                    gradient_accumulation_steps
+                )
+                if combined_loss is None:
+                    continue
+                
+                total_loss += combined_loss
+                total_router_loss += router_loss if router_loss is not None else 0.0
+                
+                batch_tokens = gradient_accumulation_steps * batch_size * block_size
+                total_tokens += batch_tokens
+                tokens_window.append((time.time(), batch_tokens))
+                if len(tokens_window) > window_size:
+                    tokens_window.pop(0)
                 
                 with timing_stats.track("backward"):
                     if combined_loss is not None:
