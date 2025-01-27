@@ -330,7 +330,7 @@ grad_clip = 0.5
 
 # learning rate decay settings
 decay_lr = True
-warmup_iters = 1000 / gradient_accumulation_steps
+warmup_iters = 20
 lr_decay_iters = 600000 / gradient_accumulation_steps
 min_lr = 6e-5
 
@@ -1048,6 +1048,7 @@ while True:
         if device_type == 'cuda':
             print(f"GPU mem: {torch.cuda.memory_allocated()/1e9:.2f}GB / {torch.cuda.max_memory_allocated()/1e9:.2f}GB")
             torch.cuda.synchronize()  # Force CUDA sync
+            
 
 if ddp:
     destroy_process_group()

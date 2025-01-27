@@ -693,15 +693,17 @@ class MoEEncoderDecoderGPT(nn.Module):
             else:
                 other_params.append(param)
         
-        # Debug print
-        # print("\nParameter classification:")
-        # for name, param in param_dict.items():
-        #     if any(expert_type in name.lower() for expert_type in ['expert_group', 'shared_mlp', 'expert_proj', 'expert_adapters']):
-        #         print(f"Expert param: {name} - {param.numel():,} parameters")
-        #     elif 'router' in name.lower():
-        #         print(f"Router param: {name} - {param.numel():,} parameters")
-        #     else:
-        #         print(f"Other param: {name} - {param.numel():,} parameters")
+        # Print parameter counts
+        num_expert_params = sum(p.numel() for p in expert_params)
+        num_router_params = sum(p.numel() for p in router_params)
+        num_other_params = sum(p.numel() for p in other_params)
+        total_params = num_expert_params + num_router_params + num_other_params
+        
+        print(f"\nParameter counts:")
+        print(f"Expert parameters: {num_expert_params:,} ({num_expert_params/total_params:.1%})")
+        print(f"Router parameters: {num_router_params:,} ({num_router_params/total_params:.1%})")
+        print(f"Other parameters: {num_other_params:,} ({num_other_params/total_params:.1%})")
+        print(f"Total trainable parameters: {total_params:,}")
         
         # Create optimizer groups with different learning rates
         optim_groups = [
@@ -724,16 +726,6 @@ class MoEEncoderDecoderGPT(nn.Module):
                 'lr': learning_rate
             }
         ]
-        
-        # Print parameter counts
-        num_expert_params = sum(p.numel() for p in expert_params)
-        num_router_params = sum(p.numel() for p in router_params)
-        num_other_params = sum(p.numel() for p in other_params)
-        
-        print(f"\nParameter counts:")
-        print(f"Expert parameters: {num_expert_params:,}")
-        print(f"Router parameters: {num_router_params:,}")
-        print(f"Other parameters: {num_other_params:,}")
         
         # Create AdamW optimizer with fused implementation if available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
