@@ -44,55 +44,24 @@ class Router(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
-        combined_batch_size = batch_size * seq_len
+        x_flat = x.view(-1, self.input_dim)
         
-        # Compute router logits
-        router_logits = self.router(x.view(-1, self.input_dim))
+        with torch.amp.autocast(enabled=True, device_type='cuda'):
+            router_logits = self.router(x_flat)
+            routing_weights = F.softmax(router_logits / (self.temperature + 1e-6), dim=-1)
+            top_k_weights, top_k_indices = torch.topk(routing_weights, self.k, dim=-1)
+            
+            # Fused mask creation
+            dispatch_mask = torch.zeros_like(routing_weights, memory_format=torch.contiguous_format)
+            dispatch_mask.scatter_(-1, top_k_indices, top_k_weights)
+            dispatch_mask = dispatch_mask.view(batch_size, seq_len, -1)
+
+        # Simplified load balancing
+        expert_load = dispatch_mask.sum(dim=1).mean(0)
+        target_load = expert_load.mean()
+        load_balance_loss = F.mse_loss(expert_load, torch.full_like(expert_load, target_load))
         
-        # Scale logits by learned temperature
-        router_logits = router_logits / (self.temperature.abs() + 1e-6)
-        
-        # Compute routing probabilities with stable softmax
-        routing_weights = F.softmax(router_logits, dim=-1)
-        
-        # Get top-k routing weights and indices
-        top_k_weights, top_k_indices = torch.topk(routing_weights, self.k, dim=-1)
-        
-        # Normalize top-k weights
-        top_k_weights = top_k_weights / (top_k_weights.sum(dim=-1, keepdim=True) + 1e-6)
-        
-        # Create dispatch mask.
-        dispatch_mask = torch.zeros_like(routing_weights)
-        dispatch_mask.scatter_(
-            dim=-1,
-            index=top_k_indices,
-            src=top_k_weights
-        )
-        
-        # Compute load balancing loss
-        # Ideal load would be uniform distribution across experts
-        ideal_load = torch.ones_like(routing_weights.mean(0)) / self.num_experts
-        actual_load = routing_weights.mean(0)
-        load_balance_loss = F.kl_div(
-            actual_load.log(),
-            ideal_load,
-            reduction='batchmean',
-            log_target=False
-        )
-        
-        # Router z-loss to encourage exploration
-        router_z_loss = torch.square(router_logits).mean()
-        
-        # Combine losses with adjusted coefficients
-        router_loss = (
-            self.router_z_loss_coef * router_z_loss +
-            self.load_balance_coef * load_balance_loss
-        )
-        
-        # Reshape dispatch mask for batch processing
-        dispatch_mask = dispatch_mask.view(batch_size, seq_len, -1)
-        
-        return routing_weights.detach(), dispatch_mask, router_loss
+        return routing_weights.detach(), dispatch_mask, self.load_balance_coef * load_balance_loss
 
 class SharedExpertMLP(nn.Module):
     """
@@ -212,40 +181,23 @@ class ExpertGroup(nn.Module):
     def forward(self, x: torch.Tensor, expert_weights: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, hidden_dim = x.shape
         
-        # Get shared representations
         shared_output = self.shared_mlp(x)
         
-        if self.parallel_adapters:
-            # Process all experts in parallel
-            expert_outputs = []
-            masks = []
-            
-            # Ensure expert_weights has correct shape [batch_size, seq_len, num_experts]
-            if expert_weights.dim() == 2:
-                expert_weights = expert_weights.view(batch_size, seq_len, -1)
-            
-            # Create masks for each expert
-            for i in range(self.num_experts):
-                mask = expert_weights[:, :, i] > 0
-                if mask.any():
-                    masks.append(mask)
-                    expert_x = x[mask]
-                    # Process through adapter and projections
-                    expert_hidden = self.shared_mlp.pre_adapt(expert_x)
-                    expert_hidden = self.expert_adapters[i](expert_hidden)
-                    expert_hidden = self.expert_proj(expert_hidden)
-                    expert_hidden = self.output_proj(expert_hidden)
-                    expert_outputs.append(expert_hidden)
-            
-            # Combine expert outputs efficiently
-            if expert_outputs:
-                combined_output = torch.zeros_like(shared_output)
-                for mask, expert_output in zip(masks, expert_outputs):
-                    combined_output[mask] = expert_output
-                
-                return shared_output + 0.1 * combined_output
+        # Process all experts in parallel using group convolution approach
+        expert_mask = expert_weights.transpose(1, 2).unsqueeze(-1)  # [B, num_experts, S, 1]
+        x_flat = x.view(-1, hidden_dim)
         
-        return shared_output
+        # Process all adapters in parallel
+        adapter_input = self.shared_mlp.pre_adapt(x_flat)
+        adapter_output = torch.stack([adapter(adapter_input) for adapter in self.expert_adapters], dim=1)
+        expert_outputs = self.expert_proj(adapter_output)
+        expert_outputs = self.output_proj(expert_outputs)
+        
+        # Combine using expert weights
+        expert_outputs = expert_outputs.view(batch_size, seq_len, self.num_experts, -1)
+        combined = torch.einsum('bse,bsed->bsd', expert_weights, expert_outputs)
+        
+        return shared_output + 0.1 * combined
 
 class HierarchicalRouter(nn.Module):
     """
@@ -417,16 +369,21 @@ class MoEEncoderDecoderGPT(nn.Module):
         self.shared_embedding = nn.Embedding(encoder_config.vocab_size, encoder_config.n_embd)
         self.shared_pos_embedding = nn.Embedding(encoder_config.block_size, encoder_config.n_embd)
         
+        # Add expert parallelism
+        self.expert_parallelism = torch.cuda.device_count()
+        if self.expert_parallelism > 1:
+            self.expert_group = torch.distributed.new_group(backend='nccl')
+            
         # Create encoder and decoder with MoE blocks
         self.encoder = nn.ModuleDict(dict(
             drop = nn.Dropout(encoder_config.dropout),
-            h = nn.ModuleList([MoEBlock(encoder_config, num_experts, k) for _ in range(encoder_config.n_layer)]),
+            h = nn.ModuleList([MoEBlock(encoder_config, num_experts//self.expert_parallelism, k) for _ in range(encoder_config.n_layer)]),
             ln_f = nn.LayerNorm(encoder_config.n_embd)
         ))
         
         self.decoder = nn.ModuleDict(dict(
             drop = nn.Dropout(decoder_config.dropout),
-            h = nn.ModuleList([MoEBlock(decoder_config, num_experts, k) for _ in range(decoder_config.n_layer)]),
+            h = nn.ModuleList([MoEBlock(decoder_config, num_experts//self.expert_parallelism, k) for _ in range(decoder_config.n_layer)]),
             ln_f = nn.LayerNorm(decoder_config.n_embd)
         ))
         

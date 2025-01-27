@@ -847,6 +847,30 @@ window_size = 10   # Taille de la fenêtre pour la moyenne glissante
 print(f"Starting training with {num_experts} experts and top-{expert_k} routing")
 print_memory_stats("Initial")
 
+# Add after model initialization
+torch._inductor.config.force_fuse_int_mm_with_mul = True
+torch._inductor.config.use_mixed_mm = True
+torch._inductor.config.epilogue_fusion = True
+
+# Modify the training loop
+def forward_backward_step():
+    try:
+        with torch.amp.autocast(enabled=True, device_type=device_type), torch.no_grad():
+            encoder_input, decoder_input, target = next(train_iterator)
+            encoder_input, decoder_input, target = pad_sequences(encoder_input, decoder_input, target)
+
+        # Overlap data transfer with computation
+        with torch.amp.autocast(enabled=True, device_type=device_type):
+            logits, loss, router_loss = model(encoder_input, decoder_input, target)
+            combined_loss = (loss + router_aux_loss_coef * router_loss) / gradient_accumulation_steps
+
+        # Overlap backward with next forward
+        scaler.scale(combined_loss).backward(create_graph=False)
+        return combined_loss.item(), router_loss.item()
+    except Exception as e:
+        print(f"Training iteration failed: {e}")
+        return 0.0, 0.0
+
 # training loop
 while True:
     # determine and set the learning rate for this iteration
@@ -957,19 +981,12 @@ while True:
                     if 'decoder_input' in locals(): del decoder_input
                     if 'target' in locals(): del target
                     
-                    encoder_input, decoder_input, target = next(train_iterator)
-                    encoder_input, decoder_input, target = pad_sequences(
-                        encoder_input, decoder_input, target
-                    )
-                    
-                    # Forward pass
-                    logits, loss, router_loss = model(encoder_input, decoder_input, target)
+                    loss, router_loss = forward_backward_step()
                     batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
                     total_tokens += batch_tokens
                     tokens_window.append((time.time(), batch_tokens))
                     if len(tokens_window) > window_size:
                         tokens_window.pop(0)
-                    del logits
                 
                 with timing_stats.track("backward"):
                     if loss is not None:
@@ -1056,6 +1073,12 @@ if ddp:
 if device_type == 'cuda':
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
+
+# Add memory optimizations after model initialization
+if device_type == 'cuda':
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(False)
 
 if master_process:
     print("Training finished!")
