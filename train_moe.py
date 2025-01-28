@@ -332,7 +332,7 @@ grad_clip = 0.5
 warmup_iters = 2000
 lr_decay_iters = 200000
 min_lr = 1e-5
-
+decay_lr = True
 # DDP settings
 backend = 'nccl'
 compile = True
