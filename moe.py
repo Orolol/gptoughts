@@ -19,218 +19,51 @@ class Router(nn.Module):
     Router module that determines which expert should process each token.
     Uses top-k routing with load balancing.
     """
-    def __init__(self, input_dim: int, num_experts: int, k: int = 2, capacity_factor: float = 1.25):
+    def __init__(self, input_dim: int, num_experts: int, k: int = 2):
         super().__init__()
-        self.input_dim = input_dim
-        self.num_experts = num_experts
         self.k = k
-        self.capacity_factor = capacity_factor
-        
-        # Simpler router architecture with better initialization
-        self.router = nn.Sequential(
-            nn.Linear(input_dim, num_experts, bias=False),
-            nn.LayerNorm(num_experts)  # Normalize router logits
-        )
-        
-        # Better initialization for routing
-        nn.init.kaiming_normal_(self.router[0].weight, mode='fan_in', nonlinearity='linear')
-        with torch.no_grad():
-            self.router[0].weight.data *= 0.01  # Reduced from 0.1
-        
-        # Adjust temperature constraints
-        self.temperature = nn.Parameter(torch.ones(1) * 0.5)  # Increased initial temperature
-        self.min_temp = 0.1
-        self.max_temp = 2.0
-
-        # Modified loss coefficients
-        self.router_z_loss_coef = 0.001  # Reduced from 0.01
-        self.load_balance_coef = 0.1      # Increased from 0.01
-
-        # Add explicit device and dtype initialization
-        self.register_buffer('dummy', torch.tensor(0), persistent=False)
+        self.num_experts = num_experts
+        self.gate = nn.Linear(input_dim, num_experts, bias=False)
+        nn.init.normal_(self.gate.weight, std=0.02 / math.sqrt(num_experts))
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size, seq_len, _ = x.shape
-        x_flat = x.view(-1, self.input_dim)
+        # Direct top-k routing without softmax temperature
+        logits = self.gate(x)
+        top_k_logits, top_k_indices = logits.topk(self.k, dim=-1)
+        routing_weights = F.softmax(top_k_logits, dim=-1)
         
-        with torch.amp.autocast(enabled=True, device_type='cuda'):
-            router_logits = self.router(x_flat)
-            
-            # Add expert parallelism aware constraints
-            if hasattr(self, 'expert_parallelism'):
-                # Split experts across devices
-                local_num_experts = self.num_experts // self.expert_parallelism
-                router_logits = router_logits[..., :local_num_experts]
-            
-            # Ensure valid indices
-            routing_weights = F.softmax(router_logits / (self.temperature + 1e-6), dim=-1)
-            top_k_weights, top_k_indices = torch.topk(routing_weights, self.k, dim=-1)
-            
-            # Clamp indices to valid range
-            top_k_indices = top_k_indices % self.num_experts  # Add modulo operation
-            
-            # Create dispatch mask with proper tensor initialization
-            dispatch_mask = torch.zeros(
-                routing_weights.shape,
-                device=self.dummy.device,
-                dtype=self.dummy.dtype,
-                memory_format=torch.contiguous_format
-            )
-            dispatch_mask.scatter_(-1, top_k_indices, top_k_weights)
-            
-        # Modified temperature constraint
-        with torch.no_grad():
-            self.temperature.data.clamp_(min=self.min_temp, max=self.max_temp)
+        # Simplified load balancing
+        expert_counts = torch.zeros(self.num_experts, device=x.device)
+        expert_counts.scatter_add_(0, top_k_indices.view(-1), torch.ones_like(top_k_indices.view(-1), dtype=torch.float))
+        load_balance_loss = expert_counts.std() / (expert_counts.mean() + 1e-6)
         
-        # Simplified load balancing loss
-        expert_load = dispatch_mask.mean(dim=1)  # [batch_size, num_experts]
-        load_balance_loss = (expert_load.std() / expert_load.mean()) * 10  # Relative std
-        
-        # Add back z-loss for stability
-        router_z_loss = torch.square(router_logits).mean()
-        total_loss = (
-            self.router_z_loss_coef * router_z_loss +
-            self.load_balance_coef * load_balance_loss
-        )
-        
-        return routing_weights.detach(), dispatch_mask, total_loss
+        return routing_weights, top_k_indices, load_balance_loss * 0.01  # Scaled loss
 
-class SharedExpertMLP(nn.Module):
-    """
-    Expert MLP with partial weight sharing.
-    Each expert shares a common backbone but has unique adaptation layers.
-    """
+class ExpertMLP(nn.Module):
+    """Simplified expert with fused operations"""
     def __init__(self, config):
         super().__init__()
-        self.config = config
+        self.fc1 = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.fc2 = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.act = nn.GELU(approximate='tanh')
         
-        # Dimensions avec facteur plus petit pour plus de stabilité
-        self.hidden_dim = 2 * config.n_embd  # Réduit de 4x à 2x
-        
-        # Shared parameters
-        self.shared_up = nn.Linear(config.n_embd, self.hidden_dim, bias=config.bias)
-        self.shared_gate = nn.Linear(config.n_embd, self.hidden_dim, bias=config.bias)
-        self.shared_down = nn.Linear(self.hidden_dim, config.n_embd, bias=config.bias)
-        
-        # Smaller adaptation dimensions
-        self.adapt_dim = self.hidden_dim // 16  # Encore plus petit pour la stabilité
-        self.pre_adapt = nn.Linear(config.n_embd, self.adapt_dim, bias=config.bias)
-        self.post_adapt = nn.Linear(self.hidden_dim, self.adapt_dim, bias=config.bias)
-        
-        # Layer norm pour stabiliser
-        self.adapt_norm = nn.LayerNorm(self.adapt_dim)
-        
-        # Projection avec plus petit facteur d'échelle
-        self.adapt_proj = nn.Linear(self.adapt_dim, self.hidden_dim, bias=False)
-        
-        self.dropout = nn.Dropout(config.dropout)
-        self._init_weights()
+        # Fused initialization
+        nn.init.normal_(self.fc1.weight, std=0.02 / math.sqrt(2 * config.n_layer))
+        nn.init.normal_(self.fc2.weight, std=0.02 / math.sqrt(2 * config.n_layer))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, S, D = x.shape
-        
-        # Main computation with shared weights
-        up = self.shared_up(x)
-        gate = self.shared_gate(x)
-        hidden = F.silu(gate) * up
-        
-        # Adaptation pathway avec plus de normalisation
-        adapt_in = self.adapt_norm(self.pre_adapt(x))
-        adapt_out = self.adapt_norm(self.post_adapt(hidden))
-        
-        # Compute adaptation weights avec clipping
-        adapt_weights = torch.bmm(adapt_in, adapt_out.transpose(1, 2))
-        adapt_weights = torch.clamp(adapt_weights, -5.0, 5.0)  # Prevent exploding values
-        adapt_weights = F.silu(adapt_weights)
-        
-        # Apply adaptation avec gradient scaling
-        with torch.amp.autocast(enabled=False, device_type='cuda'):
-            adapt = torch.bmm(adapt_weights.float(), adapt_in.float())
-        adapt = self.adapt_proj(adapt.to(x.dtype))
-        
-        # Scale down adaptation contribution
-        adapt = 0.1 * adapt  # Reduce influence of adaptation
-        
-        # Combine main path with adaptation
-        hidden = hidden + adapt
-        
-        return self.dropout(self.shared_down(hidden))
-
-    def _init_weights(self):
-        # Smaller initialization for more stability
-        scale = 1 / (self.config.n_embd ** 0.5)
-        for layer in [self.shared_up, self.shared_gate, self.shared_down]:
-            nn.init.normal_(layer.weight, mean=0.0, std=scale)
-            if layer.bias is not None:
-                nn.init.zeros_(layer.bias)
-        
-        # Even smaller scale for adaptation layers
-        adapt_scale = scale * 0.01
-        for layer in [self.pre_adapt, self.post_adapt, self.adapt_proj]:
-            nn.init.normal_(layer.weight, mean=0.0, std=adapt_scale)
-            if hasattr(layer, 'bias') and layer.bias is not None:
-                nn.init.zeros_(layer.bias)
+    def forward(self, x):
+        return self.fc2(self.act(self.fc1(x)))
 
 class ExpertGroup(nn.Module):
-    """
-    A group of experts that share some weights but maintain unique characteristics
-    through adaptation layers.
-    """
+    """Simplified expert group with parallel computation"""
     def __init__(self, config, num_experts: int):
         super().__init__()
-        self.num_experts = num_experts
-        self.config = config
+        self.experts = nn.ModuleList([ExpertMLP(config) for _ in range(num_experts)])
         
-        # Define dimensions
-        self.hidden_dim = 2 * config.n_embd
-        self.adapt_dim = self.hidden_dim // 16
-        
-        # Shared MLP backbone with larger capacity
-        self.shared_mlp = SharedExpertMLP(config)
-        
-        # Expert-specific adaptation with parallel computation
-        self.expert_adapters = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(self.adapt_dim, self.adapt_dim, bias=False),
-                nn.LayerNorm(self.adapt_dim)
-            ) for _ in range(num_experts)
-        ])
-        
-        # Projections for dimension matching
-        self.expert_proj = nn.Linear(self.adapt_dim, self.hidden_dim, bias=False)
-        self.output_proj = nn.Linear(self.hidden_dim, config.n_embd, bias=False)
-        
-        # Enable parallel computation
-        self.parallel_adapters = True
-        
-        # Initialize with small values
-        adapt_scale = 0.01 / (self.adapt_dim ** 0.5)
-        for adapter in self.expert_adapters:
-            nn.init.normal_(adapter[0].weight, mean=0.0, std=adapt_scale)
-        nn.init.normal_(self.expert_proj.weight, mean=0.0, std=adapt_scale)
-        nn.init.normal_(self.output_proj.weight, mean=0.0, std=adapt_scale)
-
     def forward(self, x: torch.Tensor, expert_weights: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, hidden_dim = x.shape
-        
-        shared_output = self.shared_mlp(x)
-        
-        # Process all experts in parallel using group convolution approach
-        expert_mask = expert_weights.transpose(1, 2).unsqueeze(-1)  # [B, num_experts, S, 1]
-        x_flat = x.view(-1, hidden_dim)
-        
-        # Process all adapters in parallel
-        adapter_input = self.shared_mlp.pre_adapt(x_flat)
-        adapter_output = torch.stack([adapter(adapter_input) for adapter in self.expert_adapters], dim=1)
-        expert_outputs = self.expert_proj(adapter_output)
-        expert_outputs = self.output_proj(expert_outputs)
-        
-        # Combine using expert weights
-        expert_outputs = expert_outputs.view(batch_size, seq_len, self.num_experts, -1)
-        combined = torch.einsum('bse,bsed->bsd', expert_weights, expert_outputs)
-        
-        # Increase expert contribution gradually
-        return shared_output + 0.5 * combined + 0.1 * x
+        # Parallel expert computation
+        expert_outputs = torch.stack([e(x) for e in self.experts], dim=2)
+        return torch.einsum('bse,bsed->bsd', expert_weights, expert_outputs)
 
 class HierarchicalRouter(nn.Module):
     """
@@ -318,8 +151,7 @@ class MoELayer(nn.Module):
         self.router = Router(
             input_dim=config.n_embd,
             num_experts=num_experts,
-            k=k,
-            capacity_factor=1.5  # Increased capacity factor
+            k=k
         )
         
         # Expert group with shared parameters
@@ -338,10 +170,10 @@ class MoELayer(nn.Module):
         normalized = self.norm(x)
         
         # Get routing weights and dispatch mask
-        routing_weights, dispatch_mask, router_loss = self.router(normalized)
+        routing_weights, top_k_indices, router_loss = self.router(normalized)
         
         # Process through expert group
-        expert_output = self.expert_group(normalized, dispatch_mask)
+        expert_output = self.expert_group(normalized, routing_weights)
         
         # Add scaled residual connection
         output = residual + self.residual_scale * expert_output
@@ -374,14 +206,10 @@ class MoEBlock(nn.Module):
         
         # MoE layer
         moe_input = self.ln_2(x)
-        routing_weights, dispatch_mask, router_loss = self.router(moe_input)
+        routing_weights, top_k_indices, router_loss = self.router(moe_input)
         
-        # Ensure dispatch_mask has correct shape
-        if dispatch_mask.dim() == 2:
-            batch_size, seq_len = x.shape[:2]
-            dispatch_mask = dispatch_mask.view(batch_size, seq_len, -1)
-            
-        expert_output = self.expert_group(moe_input, dispatch_mask)
+        # Process through expert group
+        expert_output = self.expert_group(moe_input, routing_weights)
         x = x + expert_output
         
         return x, router_loss
@@ -484,9 +312,9 @@ class MoEEncoderDecoderGPT(nn.Module):
                     with track("moe"):
                         moe_input = block.ln_2(x)
                         with track("router"):
-                            routing_weights, dispatch_mask, router_loss = block.router(moe_input)
+                            routing_weights, top_k_indices, router_loss = block.router(moe_input)
                         with track("experts"):
-                            expert_output = block.expert_group(moe_input, dispatch_mask)
+                            expert_output = block.expert_group(moe_input, routing_weights)
                             x = x + expert_output
                         total_router_loss = total_router_loss + router_loss
                 
@@ -515,9 +343,9 @@ class MoEEncoderDecoderGPT(nn.Module):
                     with track("moe"):
                         moe_input = block.ln_2(x)
                         with track("router"):
-                            routing_weights, dispatch_mask, router_loss = block.router(moe_input)
+                            routing_weights, top_k_indices, router_loss = block.router(moe_input)
                         with track("experts"):
-                            expert_output = block.expert_group(moe_input, dispatch_mask)
+                            expert_output = block.expert_group(moe_input, routing_weights)
                             x = x + expert_output
                         total_router_loss = total_router_loss + router_loss
                 
@@ -563,8 +391,8 @@ class MoEEncoderDecoderGPT(nn.Module):
             
             # MoE layer
             moe_input = block.ln_2(x)
-            routing_weights, dispatch_mask, _ = block.router(moe_input)
-            expert_output = block.expert_group(moe_input, dispatch_mask)
+            routing_weights, top_k_indices, _ = block.router(moe_input)
+            expert_output = block.expert_group(moe_input, routing_weights)
             x = x + expert_output
         
         encoder_output = self.encoder.ln_f(x)
@@ -612,8 +440,8 @@ class MoEEncoderDecoderGPT(nn.Module):
                 
                 # MoE layer
                 moe_input = block.ln_2(decoder_x)
-                routing_weights, dispatch_mask, _ = block.router(moe_input)
-                expert_output = block.expert_group(moe_input, dispatch_mask)
+                routing_weights, top_k_indices, _ = block.router(moe_input)
+                expert_output = block.expert_group(moe_input, routing_weights)
                 decoder_x = decoder_x + expert_output
             
             decoder_x = self.decoder.ln_f(decoder_x)

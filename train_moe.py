@@ -840,29 +840,27 @@ torch._inductor.config.triton.cudagraph_trees = False
 torch._inductor.config.triton.store_cubin = False
 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
 
-# Modify the training loop
-def forward_backward_step(micro_step, total_steps):
+# Add these configs at the top
+torch._inductor.config.triton.autotune = True
+torch._inductor.config.force_fuse_fx_passes = True
+
+# Modify the model creation:
+model = MoEEncoderDecoderGPT(encoder_config, decoder_config, num_experts=32, k=2)
+model = torch.compile(model, mode='max-autotune')  # Enable full compilation
+
+# Simplify the forward/backward step:
+def forward_backward_step():
     try:
-        with timing_stats.track("data_loading"):
-            with torch.no_grad():
-                encoder_input, decoder_input, target = next(train_iterator)
-                encoder_input, decoder_input, target = pad_sequences(encoder_input, decoder_input, target)
-
-        # Forward pass
-        with timing_stats.track("forward"):
-            with torch.amp.autocast(enabled=True, device_type=device_type):
-                logits, loss, router_loss = model(encoder_input, decoder_input, target)
-                combined_loss = (loss + router_aux_loss_coef * router_loss) / total_steps
-
-        # Backward pass
-        with timing_stats.track("backward"):
-            scaled_loss = scaler.scale(combined_loss)
-            scaled_loss.backward()
+        with torch.no_grad():
+            inputs = next(train_iterator)
         
-        return combined_loss.item(), router_loss.item()
-    
+        with torch.amp.autocast(enabled=True, device_type='cuda'):
+            _, loss, router_loss = model(*inputs)
+            scaler.scale(loss + 0.01*router_loss).backward()
+            
+        return loss.item(), router_loss.item()
     except Exception as e:
-        print(f"Microstep {micro_step} failed: {e}")
+        print(f"Step failed: {e}")
         return 0.0, 0.0
 
 # training loop
@@ -976,10 +974,7 @@ while True:
                 )
                 
                 # Get losses and perform backward pass
-                loss_val, router_loss_val = forward_backward_step(
-                    micro_step, 
-                    gradient_accumulation_steps
-                )
+                loss_val, router_loss_val = forward_backward_step()
                 if loss_val is None:
                     continue
                 
