@@ -29,7 +29,7 @@ class Router(nn.Module):
         # Add loss coefficients with warmup
         self.load_balance_coef = 0.01  # Reduced from 0.1
         self.warmup_steps = 1000
-        self.steps = 0
+        self.register_buffer('steps', torch.zeros(1, dtype=torch.long))
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Direct top-k routing without softmax temperature
@@ -43,7 +43,7 @@ class Router(nn.Module):
         load_balance_loss = expert_counts.std() / (expert_counts.mean() + 1e-6)
         
         # Linear warmup for load balancing loss
-        current_coef = self.load_balance_coef * min(1.0, self.steps.item()/self.warmup_steps)
+        current_coef = self.load_balance_coef * min(1.0, self.steps.item() / self.warmup_steps)
         total_loss = current_coef * load_balance_loss
         
         self.steps += 1
