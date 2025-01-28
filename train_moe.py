@@ -329,10 +329,9 @@ beta2 = 0.999
 grad_clip = 0.5
 
 # learning rate decay settings
-decay_lr = True
-warmup_iters = 20
-lr_decay_iters = 600000 / gradient_accumulation_steps
-min_lr = 6e-5
+warmup_iters = 2000
+lr_decay_iters = 200000
+min_lr = 1e-5
 
 # DDP settings
 backend = 'nccl'
@@ -977,6 +976,11 @@ while True:
                 torch.distributed.destroy_process_group()
             sys.exit(1)
 
+    # After backward pass:
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Add moderate clipping
+    scaler.step(optimizer)
+    scaler.update()
 
     # timing and logging
     t1 = time.time()
@@ -984,8 +988,8 @@ while True:
     t0 = t1
     
     if iter_num % log_interval == 0:
-        lossf = total_loss
-        router_lossf = total_router_loss
+        lossf = total_loss / gradient_accumulation_steps
+        router_lossf = total_router_loss / gradient_accumulation_steps
         
         # Get detailed timing breakdown
         avg_timings, percentages = timing_stats.get_averaged_stats()

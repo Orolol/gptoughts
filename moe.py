@@ -25,6 +25,11 @@ class Router(nn.Module):
         self.num_experts = num_experts
         self.gate = nn.Linear(input_dim, num_experts, bias=False)
         nn.init.normal_(self.gate.weight, std=0.02 / math.sqrt(num_experts))
+        
+        # Add loss coefficients with warmup
+        self.load_balance_coef = 0.01  # Reduced from 0.1
+        self.warmup_steps = 1000
+        self.steps = 0
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Direct top-k routing without softmax temperature
@@ -37,7 +42,12 @@ class Router(nn.Module):
         expert_counts.scatter_add_(0, top_k_indices.view(-1), torch.ones_like(top_k_indices.view(-1), dtype=torch.float))
         load_balance_loss = expert_counts.std() / (expert_counts.mean() + 1e-6)
         
-        return routing_weights, top_k_indices, load_balance_loss * 0.01  # Return indices
+        # Linear warmup for load balancing loss
+        current_coef = self.load_balance_coef * min(1.0, self.steps.item()/self.warmup_steps)
+        total_loss = current_coef * load_balance_loss
+        
+        self.steps += 1
+        return routing_weights, top_k_indices, total_loss
 
 class ExpertMLP(nn.Module):
     """Simplified expert with fused operations"""
@@ -171,7 +181,7 @@ class MoELayer(nn.Module):
         self.norm = nn.LayerNorm(config.n_embd)
         
         # Add residual scaling
-        self.residual_scale = nn.Parameter(torch.ones(1) * 0.1)
+        self.residual_scale = nn.Parameter(torch.ones(1) * 0.5)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         residual = x
@@ -567,19 +577,19 @@ class MoEEncoderDecoderGPT(nn.Module):
             {
                 'params': expert_params,
                 'weight_decay': weight_decay,
-                'lr': learning_rate * 0.8  # Increased from 0.5
+                'lr': learning_rate * 1.2  # Increased from 0.8
             },
             # Router parameters
             {
                 'params': router_params,
                 'weight_decay': 0.0,
-                'lr': learning_rate * 0.05  # Reduced from 0.1
+                'lr': learning_rate * 0.2  # Increased from 0.05
             },
             # Other parameters
             {
                 'params': other_params,
                 'weight_decay': weight_decay,
-                'lr': learning_rate
+                'lr': learning_rate * 0.8  # Reduced from 1.0
             }
         ]
         
