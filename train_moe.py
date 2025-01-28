@@ -835,14 +835,25 @@ def forward_backward_step():
         with torch.no_grad():
             inputs = next(train_iterator)
         
+        # Forward pass with autocast
         with torch.amp.autocast(enabled=True, device_type='cuda'):
             _, loss, router_loss = model(*inputs)
-            scaler.scale(loss + 0.01*router_loss).backward()
+            if loss is None or router_loss is None:
+                return None, None
+            total_loss = loss + 0.01 * router_loss
+            
+        # Scale and backward
+        scaled_loss = scaler.scale(total_loss)
+        scaled_loss.backward()
             
         return loss.item(), router_loss.item()
+    except StopIteration:
+        print("Dataset iteration complete")
+        return None, None
     except Exception as e:
         print(f"Step failed: {e}")
-        return 0.0, 0.0
+        print(traceback.format_exc())
+        return None, None
 
 # training loop
 while True:
@@ -956,7 +967,8 @@ while True:
                 
                 # Get losses and perform backward pass
                 loss_val, router_loss_val = forward_backward_step()
-                if loss_val is None:
+                if loss_val is None or router_loss_val is None:
+                    print("Skipping step due to None values")
                     continue
                 
                 # Accumulate scalar values
@@ -972,15 +984,18 @@ while True:
 
         except Exception as e:
             print(f"Training failed at iter {iter_num}: {e}")
+            print(traceback.format_exc())
             if ddp:
                 torch.distributed.destroy_process_group()
             sys.exit(1)
 
-    # After backward pass:
-    scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Add moderate clipping
-    scaler.step(optimizer)
-    scaler.update()
+        # Only proceed with optimizer steps if we have valid losses
+        if total_loss > 0:
+            # After backward pass:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # Add moderate clipping
+            scaler.step(optimizer)
+            scaler.update()
 
     # timing and logging
     t1 = time.time()
