@@ -977,12 +977,6 @@ while True:
                 torch.distributed.destroy_process_group()
             sys.exit(1)
 
-    # After all microsteps:
-    scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    scaler.step(optimizer)
-    scaler.update()
-    optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
     t1 = time.time()
