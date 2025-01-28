@@ -938,7 +938,7 @@ while True:
 
     # forward backward update, with gradient accumulation
     with timing_stats.track("optimization"):
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=False)
         total_loss = 0
         total_router_loss = 0
         batch_tokens = 0  # Track total tokens for this batch
