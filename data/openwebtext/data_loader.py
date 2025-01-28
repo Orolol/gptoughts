@@ -194,14 +194,14 @@ class StreamingDataset(IterableDataset):
         # Prepare les tensors comme avant, mais avec la taille de batch ajustée
         encoder_input = torch.tensor(self.token_buffer[:total_length], 
                                    dtype=torch.long, device=self.device)
-        decoder_input = torch.tensor(self.token_buffer[total_length:total_length*2], 
-                                   dtype=torch.long, device=self.device)
+        # decoder_input = torch.tensor(self.token_buffer[total_length:total_length*2], 
+        #                            dtype=torch.long, device=self.device)
         target = torch.tensor(self.token_buffer[total_length+1:total_length*2+1], 
                             dtype=torch.long, device=self.device)
 
         # Reshape avec la taille de batch ajustée
         encoder_input = encoder_input.view(actual_batch_size, self.block_size)
-        decoder_input = decoder_input.view(actual_batch_size, self.block_size)
+        # decoder_input = decoder_input.view(actual_batch_size, self.block_size)
         target = target.view(actual_batch_size, self.block_size)
 
         # Nettoie le buffer
@@ -211,7 +211,7 @@ class StreamingDataset(IterableDataset):
         # print(f"Time to get a batch: {end_time - start_time:.4f} seconds")
 
         self.current_iter += 1
-        return encoder_input, decoder_input, target
+        return encoder_input, encoder_input, target
     
     def __iter__(self):
         while True:

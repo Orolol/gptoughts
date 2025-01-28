@@ -206,7 +206,7 @@ if torch.cuda.is_available():
         if is_ampere:
             # Optimisations A100
             batch_size = 92  # Réduit pour éviter OOM
-            gradient_accumulation_steps = 1  # Augmenté pour compenser
+            gradient_accumulation_steps = 2  # Augmenté pour compenser
             
             # Optimisations mémoire et calcul
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -964,7 +964,7 @@ while True:
                     
                     # Forward pass
                     logits, loss, router_loss = model(encoder_input, decoder_input, target)
-                    batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item() + decoder_input.ne(tokenizer.pad_token_id).sum().item()
+                    batch_tokens = encoder_input.ne(tokenizer.pad_token_id).sum().item()
                     total_tokens += batch_tokens
                     tokens_window.append((time.time(), batch_tokens))
                     if len(tokens_window) > window_size:
