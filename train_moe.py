@@ -830,24 +830,6 @@ total_tokens = 0
 print(f"Starting training with {num_experts} experts and top-{expert_k} routing")
 print_memory_stats("Initial")
 
-# Add after model initialization
-torch._inductor.config.force_fuse_int_mm_with_mul = False
-torch._inductor.config.use_mixed_mm = True
-torch._inductor.config.epilogue_fusion = True
-
-# Disable problematic optimizations
-torch._inductor.config.triton.cudagraph_trees = False
-torch._inductor.config.triton.store_cubin = False
-torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
-
-# Add these configs at the top
-torch._inductor.config.triton.autotune = True
-torch._inductor.config.force_fuse_fx_passes = True
-
-# Modify the model creation:
-model = MoEEncoderDecoderGPT(encoder_config, decoder_config, num_experts=32, k=2)
-model = torch.compile(model, mode='max-autotune')  # Enable full compilation
-
 # Simplify the forward/backward step:
 def forward_backward_step():
     try:
