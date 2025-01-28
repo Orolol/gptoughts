@@ -183,14 +183,14 @@ if torch.cuda.is_available():
     elif args.size == "medium":
         # Base parameters
         block_size = 256
-        num_experts = 32
+        num_experts = 16
         expert_k = 4
         
         
         # Ajustements spécifiques selon le GPU
         if is_ampere:
             # Optimisations A100
-            batch_size = 54  # Réduit pour éviter OOM
+            batch_size = 48  # Réduit pour éviter OOM
             gradient_accumulation_steps = 4  # Augmenté pour compenser
             
             # Optimisations mémoire et calcul
