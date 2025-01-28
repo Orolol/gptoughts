@@ -37,7 +37,7 @@ class Router(nn.Module):
         expert_counts.scatter_add_(0, top_k_indices.view(-1), torch.ones_like(top_k_indices.view(-1), dtype=torch.float))
         load_balance_loss = expert_counts.std() / (expert_counts.mean() + 1e-6)
         
-        return routing_weights, top_k_indices, load_balance_loss * 0.01  # Scaled loss
+        return routing_weights, top_k_indices, load_balance_loss * 0.01  # Return indices
 
 class ExpertMLP(nn.Module):
     """Simplified expert with fused operations"""
@@ -59,11 +59,21 @@ class ExpertGroup(nn.Module):
     def __init__(self, config, num_experts: int):
         super().__init__()
         self.experts = nn.ModuleList([ExpertMLP(config) for _ in range(num_experts)])
+        self.num_experts = num_experts
         
-    def forward(self, x: torch.Tensor, expert_weights: torch.Tensor) -> torch.Tensor:
-        # Parallel expert computation
-        expert_outputs = torch.stack([e(x) for e in self.experts], dim=2)
-        return torch.einsum('bse,bsed->bsd', expert_weights, expert_outputs)
+    def forward(self, x: torch.Tensor, expert_weights: torch.Tensor, top_k_indices: torch.Tensor) -> torch.Tensor:
+        # Compute all expert outputs in parallel
+        expert_outputs = torch.stack([e(x) for e in self.experts], dim=2)  # [batch_size, seq_len, num_experts, dim]
+        
+        # Gather only the top-k expert outputs using indices
+        selected_expert_outputs = torch.gather(
+            expert_outputs,
+            dim=2,
+            index=top_k_indices.unsqueeze(-1).expand(-1, -1, -1, expert_outputs.size(-1))
+        )  # [batch_size, seq_len, k, dim]
+        
+        # Combine using the routing weights
+        return torch.einsum('bse,bsek->bsk', expert_weights, selected_expert_outputs)
 
 class HierarchicalRouter(nn.Module):
     """
@@ -169,11 +179,11 @@ class MoELayer(nn.Module):
         # Normalize input
         normalized = self.norm(x)
         
-        # Get routing weights and dispatch mask
+        # Get routing weights and indices
         routing_weights, top_k_indices, router_loss = self.router(normalized)
         
-        # Process through expert group
-        expert_output = self.expert_group(normalized, routing_weights)
+        # Process through expert group with indices
+        expert_output = self.expert_group(normalized, routing_weights, top_k_indices)
         
         # Add scaled residual connection
         output = residual + self.residual_scale * expert_output
@@ -209,7 +219,7 @@ class MoEBlock(nn.Module):
         routing_weights, top_k_indices, router_loss = self.router(moe_input)
         
         # Process through expert group
-        expert_output = self.expert_group(moe_input, routing_weights)
+        expert_output = self.expert_group(moe_input, routing_weights, top_k_indices)
         x = x + expert_output
         
         return x, router_loss
@@ -314,7 +324,7 @@ class MoEEncoderDecoderGPT(nn.Module):
                         with track("router"):
                             routing_weights, top_k_indices, router_loss = block.router(moe_input)
                         with track("experts"):
-                            expert_output = block.expert_group(moe_input, routing_weights)
+                            expert_output = block.expert_group(moe_input, routing_weights, top_k_indices)
                             x = x + expert_output
                         total_router_loss = total_router_loss + router_loss
                 
@@ -345,7 +355,7 @@ class MoEEncoderDecoderGPT(nn.Module):
                         with track("router"):
                             routing_weights, top_k_indices, router_loss = block.router(moe_input)
                         with track("experts"):
-                            expert_output = block.expert_group(moe_input, routing_weights)
+                            expert_output = block.expert_group(moe_input, routing_weights, top_k_indices)
                             x = x + expert_output
                         total_router_loss = total_router_loss + router_loss
                 
@@ -392,7 +402,7 @@ class MoEEncoderDecoderGPT(nn.Module):
             # MoE layer
             moe_input = block.ln_2(x)
             routing_weights, top_k_indices, _ = block.router(moe_input)
-            expert_output = block.expert_group(moe_input, routing_weights)
+            expert_output = block.expert_group(moe_input, routing_weights, top_k_indices)
             x = x + expert_output
         
         encoder_output = self.encoder.ln_f(x)
@@ -441,7 +451,7 @@ class MoEEncoderDecoderGPT(nn.Module):
                 # MoE layer
                 moe_input = block.ln_2(decoder_x)
                 routing_weights, top_k_indices, _ = block.router(moe_input)
-                expert_output = block.expert_group(moe_input, routing_weights)
+                expert_output = block.expert_group(moe_input, routing_weights, top_k_indices)
                 decoder_x = decoder_x + expert_output
             
             decoder_x = self.decoder.ln_f(decoder_x)
