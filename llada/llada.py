@@ -33,7 +33,7 @@ class LLaDAConfig:
 class LLaDARouter(nn.Module):
     """
     Router module that determines which expert should process each token.
-    Modified for LLaDA with improved stability.
+    Modified for LLaDA with improved stability and memory efficiency.
     """
     def __init__(self, input_dim: int, num_experts: int, k: int = 2, capacity_factor: float = 1.5):
         super().__init__()
@@ -43,18 +43,30 @@ class LLaDARouter(nn.Module):
         self.k = min(k, num_experts)
         self.capacity_factor = capacity_factor
         
-        # Router network with normalization
-        self.router = nn.Sequential(
-            nn.Linear(input_dim, num_experts, bias=False),
-            nn.LayerNorm(num_experts)
-        )
+        # Improved router design: use a more efficient network structure
+        # Reduce parameter count by factorizing the routing network
+        reduction_factor = 8
+        hidden_dim = max(input_dim // reduction_factor, 32)
         
-        # Temperature parameter for routing
-        self.temperature = nn.Parameter(torch.ones(1) * 0.1)
+        # Use separate layers for more efficient computation
+        self.router_projection = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.router_gate = nn.Linear(hidden_dim, num_experts, bias=False)
+        self.router_norm = nn.LayerNorm(hidden_dim)
         
-        # Loss coefficients
-        self.router_z_loss_coef = 0.01
-        self.load_balance_coef = 0.01
+        # Temperature parameter for routing with better initialization
+        self.temperature = nn.Parameter(torch.ones(1) * 0.07)
+        
+        # Loss coefficients - slightly reduced to prevent training instability
+        self.router_z_loss_coef = 0.005
+        self.load_balance_coef = 0.005
+        
+        # Initialize weights with a specific pattern to improve initial routing
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize router weights for better gradient flow"""
+        nn.init.orthogonal_(self.router_projection.weight, gain=0.3)
+        nn.init.orthogonal_(self.router_gate.weight, gain=0.3)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
@@ -543,7 +555,7 @@ class LLaDAModel(nn.Module):
 
     def forward(self, input_ids, targets=None, apply_masking=True, eps=1e-3):
         """
-        Forward pass through the model
+        Forward pass through the model with optimized memory usage
         
         Args:
             input_ids: Tensor of token indices [batch_size, seq_len]
@@ -558,6 +570,10 @@ class LLaDAModel(nn.Module):
         """
         device = input_ids.device
         batch_size, seq_len = input_ids.shape
+        
+        # Explicitly clear GPU memory cache before large operations
+        if torch.cuda.is_available() and seq_len > 512:
+            torch.cuda.empty_cache()
         
         # Safety check: ensure all input IDs are within vocabulary range (strictly less than vocab_size)
         if torch.any(input_ids >= self.config.vocab_size):

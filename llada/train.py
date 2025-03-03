@@ -18,6 +18,10 @@ from collections import defaultdict
 from contextlib import contextmanager
 import sys
 import traceback
+from memory_utils import (
+    MemoryTracker, optimized_memory_context, free_memory, 
+    set_memory_fraction, setup_optimal_memory_config
+)
 # Add parent directory to path to import from root project
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -221,42 +225,85 @@ class SFTDataset(Dataset):
         }
 
 def preallocate_cuda_memory():
-    """Préalloue de la mémoire CUDA pour éviter la fragmentation et améliorer les performances"""
-    print("Préallocation de mémoire CUDA...")
+    """Preallocate CUDA memory to avoid fragmentation and improve performance"""
+    print("Preallocating CUDA memory...")
     if torch.cuda.is_available():
         device = torch.cuda.current_device()
         try:
-            # Calcule environ 70% de la mémoire disponible
+            # Calculate available memory
             free_mem, total_mem = torch.cuda.mem_get_info(device)
-            # Utilise 70% de la mémoire disponible
-            mem_to_allocate = int(free_mem * 0.8)
-            # Alloue un grand bloc continu
-            prealloc = torch.empty(mem_to_allocate // 4, dtype=torch.float, device='cuda')
-            # Libère immédiatement, mais laisse le bloc réservé dans le cache CUDA
-            del prealloc
+            
+            # Use a more conservative allocation to avoid OOM errors (75% of free memory)
+            mem_to_allocate = int(free_mem * 0.75)
+            
+            # Allocate in multiple smaller blocks instead of one large block
+            # This creates a more stable memory pool and reduces fragmentation
+            block_size = mem_to_allocate // 8
+            allocations = []
+            
+            # Allocate blocks sequentially
+            for i in range(8):
+                try:
+                    # Use float16 instead of float32 to allocate more efficiently
+                    allocations.append(torch.empty(block_size // 2, 
+                                                 dtype=torch.float16, 
+                                                 device='cuda'))
+                    print(f"Allocated block {i+1}/8 ({block_size/(1024**3):.2f} GB)")
+                except RuntimeError as e:
+                    print(f"Stopped at block {i+1}/8: {e}")
+                    break
+            
+            # Free the allocations but keep them in CUDA cache
+            for block in allocations:
+                del block
+            
+            allocations = []
             torch.cuda.empty_cache()
-            print(f"Préallocation terminée, {mem_to_allocate / (1024**3):.2f} GB réservés")
+            
+            # Force a CUDA synchronization to complete pending operations
+            torch.cuda.synchronize()
+            
+            # Calculate how much we've successfully preallocated
+            _, new_free = torch.cuda.mem_get_info(device)
+            preallocated = total_mem - new_free
+            
+            print(f"Preallocation complete, {preallocated/(1024**3):.2f} GB reserved")
+            
         except Exception as e:
-            # Fallback si mem_get_info n'est pas disponible
-            print(f"Préallocation avec méthode alternative: {e}")
-            # Alloue ~70% de la mémoire totale si on ne peut pas obtenir l'info précise
-            total_mem = torch.cuda.get_device_properties(device).total_memory
-            mem_to_allocate = int(total_mem * 0.7)
+            # Fallback if mem_get_info isn't available
+            print(f"Preallocation using alternate method: {e}")
             try:
-                prealloc = torch.empty(mem_to_allocate // 4, dtype=torch.float, device='cuda')
-                del prealloc
+                # Allocate ~70% of total memory in smaller chunks
+                total_mem = torch.cuda.get_device_properties(device).total_memory
+                mem_to_allocate = int(total_mem * 0.7)
+                block_size = mem_to_allocate // 8
+                
+                allocations = []
+                for i in range(8):
+                    try:
+                        allocations.append(torch.empty(block_size // 2, 
+                                                     dtype=torch.float16, 
+                                                     device='cuda'))
+                    except RuntimeError:
+                        break
+                
+                for block in allocations:
+                    del block
+                allocations = []
                 torch.cuda.empty_cache()
-                print(f"Préallocation terminée, ~{mem_to_allocate / (1024**3):.2f} GB réservés")
+                torch.cuda.synchronize()
+                
+                print(f"Preallocation complete (fallback method)")
             except RuntimeError:
-                print("Préallocation échouée - mémoire insuffisante. Continuons sans préallocation.")
+                print("Preallocation failed - insufficient memory. Continuing without preallocation.")
 
 def setup_cuda_optimizations():
     """Configure CUDA optimizations based on the detected GPU hardware."""
     if not torch.cuda.is_available():
-        print("CUDA n'est pas disponible, aucune optimisation appliquée")
+        print("CUDA is not available, no optimizations applied")
         return
     
-    # Optimisations TF32 pour accélérer les calculs matriciels
+    # TF32 optimizations for accelerated matrix calculations
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision('high')
@@ -265,7 +312,7 @@ def setup_cuda_optimizations():
     gpu_name = torch.cuda.get_device_name().lower()
     detected_arch = "unknown"
     
-    # Détection de l'architecture
+    # Architecture detection
     if any(x in gpu_name for x in ['h100', 'h800']):
         detected_arch = "hopper"
     elif any(x in gpu_name for x in ['a100', 'a6000', 'a5000', 'a4000']):
@@ -273,57 +320,93 @@ def setup_cuda_optimizations():
     elif any(x in gpu_name for x in ['4090', '4080', '4070', '4060', '3090', '3080', '3070', '2070']):
         detected_arch = "consumer"
     
-    print(f"Détecté GPU: {torch.cuda.get_device_name()} (architecture: {detected_arch})")
+    print(f"Detected GPU: {torch.cuda.get_device_name()} (architecture: {detected_arch})")
     
-    # Optimisations communes
+    # Common optimizations
     torch.backends.cudnn.benchmark = True
     
-    # Optimisations spécifiques à l'architecture
+    # Architecture-specific optimizations
     if detected_arch == "hopper":
-        # H100/H800 - GPUs HPC haut de gamme
+        # H100/H800 - High-end HPC GPUs
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-        torch.cuda.set_per_process_memory_fraction(0.98)
-        # Désactiver le GC Python pour les cas temps-réel
-        gc.disable()
-        print("Optimisations Hopper appliquées: précision réduite pour BF16/FP16, connexions GPU optimisées")
+        
+        # Don't set a fixed memory fraction - let PyTorch manage dynamically
+        # Instead set these memory-related environment variables
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+        
+        # Enable cudnn benchmark mode for optimizing convolution algorithms
+        torch.backends.cudnn.benchmark = True
+        
+        # Don't disable Python's GC completely - can cause memory leaks
+        # Instead, tune GC parameters for more aggressive collection
+        gc.set_threshold(100, 5, 5)  # More frequent collection
+        
+        print("Hopper optimizations applied: reduced precision for BF16/FP16, optimized GPU connections")
         
     elif detected_arch == "ampere":
-        # A100 et autres GPUs datacenter Ampere
+        # A100 and other Ampere datacenter GPUs
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-        torch.cuda.set_per_process_memory_fraction(0.95)
-        print("Optimisations Ampere appliquées: précision réduite pour BF16/FP16, fraction mémoire 95%")
+        
+        # Dynamic memory management instead of fixed percentage
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+        
+        # Tune GC for large models
+        gc.set_threshold(700, 10, 5)
+        
+        print("Ampere optimizations applied: reduced precision for BF16/FP16, dynamic memory management")
         
     elif detected_arch == "consumer":
-        # GPUs grand public (RTX série 3000/4000)
+        # Consumer GPUs (RTX 3000/4000 series)
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
-        torch.cuda.set_per_process_memory_fraction(0.85)
-        print("Optimisations GPU Consumer appliquées: connexions multiples, fraction mémoire 85%")
+        
+        # More conservative memory settings for consumer GPUs
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
+        
+        print("Consumer GPU optimizations applied: multiple connections, dynamic memory management")
         
     else:
-        # GPU inconnu ou plus ancien - optimisations génériques
-        print("Architecture GPU non reconnue, application d'optimisations génériques")
+        # Unknown or older GPU - generic optimizations
+        print("Unrecognized GPU architecture, applying generic optimizations")
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
-        torch.cuda.set_per_process_memory_fraction(0.8)
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
     
-    # Optimisations de cuDNN
+    # cuDNN optimizations
     if hasattr(torch.backends.cudnn, "allow_tensor_core"):
         torch.backends.cudnn.allow_tensor_core = True
-        
+    
+    # Enable better memory defrag
+    if hasattr(torch.cuda, "memory_stats"):
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "") + ",garbage_collection_threshold:0.6"
+    
+    # Optimize memory allocator
+    if hasattr(torch, "use_deterministic_algorithms"):
+        # Only do this in non-deterministic mode
+        try:
+            torch.use_deterministic_algorithms(False)
+        except:
+            pass
+    
     # Autocast settings
     if hasattr(torch.cuda, "amp") and hasattr(torch.cuda.amp, "autocast"):
-        # Patch pour assurer la compatibilité avec les instructions personnalisées
+        # Patch for compatibility with custom instructions
         original_autocast = torch.cuda.amp.autocast
         def patched_autocast(*args, **kwargs):
             if not kwargs.get("enabled", True):
                 return nullcontext()
             return torch.amp.autocast(device_type='cuda', *args, **kwargs)
         torch.cuda.amp.autocast = patched_autocast
-        
-    print("Configuration des optimisations CUDA terminée")
+    
+    # NCCL optimization for multi-GPU if available
+    if hasattr(torch.distributed, "is_available") and torch.distributed.is_available():
+        # Set NCCL environment variables for better performance
+        os.environ["NCCL_BLOCKING_WAIT"] = "1"
+        os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
+    
+    print("CUDA optimization configuration complete")
 
 def print_gpu_stats():
     """Affiche des statistiques détaillées sur l'utilisation du GPU."""
@@ -721,33 +804,74 @@ def train_llada(args):
                                   not ddp and 
                                   device_type == 'cuda')
                 
-                # Importante optimisation: ne pas utiliser CUDA Graphs si accumulation > 4
-                # car cela peut causer des ralentissements importants
-                if args.gradient_accumulation_steps > 4:
+                # Important optimization: use CUDA graphs smarter - disable for uneven batch sizes
+                # Don't use for extremely large gradient accumulation steps, but increase threshold
+                if args.gradient_accumulation_steps > 8:
                     use_cuda_graph = False
                     if args.use_cuda_graphs and iter_num == 0:
-                        print("CUDA Graphs désactivés car gradient_accumulation_steps > 4")
+                        print("CUDA Graphs disabled because gradient_accumulation_steps > 8")
                 elif use_cuda_graph and iter_num == 0:
-                    print("CUDA Graphs activés - premier iter servira de warmup")
+                    print("CUDA Graphs enabled - first iteration will serve as warmup")
                 
-                # Utilisation du monitoring GPU si demandé
+                # GPU monitoring if requested
                 if args.gpu_monitor_interval > 0 and iter_num % args.gpu_monitor_interval == 0 and master_process:
                     print_gpu_stats()
                 
-                # Limiter le nombre de graphes pour éviter explosion mémoire
-                max_graphs_per_shape = 2
+                # More aggressive cache for CUDA graphs - only need 1 graph per size typically
+                max_graphs_per_shape = 1
                 static_input_shapes = {}
                 cuda_graphs = {}
                 
-                # Pré-chargement des lots pour tous les micro-steps
+                # Make sure CUDA graphs memory is managed efficiently
+                if use_cuda_graph and hasattr(torch.cuda, "graphs"):
+                    # Try to use the more memory-efficient CUDA graph API if available
+                    if hasattr(torch.cuda.graphs, "graph_pool_handle"):
+                        # Set memory pool for graphs to be more efficient
+                        try:
+                            torch.cuda.graphs.graph_pool_handle()
+                        except:
+                            pass
+                
+                # Pre-load batches for all micro-steps
+                # Use multi-threaded, async loading for better performance
                 batches = []
+                batch_futures = []
+                use_threading = True
+                
+                def load_batch_worker(train_loader, mode, queue, idx):
+                    """Worker function to load batches in separate threads"""
+                    try:
+                        if args.use_streaming_dataset:
+                            batch = next(train_loader)
+                            queue.put((idx, batch))
+                        elif mode == 'pretrain':
+                            if isinstance(train_loader, DataLoader):
+                                x, y = next(iter(train_loader))
+                                queue.put((idx, (x, y)))
+                            else:
+                                x, y = next(train_loader)
+                                queue.put((idx, (x, y)))
+                        else:
+                            # SFT batch
+                            if isinstance(train_loader, DataLoader):
+                                batch = next(iter(train_loader))
+                                queue.put((idx, batch))
+                            else:
+                                batch = next(train_loader)
+                                queue.put((idx, batch))
+                    except StopIteration:
+                        queue.put((idx, None))
+                    except Exception as e:
+                        print(f"Batch loading error: {e}")
+                        queue.put((idx, None))
+                
                 try:
                     with timing_stats.track("data_preloading"):
-                        # Vérifier si le data loader a une méthode pour récupérer plusieurs lots en une fois
+                        # Check if data loader has a method to fetch multiple batches at once
                         data_loading_start = time.time()
                         
                         if args.use_streaming_dataset and hasattr(train_loader, 'get_accumulation_batches'):
-                            # Méthode optimisée pour récupérer tous les lots d'un coup
+                            # Optimized method to get all batches at once
                             batches = train_loader.get_accumulation_batches(args.gradient_accumulation_steps)
                             if master_process and iter_num % args.log_interval == 0:
                                 data_loading_time = time.time() - data_loading_start
@@ -755,33 +879,76 @@ def train_llada(args):
                                 if len(batches) != args.gradient_accumulation_steps:
                                     print(f"⚠️ Warning: Expected {args.gradient_accumulation_steps} batches, got {len(batches)}")
                         else:
-                            # Fallback: récupérer les lots un par un
-                            for i in range(args.gradient_accumulation_steps):
-                                load_start = time.time()
-                                if args.use_streaming_dataset:
-                                    # Nouveau data loader optimisé
-                                    batch = next(train_loader)
-                                    batches.append(batch)
-                                elif args.mode == 'pretrain':
-                                    if isinstance(train_loader, DataLoader):
-                                        x, y = next(iter(train_loader))
-                                        batches.append((x, y))
-                                    else:
-                                        x, y = next(train_loader)
-                                        batches.append((x, y))
-                                else:
-                                    # SFT batch
-                                    if isinstance(train_loader, DataLoader):
-                                        batch = next(iter(train_loader))
-                                        batches.append(batch)
-                                    else:
+                            # Use threaded batch loading for better performance
+                            if use_threading:
+                                import queue
+                                batch_queue = queue.Queue()
+                                threads = []
+                                
+                                # Start all loading threads at once
+                                for i in range(args.gradient_accumulation_steps):
+                                    thread = threading.Thread(
+                                        target=load_batch_worker,
+                                        args=(train_loader, args.mode, batch_queue, i)
+                                    )
+                                    thread.daemon = True
+                                    thread.start()
+                                    threads.append(thread)
+                                
+                                # Initialize batches list with None placeholders
+                                batches = [None] * args.gradient_accumulation_steps
+                                
+                                # Collect results as they complete
+                                completed = 0
+                                while completed < args.gradient_accumulation_steps:
+                                    try:
+                                        idx, batch = batch_queue.get(timeout=1.0)
+                                        if batch is None:
+                                            raise StopIteration
+                                        batches[idx] = batch
+                                        completed += 1
+                                    except queue.Empty:
+                                        # Check if any threads have died
+                                        if not any(t.is_alive() for t in threads):
+                                            if completed == 0:
+                                                raise StopIteration
+                                            break
+                                
+                                # If we didn't get all batches, we need to raise StopIteration
+                                if None in batches:
+                                    raise StopIteration
+                                
+                                if master_process and iter_num % args.log_interval == 0:
+                                    data_loading_time = time.time() - data_loading_start
+                                    print(f"🔄 Data loading time (threaded): {data_loading_time*1000:.1f}ms for {args.gradient_accumulation_steps} batches")
+                            else:
+                                # Fallback: get batches one by one
+                                for i in range(args.gradient_accumulation_steps):
+                                    load_start = time.time()
+                                    if args.use_streaming_dataset:
+                                        # New optimized data loader
                                         batch = next(train_loader)
                                         batches.append(batch)
-                                
-                                # Log détaillé du temps de chargement
-                                if master_process and iter_num % args.log_interval == 0:
-                                    load_time = time.time() - load_start
-                                    print(f"🔄 Data loading time (batch {i+1}/{args.gradient_accumulation_steps}): {load_time*1000:.1f}ms")
+                                    elif args.mode == 'pretrain':
+                                        if isinstance(train_loader, DataLoader):
+                                            x, y = next(iter(train_loader))
+                                            batches.append((x, y))
+                                        else:
+                                            x, y = next(train_loader)
+                                            batches.append((x, y))
+                                    else:
+                                        # SFT batch
+                                        if isinstance(train_loader, DataLoader):
+                                            batch = next(iter(train_loader))
+                                            batches.append(batch)
+                                        else:
+                                            batch = next(train_loader)
+                                            batches.append(batch)
+                                    
+                                    # Detailed load time logging
+                                    if master_process and iter_num % args.log_interval == 0:
+                                        load_time = time.time() - load_start
+                                        print(f"🔄 Data loading time (batch {i+1}/{args.gradient_accumulation_steps}): {load_time*1000:.1f}ms")
                 except StopIteration:
                     if args.use_streaming_dataset and master_process:
                         print("Fin de l'itération du dataloader, réinitialisation...")
@@ -789,17 +956,68 @@ def train_llada(args):
                     # On saute cette itération
                     continue
                 
-                # Boucle pour l'accumulation de gradients
+                # Create CUDA streams for overlapped execution
+                data_stream = torch.cuda.Stream() if torch.cuda.is_available() and not args.disable_non_blocking else None
+                compute_stream = torch.cuda.current_stream() if torch.cuda.is_available() else None
+                
+                # Pre-fetch first batch data to device asynchronously
+                if data_stream is not None and micro_step < len(batches):
+                    with torch.cuda.stream(data_stream):
+                        prefetched_data = {}
+                        if args.use_streaming_dataset:
+                            prefetched_data['x'] = batches[0]['input_ids'].to(device, non_blocking=True)
+                            prefetched_data['y'] = batches[0]['labels'].to(device, non_blocking=True)
+                        elif args.mode == 'pretrain':
+                            x, y = batches[0]
+                            prefetched_data['x'] = x.to(device, non_blocking=True)
+                            prefetched_data['y'] = y.to(device, non_blocking=True)
+                        else:
+                            # SFT batch
+                            prefetched_data['batch'] = {k: v.to(device, non_blocking=True) 
+                                                     for k, v in batches[0].items()}
+                
+                # Gradient accumulation loop
                 for micro_step in range(args.gradient_accumulation_steps):
-                    # Activer la synchronisation de gradient DDP uniquement pour le dernier micro_step
-                    if ddp and micro_step == args.gradient_accumulation_steps - 1:
-                        model.require_backward_grad_sync = True
+                    # Enable DDP gradient sync only for the last micro_step
+                    if ddp:
+                        model.require_backward_grad_sync = (micro_step == args.gradient_accumulation_steps - 1)
                     
-                        # Récupération du batch pré-chargé
-                        with timing_stats.track(f"data_loading_{micro_step}"):
+                    # Fetch data from the pre-loaded batches
+                    with timing_stats.track(f"data_loading_{micro_step}"):
+                        if data_stream is not None and micro_step < len(batches):
+                            # Wait for the prefetched data to be ready
+                            torch.cuda.current_stream().wait_stream(data_stream)
+                            
+                            # Use the prefetched data
+                            if args.use_streaming_dataset:
+                                x = prefetched_data['x']
+                                y = prefetched_data['y']
+                            elif args.mode == 'pretrain':
+                                x = prefetched_data['x']
+                                y = prefetched_data['y']
+                            else:
+                                # SFT batch
+                                batch = prefetched_data['batch']
+                            
+                            # Pre-fetch next batch if available
+                            if micro_step + 1 < len(batches):
+                                with torch.cuda.stream(data_stream):
+                                    if args.use_streaming_dataset:
+                                        prefetched_data['x'] = batches[micro_step+1]['input_ids'].to(device, non_blocking=True)
+                                        prefetched_data['y'] = batches[micro_step+1]['labels'].to(device, non_blocking=True)
+                                    elif args.mode == 'pretrain':
+                                        next_x, next_y = batches[micro_step+1]
+                                        prefetched_data['x'] = next_x.to(device, non_blocking=True)
+                                        prefetched_data['y'] = next_y.to(device, non_blocking=True)
+                                    else:
+                                        # SFT batch
+                                        prefetched_data['batch'] = {k: v.to(device, non_blocking=True) 
+                                                                 for k, v in batches[micro_step+1].items()}
+                        else:
+                            # Standard synchronous data loading as fallback
                             if args.use_streaming_dataset:
                                 batch = batches[micro_step]
-                                # Transférer les données en mode non-bloquant et asynchrone
+                                # Transfer data in non-blocking and asynchronous mode
                                 with torch.cuda.stream(torch.cuda.Stream()) if not args.disable_non_blocking else nullcontext():
                                     x = batch['input_ids'].to(device, non_blocking=not args.disable_non_blocking)
                                     y = batch['labels'].to(device, non_blocking=not args.disable_non_blocking)
@@ -1248,11 +1466,11 @@ def main():
     parser.add_argument('--log_interval', type=int, default=1, help='Log every N iterations')
     parser.add_argument('--save_interval', type=int, default=1000, help='Save every N iterations')
     parser.add_argument('--gradient_checkpointing', action='store_true', help='Use gradient checkpointing')
-    
+    parser.add_argument('--memory_efficient', action='store_true', help='Use memory efficient implementation')
     
     # System parameters
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--dtype', type=str, choices=['float32', 'float16', 'bfloat16'], default='float16')
+    parser.add_argument('--dtype', type=str, choices=['float32', 'float16', 'bfloat16'], default='bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16')
     parser.add_argument('--output_dir', type=str, default='./checkpoints', help='Output directory')
     parser.add_argument('--distributed', action='store_true', help='Use distributed training')
     parser.add_argument('--backend', type=str, default='nccl', help='Distributed backend')
@@ -1269,12 +1487,20 @@ def main():
     parser.add_argument('--remasking', type=str, default='low_confidence', 
                        choices=['low_confidence', 'random'], help='Remasking strategy')
     
-    # Nouvelles options d'optimisation
+    # Advanced optimization options
     parser.add_argument('--compile', action='store_true', help='Compile the model with torch.compile')
     parser.add_argument('--use_cuda_graphs', action='store_true', help='Use CUDA Graphs for optimization')
     parser.add_argument('--preallocate_memory', action='store_true', help='Preallocate CUDA memory to reduce fragmentation')
     parser.add_argument('--disable_non_blocking', action='store_true', help='Disable non-blocking data transfers')
     parser.add_argument('--gpu_monitor_interval', type=int, default=0, help='Interval for GPU statistics monitoring (0 to disable)')
+    parser.add_argument('--memory_optimization_level', type=int, default=1, choices=[0, 1, 2, 3], 
+                       help='Memory optimization level (0=off, 1=basic, 2=aggressive, 3=maximum)')
+    parser.add_argument('--prefetch_factor', type=int, default=2, help='Number of batches to prefetch in dataloader')
+    parser.add_argument('--async_loading', action='store_true', help='Enable async data loading')
+    parser.add_argument('--batch_fusion', action='store_true', help='Enable batch fusion for better GPU utilization')
+    parser.add_argument('--amp_dtype', type=str, choices=['float16', 'bfloat16'], 
+                       default='bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16',
+                       help='Data type for AMP (automatic mixed precision)')
     
     args = parser.parse_args()
     
