@@ -85,7 +85,7 @@ def generate_samples(model, tokenizer, device):
         
         try:
             # Générer le texte avec gestion des types
-            with torch.no_grad(), torch.cuda.amp.autocast(enabled=True, dtype=model_dtype):
+            with torch.no_grad(), torch.amp.autocast(enabled=True, device_type='cuda', dtype=model_dtype):
                 output_ids = model.generate(
                     input_ids,
                     max_new_tokens=MAX_NEW_TOKENS,

@@ -82,6 +82,7 @@ class StreamingDataset(IterableDataset):
         self.token_cache = TokenCache()
         self.current_iter = 0
         self.is_eval_mode = False
+        self.cache_exhausted = False
         
         # Précharger le premier cache au démarrage
         if split == 'train':
@@ -139,6 +140,21 @@ class StreamingDataset(IterableDataset):
         
         # Si on arrive à la fin du cache actuel
         if self.current_iter % cache_size == 0:
+            if not self.is_eval_mode:
+                # Reset cache and dataset when cache is exhausted
+                if self.cache_exhausted:
+                    print(f"Resetting dataset at iteration {self.current_iter}")
+                    self.dataset = load_dataset("HuggingFaceFW/fineweb-edu", 
+                                             name=self.dataset_config,
+                                             split=self.split,
+                                             streaming=True)
+                    self.dataset = self.dataset.shuffle(buffer_size=10_000)
+                    self.dataset_iterator = iter(self.dataset)
+                    self.token_buffer = []
+                    self.cache_exhausted = False
+                    # Prepare new cache
+                    self.prepare_initial_cache()
+                
             # Attendre que le prochain cache soit prêt
             self.token_cache.cache_ready.wait()
             self.token_cache.cache_ready.clear()
@@ -150,7 +166,9 @@ class StreamingDataset(IterableDataset):
             if not self.is_eval_mode:
                 next_start_iter = self.current_iter + cache_size
                 self.token_cache.preload_next_cache(self.split, next_start_iter)
-        
+                if self.token_cache.load_cache(self.split, next_start_iter) is None:
+                    self.cache_exhausted = True
+
         # Utiliser les tokens du cache
         cache_index = self.current_iter % cache_size
         tokens = self.current_cache[cache_index]

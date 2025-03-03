@@ -5,19 +5,17 @@ and also in a larger training run with distributed data parallel (ddp).
 
 import os
 import time
-import math
 import pickle
 from contextlib import nullcontext
 import threading
 from queue import Queue
-import gc
 import glob
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group, all_reduce, ReduceOp, barrier as dist_barrier
+from torch.distributed import destroy_process_group, dist_barrier
 from torch.serialization import add_safe_globals
 
 from transformers import AutoTokenizer
@@ -26,13 +24,18 @@ import pickle
 from model import GPTConfig, GPT, EncoderDecoderGPT
 from data.openwebtext.data_loader import StreamingDataset
 from run_train import get_datasets
+from train_utils import (
+    get_gpu_count, setup_distributed, reduce_metrics, calculate_perplexity,
+    get_lr, cleanup_old_checkpoints, cleanup_memory, ensure_model_dtype,
+    print_memory_stats, setup_cuda_optimizations, save_checkpoint,
+    load_checkpoint, find_latest_checkpoint, get_context_manager,
+    generate_text, evaluate_model, estimate_loss
+)
 
 from rich.console import Console
 console = Console()
 
 access_token=os.getenv('HF_TOKEN')
-
-
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -90,14 +93,7 @@ if torch.cuda.is_available():
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
     
     # Activer la gestion de mémoire optimisée
-    torch.cuda.empty_cache()
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    
-    # Activer la mémoire partagée
-    if hasattr(torch.cuda, 'memory_stats'):
-        torch.cuda.memory_stats()
-    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))  # Set device based on LOCAL_RANK
+    setup_cuda_optimizations()
 else:
     device = 'cpu'
     batch_size = 2
@@ -114,7 +110,6 @@ else:
     decoder_n_head = 1
     decoder_n_embd = 2
     decoder_ratio_kv = 1
-
 
 # adamw optimizer
 learning_rate = 1e-3 # ajusté pour AdEMAMix
@@ -134,7 +129,6 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 
-
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -145,27 +139,7 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
-    # Optimisations NCCL
-    os.environ["NCCL_DEBUG"] = "INFO"
-    os.environ["NCCL_IB_DISABLE"] = "0"
-    os.environ["NCCL_NET_GDR_LEVEL"] = "2"
-    os.environ["NCCL_P2P_DISABLE"] = "0"
-    os.environ["NCCL_MIN_NCHANNELS"] = "4"
-    os.environ["NCCL_SOCKET_IFNAME"] = "^docker0,lo"
-    os.environ["NCCL_BUFFSIZE"] = "2097152"
-    
-    # Réduire la fréquence de synchronisation
-    os.environ["NCCL_ALGO"] = "Ring"
-    os.environ["NCCL_PROTO"] = "Simple"
-    
-    init_process_group(backend=backend)
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
-    
-
+    ddp_rank, ddp_local_rank, ddp_world_size, device = setup_distributed(backend=backend)
     master_process = ddp_rank == 0
     seed_offset = ddp_rank
 else:
@@ -186,17 +160,15 @@ device_type = 'cuda' if 'cuda' in device else 'cpu'
 # dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
 dtype = 'float16'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+ctx = get_context_manager(device_type, dtype)
 
 print(f"Device type: {device_type}")
 print(f"PT dtype: {ptdtype}")
-
 
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True, access_token=access_token)
 tokenizer.pad_token = tokenizer.eos_token
 
 decode = lambda tokens: tokenizer.decode(tokens, skip_special_tokens=True)
-
 
 # init these up here, can override if init_from='resume'
 iter_num = 1
@@ -243,71 +215,27 @@ add_safe_globals([GPTConfig])
 
 if init_from == 'resume':
     print(f"Attempting to resume training from {out_dir}")
-    checkpoints = glob.glob(os.path.join(out_dir, 'ckpt_iter_*.pt'))
-    if not checkpoints:
+    ckpt_path = find_latest_checkpoint(out_dir)
+    if not ckpt_path:
         print("No checkpoints found, initializing from scratch instead")
         init_from = 'scratch'
     else:
-        #Extraire les numéros d'itération et trier
-        def extract_iter_num(filename):
-            try:
-                return int(filename.split('iter_')[1].split('_loss')[0])
-            except:
-                return 0
-        
-        # Prendre le dernier checkpoint
-        checkpoints.sort(key=extract_iter_num)
-        ckpt_path = checkpoints[-1]
         print(f"Loading checkpoint: {ckpt_path}")
-        # Charger avec weights_only=True pour éviter de charger les buffers inutiles
-        checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=True)
         model = EncoderDecoderGPT(encoder_config, decoder_config)
+        model, optimizer, iter_num, best_val_loss, _, _ = load_checkpoint(
+            ckpt_path, model, map_location='cpu'
+        )
+        if optimizer is None:
+            optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
         
-        # Nettoyer le state dict avant chargement
-        state_dict = checkpoint['model']
-        unwanted_prefix = '_orig_mod.'
-        cleaned_state_dict = {}
-        
-        for k, v in state_dict.items():
-            if k.startswith(unwanted_prefix):
-                cleaned_state_dict[k[len(unwanted_prefix):]] = v
-            else:
-                cleaned_state_dict[k] = v
-        
-        # Charger le state dict nettoyé
-        model.load_state_dict(cleaned_state_dict, strict=False)
-        optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-        
-        # Libérer la mémoire explicitement
-        del checkpoint['model']
-        del state_dict
-        del cleaned_state_dict
-        torch.cuda.empty_cache()
-        
-        # Charger l'optimiseur séparément et nettoyer ses états
-        if 'optimizer' in checkpoint:
-            optimizer_state = checkpoint['optimizer']
-            # Nettoyer les états de l'optimiseur qui pourraient être en float32
-            for state in optimizer_state['state'].values():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.to(dtype=ptdtype)
-            optimizer.load_state_dict(optimizer_state)
-            del optimizer_state
-            torch.cuda.empty_cache()
-        
-        iter_num = checkpoint['iter_num'] + 1
-        best_val_loss = checkpoint['best_val_loss']
-        
-        # Libérer le reste de la mémoire
-        del checkpoint
-        torch.cuda.empty_cache()
+        # Ensure model parameters are in the correct dtype
+        model = ensure_model_dtype(model, ptdtype)
+        cleanup_memory()
 
 if init_from == 'scratch':
     print("Initializing a new encoder-decoder model from scratch")
     model = EncoderDecoderGPT(encoder_config, decoder_config)
     optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-
 
 # Juste avant le model.to(device):
 if compile:
@@ -332,38 +260,6 @@ if compile:
         model.set_gradient_checkpointing(True)
 
 model.to(device)
-
-# Optimisations CUDA
-if device_type == 'cuda':
-    
-    default_stream = torch.cuda.current_stream()
-    copy_stream = torch.cuda.Stream()
-    
-    torch.multiprocessing.set_sharing_strategy('file_system')
-    
-    device_index = 0 if isinstance(device, str) else device
-    if isinstance(device, str) and ':' in device:
-        device_index = int(device.split(':')[1])
-    torch.cuda.set_device(device_index)
-    torch.cuda.empty_cache()
-    
-    pin_memory = True
-    
-    # Désactiver le garbage collector automatique
-    gc.disable()
-    
-    # Optimisations mémoire supplémentaires
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-    
-    # Configurer la pagination de la mémoire
-    torch.cuda.set_per_process_memory_fraction(0.95)
-    
-    # Désactiver le gradient synchrone pour DDP
-    os.environ["NCCL_BLOCKING_WAIT"] = "0"
-    os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
 
 # Configurer le gradient scaler
 scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
@@ -399,73 +295,6 @@ print(f"vocab_size: {len(train_dataset.tokenizer)}")
 vocab_size = len(train_dataset.tokenizer)
 print(f"vocab_size: {vocab_size}")
 
-# Ajouter cette fonction d'aide pour l'agrégation des métriques
-def reduce_metrics(metrics, world_size):
-    """
-    Réduit les métriques à travers tous les processus.
-    Args:
-        metrics: Tensor ou float à réduire
-        world_size: Nombre total de processus
-    """
-    if not isinstance(metrics, torch.Tensor):
-        metrics = torch.tensor(metrics, device='cuda')
-    all_reduce(metrics, op=ReduceOp.SUM)
-    return metrics.item() / world_size
-
-# Après la fonction reduce_metrics, ajoutons une fonction pour calculer la perplexité
-def calculate_perplexity(loss):
-    """
-    Calcule la perplexité à partir de la loss
-    Args:
-        loss: La valeur de la loss (cross-entropy)
-    Returns:
-        float: La valeur de la perplexité
-    """
-    return torch.exp(torch.tensor(loss)).item()
-
-# Modifier la fonction estimate_loss pour inclure la perplexité
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split, dataset in [('train', train_dataset), ('val', val_dataset)]:
-        losses = torch.zeros(eval_iters, device=device)
-        valid_iters = 0
-        for k in range(eval_iters):
-            encoder_input, decoder_input, target = next(iter(dataset))
-            with ctx:
-                logits, loss = model(encoder_input, decoder_input, target)
-                if loss is not None:
-                    losses[valid_iters] = loss.item()
-                    valid_iters += 1
-        
-        # Moyenne sur les itérations valides
-        if valid_iters > 0:
-            mean_loss = losses[:valid_iters].mean()
-            # Réduire la perte à travers tous les processus si en mode DDP
-            if ddp:
-                mean_loss = reduce_metrics(mean_loss, ddp_world_size)
-            out[split] = mean_loss
-            # Calculer et stocker la perplexité
-            out[f'{split}_ppl'] = calculate_perplexity(mean_loss)
-        else:
-            out[split] = float('inf')
-            out[f'{split}_ppl'] = float('inf')
-            
-    model.train()
-    return out
-
-# learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
-    if it < warmup_iters:
-        return learning_rate * it / warmup_iters
-    if it > lr_decay_iters:
-        return min_lr
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (learning_rate - min_lr)
-
 # logging
 if wandb_log and master_process:
     import wandb
@@ -477,18 +306,17 @@ print("Initializing training loop...")
 generation_queue = Queue()
 
 # Fonction de génération qui tourne dans un thread séparé
-def generation_worker(model, device):
+def generation_worker():
     while True:
         if not generation_queue.empty():
             encoder_input = generation_queue.get()
             with torch.no_grad():
-                generated = generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8)
+                generated = generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8, tokenizer=tokenizer)
                 print(f"\nGenerated text: {generated}\n")
 
 # Démarrer le thread de génération avant la boucle d'entraînement
 generation_thread = threading.Thread(
     target=generation_worker, 
-    args=(model, device),
     daemon=True
 )
 # generation_thread.start()
@@ -503,75 +331,28 @@ running_mfu = -1.0
 
 print("Starting training...")
 
-
 train_start_time = time.time()
 total_tokens = 0
 t0 = time.time()
 
-def cleanup_old_checkpoints(out_dir, keep_num=3):
-    """Garde uniquement les 'keep_num' checkpoints les plus récents."""
-    checkpoints = glob.glob(os.path.join(out_dir, 'ckpt_iter_*.pt'))
-    if len(checkpoints) <= keep_num:
-        return
-        
-    # Trier les checkpoints par numéro d'itération
-    def extract_iter_num(filename):
-        try:
-            return int(filename.split('iter_')[1].split('_loss')[0])
-        except:
-            return 0
-            
-    checkpoints.sort(key=extract_iter_num)
-    
-    # Supprimer les checkpoints les plus anciens
-    for ckpt in checkpoints[:-keep_num]:
-        try:
-            os.remove(ckpt)
-            print(f"Removed old checkpoint: {ckpt}")
-        except Exception as e:
-            print(f"Error removing checkpoint {ckpt}: {e}")
-
-def cleanup_memory():
-    """Nettoie la mémoire GPU"""
-    if device_type == 'cuda':
-        torch.cuda.empty_cache()
-        if gc.isenabled():
-            gc.collect()
-
-# Après avoir chargé le modèle, forcer le bon dtype
-def ensure_model_dtype(model, dtype):
-    """S'assure que le modèle est dans le bon dtype"""
-    for param in model.parameters():
-        param.data = param.data.to(dtype=dtype)
-    return model
-
-# Utiliser après le chargement du modèle
-if init_from == 'resume':
-    model = ensure_model_dtype(model, ptdtype)
-
-def print_memory_stats(prefix=""):
-    """Affiche les statistiques de mémoire GPU"""
-    if device_type == 'cuda':
-        print(f"{prefix} Memory stats:")
-        print(f"Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-        print(f"Reserved: {torch.cuda.memory_reserved()/1e9:.2f}GB")
-        print(f"Max allocated: {torch.cuda.max_memory_allocated()/1e9:.2f}GB")
-        
 print_memory_stats("Initial")
 
 while True:
     # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
+    lr = get_lr(iter_num, warmup_iters, lr_decay_iters, learning_rate, min_lr) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process and iter_num > 0:
         print("Validation")
-        losses = estimate_loss()
+        # Use utility function for loss estimation
+        losses = estimate_loss(model, train_dataset, val_dataset, eval_iters, device, ctx, ddp, ddp_world_size)
+        
         print(f"step {iter_num}: train loss {losses['train']:.4f}, train ppl {losses['train_ppl']:.2f}, "
               f"val loss {losses['val']:.4f}, val ppl {losses['val_ppl']:.2f}")
         print(f"Total tokens processed: {train_dataset.get_total_tokens():,}")
         print_memory_stats("After validation")
+        
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -583,33 +364,53 @@ while True:
                 "mfu": running_mfu*100,
                 "total_tokens": train_dataset.get_total_tokens()
             })
+            
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
-                # Sauvegarder sur CPU pour éviter la duplication en mémoire GPU
-                checkpoint = {
-                    'model': {k: v.cpu() for k, v in raw_model.state_dict().items()},
-                    'optimizer': {
-                        'state': {k: {sk: sv.cpu() if isinstance(sv, torch.Tensor) else sv 
-                                     for sk, sv in v.items()}
-                                     for k, v in optimizer.state_dict()['state'].items()},
-                        'param_groups': optimizer.state_dict()['param_groups']
-                    },
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                
-                checkpoint_path = os.path.join(
-                    out_dir, 
-                    f'ckpt_iter_{iter_num}_loss_{losses["val"]:.4f}.pt'
+                checkpoint_path = save_checkpoint(
+                    raw_model, 
+                    optimizer, 
+                    model_args, 
+                    iter_num, 
+                    best_val_loss, 
+                    config,
+                    out_dir,
+                    losses['val']
                 )
-                
-                # Sauvegarder avec torch.save
-                torch.save(checkpoint, checkpoint_path)
-                del checkpoint
                 cleanup_memory()
+                cleanup_old_checkpoints(out_dir)
+                
+        # Generate examples for evaluation
+        if iter_num % generate_interval == 0 and master_process:
+            print("\nGenerating examples:")
+            example_results = evaluate_model(
+                raw_model, 
+                val_dataset, 
+                ctx, 
+                num_examples=2, 
+                max_tokens=50, 
+                temperature=0.8,
+                tokenizer=tokenizer
+            )
+            
+            for i, result in enumerate(example_results):
+                print(f"Example {i+1}:")
+                print(f"Input: {result['input']}")
+                print(f"Generated: {result['generated']}")
+                print("-" * 50)
+                
+            if wandb_log:
+                wandb_examples = []
+                for result in example_results:
+                    wandb_examples.append([result['input'], result['generated']])
+                wandb.log({
+                    "examples": wandb.Table(
+                        columns=["Input", "Generated"],
+                        data=wandb_examples
+                    )
+                })
+                
     if iter_num == 0 and eval_only:
         break
 
@@ -761,10 +562,6 @@ while True:
     local_iter_num += 1
     encoder_input, decoder_input, target = encoder_input_next, decoder_input_next, target_next
     
-    # if iter_num % 100 == 0:
-    #     generated = generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8)
-    #     print(f"\nGenerated text Q: {generated}\n")
-
     # termination conditions
     if iter_num > max_iters:
         break
@@ -776,8 +573,7 @@ while True:
             torch.cuda.synchronize()
             
         # Collecter manuellement le garbage
-        if gc.isenabled():
-            gc.collect()
+        cleanup_memory()
 
     if iter_num % 100 == 0:  # Pour profiler périodiquement
         torch.cuda.synchronize()
@@ -794,11 +590,7 @@ if ddp:
     destroy_process_group()
 
 # Nettoyage final CUDA
-if device_type == 'cuda':
-    torch.cuda.empty_cache()
-    if hasattr(torch.cuda, 'memory_stats'):
-        torch.cuda.memory_stats(device=device)
-    torch.cuda.set_stream(torch.cuda.Stream())
+cleanup_memory()
 
 # Après l'initialisation des datasets
 if master_process:

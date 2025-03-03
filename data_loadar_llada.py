@@ -139,10 +139,26 @@ class TokenBufferManager:
                 # Signal end of data when all workers are done
                 self.stop_event.set()
         
-        # Start prefetch thread
+        # Start prefetch worker threads
         self.stop_event.clear()
-        self.prefetch_thread = threading.Thread(target=prefetch_worker, daemon=True)
-        self.prefetch_thread.start()
+        
+        # Start worker threads
+        for i in range(num_workers):
+            worker = threading.Thread(
+                target=fetch_worker,
+                args=(i,),
+                daemon=True
+            )
+            worker.start()
+            self.workers.append(worker)
+            
+        # Start GPU transfer thread
+        gpu_thread = threading.Thread(
+            target=gpu_transfer_worker,
+            daemon=True
+        )
+        gpu_thread.start()
+        self.prefetch_thread = gpu_thread
     
     def get_batch(self, timeout: float = 5.0) -> Dict[str, torch.Tensor]:
         """Get a batch from the buffer with high performance"""

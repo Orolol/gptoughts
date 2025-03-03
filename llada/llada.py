@@ -334,85 +334,87 @@ class LLaDAExpertGroup(nn.Module):
             shared_output = self.shared_mlp(x)
             
             if self.parallel_adapters:
-                # Process experts in batches for better tensor core utilization
-                if expert_weights.dim() == 2:
-                    expert_weights = expert_weights.view(batch_size, seq_len, -1)
-                
-                # Ensure expert_weights has correct shape
-                if expert_weights.shape[2] < self.num_experts:
-                    padding = torch.zeros((batch_size, seq_len, self.num_experts - expert_weights.shape[2]), 
-                                         device=expert_weights.device)
-                    expert_weights = torch.cat([expert_weights, padding], dim=2)
-                
-                # Create output tensor with optimal memory layout
-                combined_output = torch.zeros_like(shared_output, memory_format=torch.contiguous_format)
-                
-                # Process experts in groups to maximize GPU utilization
-                group_size = 2  # Process experts in pairs for better parallelism
-                for group_idx in range(0, self.num_experts, group_size):
-                    group_end = min(group_idx + group_size, self.num_experts)
-                    group_expert_ids = list(range(group_idx, group_end))
+                try:
+                    # Process experts in batches for better tensor core utilization
+                    if expert_weights.dim() == 2:
+                        expert_weights = expert_weights.view(batch_size, seq_len, -1)
                     
-                    # Create combined mask for this group of experts
-                    group_mask = None
-                    for i in group_expert_ids:
-                        if i >= expert_weights.shape[2]:
-                            continue
+                    # Ensure expert_weights has correct shape
+                    if expert_weights.shape[2] < self.num_experts:
+                        padding = torch.zeros((batch_size, seq_len, self.num_experts - expert_weights.shape[2]), 
+                                             device=expert_weights.device)
+                        expert_weights = torch.cat([expert_weights, padding], dim=2)
+                    
+                    # Create output tensor with optimal memory layout
+                    combined_output = torch.zeros_like(shared_output, memory_format=torch.contiguous_format)
+                    
+                    # Process experts in groups to maximize GPU utilization
+                    group_size = 2  # Process experts in pairs for better parallelism
+                    for group_idx in range(0, self.num_experts, group_size):
+                        group_end = min(group_idx + group_size, self.num_experts)
+                        group_expert_ids = list(range(group_idx, group_end))
                         
-                        expert_mask = expert_weights[:, :, i] > 0
-                        if group_mask is None:
-                            group_mask = expert_mask
-                        else:
-                            group_mask = group_mask | expert_mask
-                    
-                    if group_mask is None or not group_mask.any():
-                        continue
-                    
-                    # Process all tokens for this expert group together
-                    group_x = x[group_mask]
-                    
-                    if group_x.numel() == 0:
-                        continue
-                    
-                    # Pre-compute the shared hidden representations for all tokens in this group
-                    group_hidden = self.shared_mlp.pre_adapt(group_x)
-                    
-                    # Process each expert in the group
-                    for i in group_expert_ids:
-                        if i >= expert_weights.shape[2]:
-                            continue
+                        # Create combined mask for this group of experts
+                        group_mask = None
+                        for i in group_expert_ids:
+                            if i >= expert_weights.shape[2]:
+                                continue
                             
-                        expert_mask = expert_weights[:, :, i] > 0
-                        if not expert_mask.any():
+                            expert_mask = expert_weights[:, :, i] > 0
+                            if group_mask is None:
+                                group_mask = expert_mask
+                            else:
+                                group_mask = group_mask | expert_mask
+                        
+                        if group_mask is None or not group_mask.any():
                             continue
                         
-                        # Find indices in the group that belong to this expert
-                        expert_indices = torch.nonzero(expert_mask[group_mask]).squeeze(-1)
-                        if expert_indices.numel() == 0:
+                        # Process all tokens for this expert group together
+                        group_x = x[group_mask]
+                        
+                        if group_x.numel() == 0:
                             continue
                         
-                        # Get only the tokens for this expert
-                        expert_hidden = group_hidden[expert_indices]
+                        # Pre-compute the shared hidden representations for all tokens in this group
+                        group_hidden = self.shared_mlp.pre_adapt(group_x)
                         
-                        # Process through expert
-                        adapted = self.expert_adapters[i](expert_hidden)
-                        expert_proj_output = self.expert_proj(adapted)
-                        expert_output = self.output_proj(expert_proj_output)
+                        # Process each expert in the group
+                        for i in group_expert_ids:
+                            if i >= expert_weights.shape[2]:
+                                continue
+                                
+                            expert_mask = expert_weights[:, :, i] > 0
+                            if not expert_mask.any():
+                                continue
+                            
+                            # Find indices in the group that belong to this expert
+                            expert_indices = torch.nonzero(expert_mask[group_mask]).squeeze(-1)
+                            if expert_indices.numel() == 0:
+                                continue
+                            
+                            # Get only the tokens for this expert
+                            expert_hidden = group_hidden[expert_indices]
+                            
+                            # Process through expert
+                            adapted = self.expert_adapters[i](expert_hidden)
+                            expert_proj_output = self.expert_proj(adapted)
+                            expert_output = self.output_proj(expert_proj_output)
+                            
+                            # Copy results back to the combined output
+                            combined_output[expert_mask] = expert_output
                         
-                        # Copy results back to the combined output
-                        combined_output[expert_mask] = expert_output
+                        # Clean up memory after each group
+                        del group_hidden, group_x
                     
-                    # Clean up memory after each group
-                    del group_hidden, group_x
+                    # Scale the expert contribution and add to shared output
+                    return shared_output + 0.1 * combined_output
                 except Exception as e:
-                    print(f"Warning: Error processing expert {i}: {e}")
-                    # Continue with next expert on error
-                    continue
+                    print(f"Warning: Error processing expert group: {e}")
+                    # Return shared output on error
+                    return shared_output
             
-            # Scale the expert contribution and add to shared output
-            return shared_output + 0.1 * combined_output
-        
-        return shared_output
+            # If we didn't use parallel adapters, just return shared output
+            return shared_output
 
 class LLaDAAttention(nn.Module):
     """

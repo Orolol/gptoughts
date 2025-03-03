@@ -143,7 +143,7 @@ class SharedExpertMLP(nn.Module):
         adapt_weights = F.silu(adapt_weights)
         
         # Apply adaptation avec gradient scaling
-        with torch.amp.autocast(enabled=False, device_type='cuda'):
+        with torch.amp.autocast(enabled=True, device_type='cuda'):
             adapt = torch.bmm(adapt_weights.float(), adapt_in.float())
         adapt = self.adapt_proj(adapt.to(x.dtype))
         
@@ -469,9 +469,9 @@ class MoEEncoderDecoderGPT(nn.Module):
         """Set the timing stats object for detailed profiling"""
         self.timing_stats = timing_stats
 
-    def forward(self, encoder_idx: torch.Tensor, decoder_idx: torch.Tensor, 
+    def forward(self, encoder_inputs: torch.Tensor, decoder_inputs: torch.Tensor, 
                 targets: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-        device = encoder_idx.device
+        device = encoder_inputs.device
         total_router_loss = torch.tensor(0.0, device=device)
         
         track = self.timing_stats.track if self.timing_stats is not None else nullcontext
@@ -480,10 +480,10 @@ class MoEEncoderDecoderGPT(nn.Module):
             with track("encoder"):
                 # Encoder
                 with track("embeddings"):
-                    encoder_pos = torch.arange(0, encoder_idx.size(1), device=device)
-                    encoder_emb = self.shared_embedding(encoder_idx)
+                    encoder_pos = torch.arange(0, encoder_inputs.size(1), device=device)
+                    encoder_emb = self.shared_embedding(encoder_inputs)
                     encoder_pos_emb = self.shared_pos_embedding(encoder_pos)
-                    encoder_pos_emb = encoder_pos_emb.unsqueeze(0).expand(encoder_idx.size(0), -1, -1)
+                    encoder_pos_emb = encoder_pos_emb.unsqueeze(0).expand(encoder_inputs.size(0), -1, -1)
                     x = self.encoder.drop(encoder_emb + encoder_pos_emb)
                 
                 # Process through layers
@@ -506,10 +506,10 @@ class MoEEncoderDecoderGPT(nn.Module):
             with track("decoder"):
                 # Embeddings
                 with track("embeddings"):
-                    decoder_pos = torch.arange(0, decoder_idx.size(1), device=device)
-                    decoder_emb = self.shared_embedding(decoder_idx)
+                    decoder_pos = torch.arange(0, decoder_inputs.size(1), device=device)
+                    decoder_emb = self.shared_embedding(decoder_inputs)
                     decoder_pos_emb = self.shared_pos_embedding(decoder_pos)
-                    decoder_pos_emb = decoder_pos_emb.unsqueeze(0).expand(decoder_idx.size(0), -1, -1)
+                    decoder_pos_emb = decoder_pos_emb.unsqueeze(0).expand(decoder_inputs.size(0), -1, -1)
                     x = self.decoder.drop(decoder_emb + decoder_pos_emb)
                 
                 # Process through layers
