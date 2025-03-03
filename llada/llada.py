@@ -74,8 +74,13 @@ class LLaDARouter(nn.Module):
         # Compute router logits with memory optimization
         with torch.amp.autocast(enabled=True, device_type='cuda'):
             try:
-                # Compute router logits
-                router_logits = self.router(x.reshape(-1, self.input_dim))
+                # Compute router logits using the factorized design
+                # Project input to lower dimension
+                projected = self.router_projection(x.reshape(-1, self.input_dim))
+                # Apply normalization
+                normalized = self.router_norm(projected)
+                # Project to expert dimension
+                router_logits = self.router_gate(normalized)
                 
                 # Scale logits by temperature
                 router_logits = router_logits / (self.temperature.abs() + 1e-6)
