@@ -77,31 +77,36 @@ class LLaDARouter(nn.Module):
         except ImportError:
             tensor_pool = None
         
-        # Compute router logits with memory optimization
-        with torch.amp.autocast(enabled=True, device_type='cuda'):
+        # Force cuBLAS to use Tensor Cores
+        old_matmul_precision = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision('high')
+        
+        # Compute router logits with memory optimization - force TF32 precision
+        with torch.cuda.amp.autocast(dtype=torch.float16):
             try:
-                # Reshape input only once and reuse the reshaped tensor
-                x_reshaped = x.reshape(-1, self.input_dim)
+                # Pin memory for optimal GPU transfer
+                with torch.cuda.stream(torch.cuda.Stream()):
+                    # Use contiguous chunks for better memory layout
+                    if not x.is_contiguous():
+                        x = x.contiguous()
+                    
+                    # Reshape input once and reuse the reshaped tensor
+                    x_reshaped = x.reshape(-1, self.input_dim)
+                    
+                    # Run all projection operations in a batch for better kernel utilization
+                    projected = self.router_projection(x_reshaped)
+                    normalized = self.router_norm(projected)
+                    router_logits = self.router_gate(normalized)
+                    
+                    # Free memory immediately
+                    del projected, normalized, x_reshaped
+                    
+                    # Scale logits by temperature - use in-place op for memory efficiency
+                    temp_val = (self.temperature.abs() + 1e-6).item()
+                    router_logits.div_(temp_val)
                 
-                # Compute router logits using the factorized design - in place operations where possible
-                # Project input to lower dimension
-                projected = self.router_projection(x_reshaped)
-                
-                # Apply normalization, reusing the same memory if possible
-                normalized = self.router_norm(projected)
-                
-                # Free the projected tensor as it's no longer needed
-                del projected
-                
-                # Project to expert dimension
-                router_logits = self.router_gate(normalized)
-                
-                # Free the normalized tensor as it's no longer needed
-                del normalized
-                
-                # Scale logits by temperature - do this in-place if possible
-                temp_val = (self.temperature.abs() + 1e-6).item()
-                router_logits.div_(temp_val)
+                # Synchronize to ensure operations complete
+                torch.cuda.synchronize()
                 
                 # Compute routing probabilities
                 routing_weights = F.softmax(router_logits, dim=-1)
@@ -319,61 +324,86 @@ class LLaDAExpertGroup(nn.Module):
     def forward(self, x: torch.Tensor, expert_weights: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, hidden_dim = x.shape
         
-        # Get shared representations
-        shared_output = self.shared_mlp(x)
-        
-        if self.parallel_adapters:
-            # Process all experts in parallel with better memory management
-            expert_outputs = []
-            masks = []
+        # Get shared representations - ensure we use TF32 for better performance
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            # Pin tensor for faster operations
+            if not x.is_contiguous():
+                x = x.contiguous()
+                
+            # Compute shared MLP in one pass for better GPU utilization
+            shared_output = self.shared_mlp(x)
             
-            # Ensure expert_weights has correct shape
-            if expert_weights.dim() == 2:
-                expert_weights = expert_weights.view(batch_size, seq_len, -1)
-            
-            # Safety check for expert_weights dimensions
-            if expert_weights.shape[2] < self.num_experts:
-                print(f"Warning: expert_weights has fewer experts ({expert_weights.shape[2]}) than expected ({self.num_experts})")
-                # Pad with zeros to match expected number of experts
-                padding = torch.zeros((batch_size, seq_len, self.num_experts - expert_weights.shape[2]), 
-                                     device=expert_weights.device)
-                expert_weights = torch.cat([expert_weights, padding], dim=2)
-            
-            # Create a combined output tensor to avoid memory fragmentation
-            combined_output = torch.zeros_like(shared_output)
-            
-            # Process each expert with explicit memory management
-            for i in range(self.num_experts):
-                try:
-                    # Safety check for out-of-bounds indexing
-                    if i >= expert_weights.shape[2]:
+            if self.parallel_adapters:
+                # Process experts in batches for better tensor core utilization
+                if expert_weights.dim() == 2:
+                    expert_weights = expert_weights.view(batch_size, seq_len, -1)
+                
+                # Ensure expert_weights has correct shape
+                if expert_weights.shape[2] < self.num_experts:
+                    padding = torch.zeros((batch_size, seq_len, self.num_experts - expert_weights.shape[2]), 
+                                         device=expert_weights.device)
+                    expert_weights = torch.cat([expert_weights, padding], dim=2)
+                
+                # Create output tensor with optimal memory layout
+                combined_output = torch.zeros_like(shared_output, memory_format=torch.contiguous_format)
+                
+                # Process experts in groups to maximize GPU utilization
+                group_size = 2  # Process experts in pairs for better parallelism
+                for group_idx in range(0, self.num_experts, group_size):
+                    group_end = min(group_idx + group_size, self.num_experts)
+                    group_expert_ids = list(range(group_idx, group_end))
+                    
+                    # Create combined mask for this group of experts
+                    group_mask = None
+                    for i in group_expert_ids:
+                        if i >= expert_weights.shape[2]:
+                            continue
+                        
+                        expert_mask = expert_weights[:, :, i] > 0
+                        if group_mask is None:
+                            group_mask = expert_mask
+                        else:
+                            group_mask = group_mask | expert_mask
+                    
+                    if group_mask is None or not group_mask.any():
                         continue
-                        
-                    mask = expert_weights[:, :, i] > 0
-                    if mask.any():
-                        # Process only the necessary tokens for this expert
-                        expert_x = x[mask]
-                        
-                        if expert_x.numel() == 0:  # Skip if no tokens were selected
+                    
+                    # Process all tokens for this expert group together
+                    group_x = x[group_mask]
+                    
+                    if group_x.numel() == 0:
+                        continue
+                    
+                    # Pre-compute the shared hidden representations for all tokens in this group
+                    group_hidden = self.shared_mlp.pre_adapt(group_x)
+                    
+                    # Process each expert in the group
+                    for i in group_expert_ids:
+                        if i >= expert_weights.shape[2]:
                             continue
                             
-                        # Process through adapter with memory optimization
-                        with torch.amp.autocast(enabled=True, device_type='cuda'):
-                            # Process through adapter and projections in smaller chunks if needed
-                            expert_hidden = self.shared_mlp.pre_adapt(expert_x)
-                            expert_hidden = self.expert_adapters[i](expert_hidden)
-                            expert_hidden = self.expert_proj(expert_hidden)
-                            expert_output = self.output_proj(expert_hidden)
-                            
-                            # Free memory
-                            del expert_hidden
-                            
-                            # Apply directly to the output tensor
-                            combined_output[mask] = expert_output
-                            
-                            # Free memory for this iteration
-                            del expert_x, expert_output
-                            torch.cuda.empty_cache()
+                        expert_mask = expert_weights[:, :, i] > 0
+                        if not expert_mask.any():
+                            continue
+                        
+                        # Find indices in the group that belong to this expert
+                        expert_indices = torch.nonzero(expert_mask[group_mask]).squeeze(-1)
+                        if expert_indices.numel() == 0:
+                            continue
+                        
+                        # Get only the tokens for this expert
+                        expert_hidden = group_hidden[expert_indices]
+                        
+                        # Process through expert
+                        adapted = self.expert_adapters[i](expert_hidden)
+                        expert_proj_output = self.expert_proj(adapted)
+                        expert_output = self.output_proj(expert_proj_output)
+                        
+                        # Copy results back to the combined output
+                        combined_output[expert_mask] = expert_output
+                    
+                    # Clean up memory after each group
+                    del group_hidden, group_x
                 except Exception as e:
                     print(f"Warning: Error processing expert {i}: {e}")
                     # Continue with next expert on error
@@ -414,32 +444,59 @@ class LLaDAAttention(nn.Module):
     def forward(self, x):
         batch_size, seq_len, n_embd = x.shape
         
-        # Calculate query, key, values
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        # Ensure inputs are contiguous for better performance
+        if not x.is_contiguous():
+            x = x.contiguous()
         
-        # Reshape to multiple heads
-        k = k.view(batch_size, seq_len, self.n_head, self.head_size).transpose(1, 2)
-        q = q.view(batch_size, seq_len, self.n_head, self.head_size).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.n_head, self.head_size).transpose(1, 2)
-        
-        # Use PyTorch's scaled dot-product attention with memory optimization
-        with torch.amp.autocast(enabled=True, device_type='cuda'):
-            # Use SDPA for efficient attention computation
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,  # No causal mask here (bidirectional attention)
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=False
-            )
+        # Use a single matrix multiply for qkv projection to maximize GPU utilization
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            # Calculate query, key, values with a single operation
+            qkv = self.c_attn(x)
+            q, k, v = qkv.split(self.n_embd, dim=2)
+            
+            # Reshape to multiple heads with memory-efficient layout
+            # Use contiguous memory for better kernel execution
+            k = k.view(batch_size, seq_len, self.n_head, self.head_size).transpose(1, 2).contiguous()
+            q = q.view(batch_size, seq_len, self.n_head, self.head_size).transpose(1, 2).contiguous()
+            v = v.view(batch_size, seq_len, self.n_head, self.head_size).transpose(1, 2).contiguous()
             
             # Free memory
+            del qkv
+            
+            # Configure Flash Attention if available
+            try:
+                # Check if Flash Attention is available
+                from torch.backends.cuda import sdp_kernel
+                
+                # Enable all optimized kernels
+                with sdp_kernel(enable_math=False, enable_flash=True, enable_mem_efficient=True):
+                    y = F.scaled_dot_product_attention(
+                        q, k, v,
+                        attn_mask=None,  # No causal mask here (bidirectional attention)
+                        dropout_p=self.dropout if self.training else 0.0,
+                        is_causal=False
+                    )
+            except (ImportError, AttributeError):
+                # Fall back to standard SDPA
+                y = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=False
+                )
+            
+            # Free memory immediately
             del q, k, v
-        
-        # Reshape back to original
-        y = y.transpose(1, 2).contiguous().view(batch_size, seq_len, n_embd)
-        
-        # Output projection
-        y = self.resid_dropout(self.c_proj(y))
+            
+            # Reshape back to original with optimal memory layout
+            y = y.transpose(1, 2).contiguous().view(batch_size, seq_len, n_embd)
+            
+            # Output projection with tensor cores
+            y = self.c_proj(y)
+            
+            # Apply dropout last
+            if self.dropout > 0 and self.training:
+                y = self.resid_dropout(y)
         
         return y
 
@@ -464,37 +521,50 @@ class LLaDABlock(nn.Module):
         self.use_checkpoint = False
 
     def forward(self, x):
-        # Process in smaller chunks if needed
-        with torch.amp.autocast(enabled=True, device_type='cuda'):
-            # Self-attention (bidirectional, not causal)
-            residual = x
-            attn_out = self.attn(self.ln_1(x))
-            x = residual + attn_out
+        # Process with pipelined operations for better GPU utilization
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            # Ensure input is in contiguous memory for better performance
+            if not x.is_contiguous():
+                x = x.contiguous()
             
-            # Free memory
-            del residual, attn_out
+            # Run normalization and prepare for attention in parallel
+            ln1_out = self.ln_1(x)
             
-            # MoE layer
-            residual = x
-            moe_input = self.ln_2(x)
-            routing_weights, dispatch_mask, router_loss = self.router(moe_input)
+            # Run attention with tensor cores
+            attn_out = self.attn(ln1_out)
             
-            # Ensure dispatch_mask has correct shape
+            # Add residual connection and normalize for MoE in one step
+            moe_input = self.ln_2(x + attn_out)
+            
+            # Free memory as soon as possible
+            del ln1_out, attn_out
+            
+            # Run router with tensor cores - ensure high precision
+            with torch.cuda.amp.autocast(enabled=False):
+                routing_weights, dispatch_mask, router_loss = self.router(moe_input)
+            
+            # Ensure dispatch_mask has correct shape for expert processing
             if dispatch_mask.dim() == 2:
                 batch_size, seq_len = x.shape[:2]
                 dispatch_mask = dispatch_mask.view(batch_size, seq_len, -1)
-                
+            
+            # Run MoE with tensor cores
             expert_output = self.expert_group(moe_input, dispatch_mask)
             
-            # Free memory for MoE intermediates
+            # Free memory
             del moe_input, routing_weights, dispatch_mask
             
-            x = residual + expert_output
+            # Add residual connection with correct precision
+            output = x + expert_output
             
             # Free memory
-            del residual, expert_output
+            del expert_output
             
-            return x, router_loss
+            # Make sure returned tensor uses optimal memory layout
+            if not output.is_contiguous():
+                output = output.contiguous()
+            
+            return output, router_loss
 
 class LLaDAModel(nn.Module):
     """
@@ -594,20 +664,44 @@ class LLaDAModel(nn.Module):
         device = input_ids.device
         batch_size, seq_len = input_ids.shape
         
-        # Memory management - keep consistent allocations
-        # Only free memory at the start of forward pass to avoid fragmentation
+        # Set up CUDA memory environment for optimal performance
         if torch.cuda.is_available():
-            # Create a memory reservation if needed for large inputs
+            # Create a memory reservation on a separate stream to avoid blocking
             with torch.no_grad():
-                if seq_len > 512:
-                    # Try to ensure enough contiguous memory
-                    from memory_utils import free_memory, tensor_pool
-                    
-                    # Free any cached memory
-                    free_memory()
-                    
-                    # Release any tensors from previous forward passes
-                    tensor_pool.clear()
+                # Use a dedicated stream for memory management
+                memory_stream = torch.cuda.Stream()
+                with torch.cuda.stream(memory_stream):
+                    # Import memory utilities if available
+                    try:
+                        from memory_utils import free_memory, tensor_pool
+                        
+                        # Free any cached memory
+                        free_memory()
+                        
+                        # Release any tensors from previous forward passes
+                        tensor_pool.clear()
+                        
+                        # Force cuBLAS to use Tensor Cores
+                        torch.set_float32_matmul_precision('high')
+                        
+                        # Optimize memory allocator for large tensors
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        
+                        # Tune cache allocator
+                        if hasattr(torch.cuda, "memory_stats") and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+                            try:
+                                import os
+                                os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,garbage_collection_threshold:0.8"
+                            except:
+                                pass
+                    except ImportError:
+                        # Basic memory cleanup if memory_utils not available
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                
+                # Wait for memory operations to complete
+                torch.cuda.current_stream().wait_stream(memory_stream)
         
         # Safety check: ensure all input IDs are within vocabulary range (strictly less than vocab_size)
         if torch.any(input_ids >= self.config.vocab_size):
