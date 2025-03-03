@@ -297,6 +297,42 @@ def preallocate_cuda_memory():
             except RuntimeError:
                 print("Preallocation failed - insufficient memory. Continuing without preallocation.")
 
+def check_cuda_graph_compatibility():
+    """Check if the current environment is compatible with CUDA graphs"""
+    if not torch.cuda.is_available():
+        return False, "CUDA not available"
+    
+    try:
+        # Check if CUDA graphs are supported
+        if not hasattr(torch.cuda, 'CUDAGraph'):
+            return False, "CUDA graphs not supported in this PyTorch version"
+        
+        # Check CUDA version
+        cuda_version = torch.version.cuda
+        if cuda_version is not None:
+            major, minor = map(int, cuda_version.split('.')[:2])
+            if major < 10 or (major == 10 and minor < 2):
+                return False, f"CUDA version {cuda_version} is too old for reliable graph usage (need 10.2+)"
+        
+        # Check GPU compute capability
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        compute_cap = props.major + props.minor / 10
+        if compute_cap < 7.0:
+            return False, f"GPU compute capability {compute_cap} is too low for optimal CUDA graph support"
+        
+        # Check environment variables that might interfere
+        problematic_vars = [
+            "CUDA_LAUNCH_BLOCKING",
+            "PYTORCH_NO_CUDA_MEMORY_CACHING",
+        ]
+        for var in problematic_vars:
+            if os.environ.get(var, "0") == "1":
+                return False, f"Environment variable {var}=1 may interfere with CUDA graphs"
+        
+        return True, "CUDA graphs compatible"
+    except Exception as e:
+        return False, f"Error checking CUDA graph compatibility: {e}"
+
 def setup_cuda_optimizations():
     """Configure CUDA optimizations based on the detected GPU hardware."""
     if not torch.cuda.is_available():
@@ -811,8 +847,16 @@ def train_llada(args):
                 if ddp:
                     model.require_backward_grad_sync = (args.gradient_accumulation_steps == 1)
                 
-                # Configuration pour CUDA Graphs
+                # Check CUDA graph compatibility first
+                cuda_graphs_compatible = False
+                if args.use_cuda_graphs:
+                    cuda_graphs_compatible, compatibility_message = check_cuda_graph_compatibility()
+                    if not cuda_graphs_compatible:
+                        print(f"CUDA graphs disabled: {compatibility_message}")
+                
+                # Configuration for CUDA Graphs
                 use_cuda_graph = (args.use_cuda_graphs and 
+                                  cuda_graphs_compatible and
                                   torch.cuda.is_available() and 
                                   hasattr(torch.cuda, 'CUDAGraph') and 
                                   not ddp and 
@@ -826,6 +870,23 @@ def train_llada(args):
                         print("CUDA Graphs disabled because gradient_accumulation_steps > 8")
                 elif use_cuda_graph and iter_num == 0:
                     print("CUDA Graphs enabled - first iteration will serve as warmup")
+                    
+                    # Hardware-specific CUDA graph settings
+                    if torch.cuda.is_available():
+                        gpu_name = torch.cuda.get_device_name().lower()
+                        
+                        # Detect problematic GPUs for CUDA graphs and adjust settings
+                        is_consumer_gpu = any(x in gpu_name for x in ['2070', '2080', '3060', '3070', '3080', '3090', '1660', '1060'])
+                        if is_consumer_gpu:
+                            if args.cuda_graphs_safe_mode:
+                                print(f"Using safer CUDA graph settings for consumer GPU: {gpu_name}")
+                                # Use more conservative settings for consumer GPUs
+                                max_graphs_per_shape = 1  # Only keep one graph per input shape
+                                
+                                # Enable synchronizations between operations
+                                os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+                            else:
+                                print(f"Warning: Consumer GPU detected ({gpu_name}). Consider using --cuda_graphs_safe_mode for stability")
                 
                 # GPU monitoring if requested
                 if args.gpu_monitor_interval > 0 and iter_num % args.gpu_monitor_interval == 0 and master_process:
@@ -1111,89 +1172,256 @@ def train_llada(args):
                     
                     # TRAITEMENT SELON LA STRATÉGIE: CUDA GRAPH RÉUTILISÉ, CAPTURE, OU EXÉCUTION NORMALE
                     if use_graph_for_step and cuda_graph_key in cuda_graphs and iter_num > 1:
-                        # CAS 1: RÉUTILISATION D'UN GRAPHE CUDA EXISTANT
-                        with timing_stats.track(f"cuda_graph_replay_{micro_step}"):
-                            # Récupérer les entrées statiques précédemment créées
-                            static_inputs = static_input_shapes[cuda_graph_key]
+                        # CASE 1: REUSE EXISTING CUDA GRAPH
+                        try:
+                            with timing_stats.track(f"cuda_graph_replay_{micro_step}"):
+                                # Get previously created static inputs
+                                static_inputs = static_input_shapes[cuda_graph_key]
+                                
+                                # Copy new data to static tensors with shape validation
+                                with torch.no_grad():
+                                    if args.use_streaming_dataset or args.mode == 'pretrain':
+                                        # First validate input shapes match exactly
+                                        if static_inputs['x'].shape != x.shape or static_inputs['y'].shape != y.shape:
+                                            raise RuntimeError(f"Input shapes changed: expected {static_inputs['x'].shape}, got {x.shape}")
+                                        
+                                        # Safe copy with synchronization to avoid race conditions
+                                        static_inputs['x'].copy_(x)
+                                        static_inputs['y'].copy_(y)
+                                    else:
+                                        for k, v in batch.items():
+                                            if k not in static_inputs:
+                                                raise RuntimeError(f"Missing key {k} in static inputs")
+                                            if static_inputs[k].shape != v.shape:
+                                                raise RuntimeError(f"Shape mismatch for {k}: expected {static_inputs[k].shape}, got {v.shape}")
+                                            static_inputs[k].copy_(v)
+                                
+                                # Ensure all copies are complete before replay
+                                torch.cuda.synchronize()
+                                
+                                # Execute the previously captured CUDA graph
+                                cuda_graphs[cuda_graph_key].replay()
+                                
+                                # Wait for graph execution to complete
+                                torch.cuda.synchronize()
+                                
+                                # Get results from static tensors
+                                loss_value = static_inputs['loss'].item()
+                                router_loss_value = static_inputs.get('router_loss', torch.tensor(0.0)).item()
+                                
+                                # Update statistics
+                                loss_accumulator += loss_value
+                                router_loss_accumulator += router_loss_value
+                                
+                                # Count processed tokens
+                                batch_size = x.size(0) if args.use_streaming_dataset or args.mode == 'pretrain' else batch['input_ids'].size(0)
+                                batch_tokens = batch_size * args.block_size
+                                total_tokens += batch_tokens
                             
-                            # Copier les nouvelles données dans les tenseurs statiques
-                            with torch.no_grad():
+                            if iter_num % 100 == 0 and micro_step == 0:
+                                print(f"Successfully replayed CUDA graph for micro_step {micro_step}")
+                        
+                        except Exception as e:
+                            print(f"CUDA graph replay failed: {e}")
+                            print("Falling back to normal execution")
+                            
+                            # Clean up the broken graph
+                            if cuda_graph_key in cuda_graphs:
+                                del cuda_graphs[cuda_graph_key]
+                            if cuda_graph_key in static_input_shapes:
+                                del static_input_shapes[cuda_graph_key]
+                            
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                            
+                            # Disable graph usage for future iterations
+                            use_cuda_graph = False
+                            
+                            # Execute normally as fallback
+                            with torch.amp.autocast(enabled=True, device_type='cuda') if ctx else nullcontext():
                                 if args.use_streaming_dataset or args.mode == 'pretrain':
-                                    static_inputs['x'].copy_(x)
-                                    static_inputs['y'].copy_(y)
+                                    outputs = model(x, targets=y)
                                 else:
-                                    for k, v in batch.items():
-                                        static_inputs[k].copy_(v)
-                            
-                            # Exécuter le graphe CUDA préalablement capturé
-                            cuda_graphs[cuda_graph_key].replay()
-                            
-
-                            # Récupérer les résultats depuis les tenseurs statiques
-                            loss_value = static_inputs['loss'].item()
-                            router_loss_value = static_inputs.get('router_loss', torch.tensor(0.0)).item()
-                            
-                                # Mise à jour des statistiques
-                            loss_accumulator += loss_value
-                            router_loss_accumulator += router_loss_value
-                            
-                            # Comptabiliser les tokens traités
-                            batch_size = x.size(0) if args.use_streaming_dataset or args.mode == 'pretrain' else batch['input_ids'].size(0)
-                            batch_tokens = batch_size * args.block_size
-                            total_tokens += batch_tokens
-                            
-                        if iter_num % 100 == 0 and micro_step == 0:
-                            print(f"Réutilisation du graphe CUDA pour micro_step {micro_step}")
+                                    outputs = model(**batch)
+                                
+                                # Handle different output formats
+                                if isinstance(outputs, dict):
+                                    loss = outputs['loss']
+                                    router_loss = outputs.get('router_loss', None)
+                                elif isinstance(outputs, tuple) and len(outputs) >= 2:
+                                    _, loss = outputs[:2]
+                                    router_loss = outputs[2] if len(outputs) > 2 else None
+                                else:
+                                    loss = outputs
+                                    router_loss = None
+                                
+                                # Process router loss if present
+                                if router_loss is not None and args.mode == 'pretrain':
+                                    router_loss = router_loss * args.router_loss_weight
+                                    loss = loss + router_loss
+                                    router_loss_value = router_loss.item()
+                                else:
+                                    router_loss_value = 0.0
+                                
+                                # Update statistics
+                                loss_accumulator += loss.item()
+                                router_loss_accumulator += router_loss_value
+                                
+                                # Count tokens
+                                batch_size = x.size(0) if args.use_streaming_dataset or args.mode == 'pretrain' else batch['input_ids'].size(0)
+                                batch_tokens = batch_size * args.block_size
+                                total_tokens += batch_tokens
+                                
+                                # Backward pass
+                                micro_loss = loss / args.gradient_accumulation_steps
+                                if scaler is not None:
+                                    scaler.scale(micro_loss).backward()
+                                else:
+                                    micro_loss.backward()
                             
                     elif use_graph_for_step and iter_num == 1 and micro_step < max_graphs_per_shape:
                         # CAS 2: CAPTURE D'UN NOUVEAU GRAPHE CUDA
                         with timing_stats.track(f"cuda_graph_capture_{micro_step}"):
-                            # Créer des copies des entrées
-                            static_inputs = {}
-                            if args.use_streaming_dataset or args.mode == 'pretrain':
-                                static_inputs['x'] = x.clone()
-                                static_inputs['y'] = y.clone()
-                            else:
-                                static_inputs = {k: v.clone() for k, v in batch.items()}
-                            
-                            # Préparer les tenseurs de sortie
-                            static_inputs['loss'] = torch.zeros(1, device=device)
-                            if args.mode == 'pretrain':
-                                static_inputs['router_loss'] = torch.zeros(1, device=device)
-                            
-                            # Synchroniser et préparer le graphe
-                            torch.cuda.synchronize()
-                            cuda_graphs[cuda_graph_key] = torch.cuda.CUDAGraph()
-                            
-                            # Capturer le graphe complet (forward + backward)
-                            with torch.cuda.graph(cuda_graphs[cuda_graph_key]):
-                                # Forward
+                            try:
+                                # Create local copies of inputs to avoid modifications during capture
+                                static_inputs = {}
+                                if args.use_streaming_dataset or args.mode == 'pretrain':
+                                    static_inputs['x'] = x.clone()
+                                    static_inputs['y'] = y.clone()
+                                else:
+                                    static_inputs = {k: v.clone() for k, v in batch.items()}
+                                
+                                # Prepare output tensors
+                                static_inputs['loss'] = torch.zeros(1, device=device)
+                                if args.mode == 'pretrain':
+                                    static_inputs['router_loss'] = torch.zeros(1, device=device)
+                                
+                                # Make sure everything is on the same device
+                                for k, v in static_inputs.items():
+                                    if isinstance(v, torch.Tensor) and v.device != device:
+                                        static_inputs[k] = v.to(device)
+                                
+                                # Ensure CUDA is synchronized before capture
+                                torch.cuda.synchronize()
+                                
+                                # Empty cache to minimize chance of memory fragmentation
+                                torch.cuda.empty_cache()
+                                torch.cuda.synchronize()
+                                
+                                # Create a fresh graph instance
+                                cuda_graphs[cuda_graph_key] = torch.cuda.CUDAGraph()
+                                
+                                # Pre-run a single forward-backward pass outside the graph to warmup
+                                with torch.no_grad():
+                                    if args.use_streaming_dataset or args.mode == 'pretrain':
+                                        _ = model(static_inputs['x'], targets=static_inputs['y'])
+                                    else:
+                                        _ = model(**{k: static_inputs[k] for k in batch.keys()})
+                                
+                                # Capture the graph with robust error handling
+                                with torch.cuda.graph(cuda_graphs[cuda_graph_key]):
+                                    # Forward pass
+                                    # Use nullcontext instead of autocast to avoid capture issues
+                                    # autocast can cause problems during graph capture
+                                    with nullcontext():
+                                        if args.use_streaming_dataset or args.mode == 'pretrain':
+                                            outputs = model(static_inputs['x'], targets=static_inputs['y'])
+                                        else:
+                                            outputs = model(**{k: static_inputs[k] for k in batch.keys()})
+                                        
+                                        # Process loss
+                                        if isinstance(outputs, dict) and 'loss' in outputs:
+                                            loss = outputs['loss']
+                                        elif isinstance(outputs, tuple) and len(outputs) > 1:
+                                            _, loss = outputs[:2]
+                                        else:
+                                            loss = outputs
+                                        
+                                        static_inputs['loss'].copy_(loss.detach())
+                                        
+                                        # Router loss if present
+                                        router_loss = None
+                                        if args.mode == 'pretrain':
+                                            if isinstance(outputs, dict) and 'router_loss' in outputs:
+                                                router_loss = outputs['router_loss']
+                                            elif isinstance(outputs, tuple) and len(outputs) > 2:
+                                                router_loss = outputs[2]
+                                            
+                                            if router_loss is not None:
+                                                static_inputs['router_loss'].copy_(router_loss.detach())
+                                                # Combine losses for backward
+                                                loss = loss + router_loss * args.router_loss_weight
+                                        
+                                        # Backward pass
+                                        micro_loss = loss / args.gradient_accumulation_steps
+                                        if scaler is not None:
+                                            scaler.scale(micro_loss).backward()
+                                        else:
+                                            micro_loss.backward()
+                                
+                                # Store the graph and inputs for reuse
+                                static_input_shapes[cuda_graph_key] = static_inputs
+                                
+                                # Sync again after capture to ensure everything is complete
+                                torch.cuda.synchronize()
+                                
+                                print(f"Successfully captured CUDA graph for micro_step {micro_step}")
+                            except RuntimeError as e:
+                                print(f"CUDA graph capture failed: {e}")
+                                print("Falling back to non-graph execution for this step")
+                                # Clear any partial graph to avoid resource leaks
+                                if cuda_graph_key in cuda_graphs:
+                                    del cuda_graphs[cuda_graph_key]
+                                
+                                # Force PyTorch to clean up any hanging resources
+                                torch.cuda.empty_cache()
+                                torch.cuda.synchronize()
+                                
+                                # Disable graph usage for all future iterations to avoid repeated errors
+                                use_cuda_graph = False
+                                
+                                # Execute normally as a fallback
+                                # Forward pass normal
                                 with torch.amp.autocast(enabled=True, device_type='cuda') if ctx else nullcontext():
                                     if args.use_streaming_dataset or args.mode == 'pretrain':
-                                        outputs = model(static_inputs['x'], targets=static_inputs['y'])
+                                        outputs = model(x, targets=y)
                                     else:
-                                        outputs = model(**{k: static_inputs[k] for k in batch.keys()})
+                                        outputs = model(**batch)
                                     
-                                    # Traitement de la loss
-                                    loss = outputs['loss']
-                                    static_inputs['loss'].copy_(loss.detach())
+                                    # Handle different output formats
+                                    if isinstance(outputs, dict):
+                                        loss = outputs['loss']
+                                        router_loss = outputs.get('router_loss', None)
+                                    elif isinstance(outputs, tuple) and len(outputs) >= 2:
+                                        _, loss = outputs[:2]
+                                        router_loss = outputs[2] if len(outputs) > 2 else None
+                                    else:
+                                        loss = outputs
+                                        router_loss = None
                                     
-                                    # Router loss si présent
-                                    if args.mode == 'pretrain' and 'router_loss' in outputs:
-                                        router_loss = outputs['router_loss'] 
-                                        static_inputs['router_loss'].copy_(router_loss.detach())
-                                        # Combiner les pertes pour le backward
-                                        loss = loss + router_loss * args.router_loss_weight
+                                    # Router loss if present
+                                    if router_loss is not None and args.mode == 'pretrain':
+                                        router_loss = router_loss * args.router_loss_weight
+                                        loss = loss + router_loss
+                                        router_loss_value = router_loss.item()
+                                    else:
+                                        router_loss_value = 0.0
                                     
-                                    # Backward
+                                    # Update statistics
+                                    loss_accumulator += loss.item()
+                                    router_loss_accumulator += router_loss_value
+                                    
+                                    # Calculate token count
+                                    batch_size = x.size(0) if args.use_streaming_dataset or args.mode == 'pretrain' else batch['input_ids'].size(0)
+                                    batch_tokens = batch_size * args.block_size
+                                    total_tokens += batch_tokens
+                                    
+                                    # Backward pass
                                     micro_loss = loss / args.gradient_accumulation_steps
                                     if scaler is not None:
                                         scaler.scale(micro_loss).backward()
                                     else:
                                         micro_loss.backward()
-                            
-                            # Stocker le graphe et les entrées pour réutilisation
-                            static_input_shapes[cuda_graph_key] = static_inputs
                             
                             # Mise à jour des statistiques après la capture
                             loss_value = static_inputs['loss'].item()
@@ -1584,6 +1812,7 @@ def main():
     # Advanced optimization options
     parser.add_argument('--compile', action='store_true', help='Compile the model with torch.compile')
     parser.add_argument('--use_cuda_graphs', action='store_true', help='Use CUDA Graphs for optimization')
+    parser.add_argument('--cuda_graphs_safe_mode', action='store_true', help='Safer but potentially slower CUDA Graphs mode')
     parser.add_argument('--preallocate_memory', action='store_true', help='Preallocate CUDA memory to reduce fragmentation')
     parser.add_argument('--disable_non_blocking', action='store_true', help='Disable non-blocking data transfers')
     parser.add_argument('--gpu_monitor_interval', type=int, default=0, help='Interval for GPU statistics monitoring (0 to disable)')
