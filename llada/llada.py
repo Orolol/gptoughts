@@ -71,19 +71,37 @@ class LLaDARouter(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
         
+        # Import tensor pool for memory reuse
+        try:
+            from memory_utils import tensor_pool
+        except ImportError:
+            tensor_pool = None
+        
         # Compute router logits with memory optimization
         with torch.amp.autocast(enabled=True, device_type='cuda'):
             try:
-                # Compute router logits using the factorized design
+                # Reshape input only once and reuse the reshaped tensor
+                x_reshaped = x.reshape(-1, self.input_dim)
+                
+                # Compute router logits using the factorized design - in place operations where possible
                 # Project input to lower dimension
-                projected = self.router_projection(x.reshape(-1, self.input_dim))
-                # Apply normalization
+                projected = self.router_projection(x_reshaped)
+                
+                # Apply normalization, reusing the same memory if possible
                 normalized = self.router_norm(projected)
+                
+                # Free the projected tensor as it's no longer needed
+                del projected
+                
                 # Project to expert dimension
                 router_logits = self.router_gate(normalized)
                 
-                # Scale logits by temperature
-                router_logits = router_logits / (self.temperature.abs() + 1e-6)
+                # Free the normalized tensor as it's no longer needed
+                del normalized
+                
+                # Scale logits by temperature - do this in-place if possible
+                temp_val = (self.temperature.abs() + 1e-6).item()
+                router_logits.div_(temp_val)
                 
                 # Compute routing probabilities
                 routing_weights = F.softmax(router_logits, dim=-1)
@@ -576,9 +594,20 @@ class LLaDAModel(nn.Module):
         device = input_ids.device
         batch_size, seq_len = input_ids.shape
         
-        # Explicitly clear GPU memory cache before large operations
-        if torch.cuda.is_available() and seq_len > 512:
-            torch.cuda.empty_cache()
+        # Memory management - keep consistent allocations
+        # Only free memory at the start of forward pass to avoid fragmentation
+        if torch.cuda.is_available():
+            # Create a memory reservation if needed for large inputs
+            with torch.no_grad():
+                if seq_len > 512:
+                    # Try to ensure enough contiguous memory
+                    from memory_utils import free_memory, tensor_pool
+                    
+                    # Free any cached memory
+                    free_memory()
+                    
+                    # Release any tensors from previous forward passes
+                    tensor_pool.clear()
         
         # Safety check: ensure all input IDs are within vocabulary range (strictly less than vocab_size)
         if torch.any(input_ids >= self.config.vocab_size):

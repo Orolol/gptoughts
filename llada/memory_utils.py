@@ -6,6 +6,57 @@ import time
 from typing import Optional, Dict, List
 from contextlib import contextmanager
 
+class TensorPool:
+    """A pool of reusable tensors to avoid memory allocation/deallocation overhead"""
+    
+    def __init__(self, device='cuda'):
+        self.device = device
+        self.pools = {}  # Pools for different shapes and dtypes
+        self.active_tensors = set()  # Track tensors currently in use
+        self.lock = threading.Lock()
+        self.enabled = torch.cuda.is_available()
+    
+    def get(self, shape, dtype=torch.float):
+        """Get a tensor from the pool or create a new one"""
+        if not self.enabled:
+            return torch.zeros(shape, dtype=dtype, device=self.device)
+            
+        with self.lock:
+            key = (shape, dtype)
+            if key not in self.pools:
+                self.pools[key] = []
+                
+            if self.pools[key]:
+                tensor = self.pools[key].pop()
+                tensor.zero_()
+            else:
+                tensor = torch.zeros(shape, dtype=dtype, device=self.device)
+                
+            self.active_tensors.add(tensor)
+            return tensor
+    
+    def release(self, tensor):
+        """Return a tensor to the pool"""
+        if not self.enabled or tensor is None:
+            return
+            
+        with self.lock:
+            if tensor in self.active_tensors:
+                key = (tensor.shape, tensor.dtype)
+                self.pools[key].append(tensor)
+                self.active_tensors.remove(tensor)
+    
+    def clear(self):
+        """Clear all pools"""
+        with self.lock:
+            self.pools.clear()
+            self.active_tensors.clear()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+# Create a global tensor pool for reuse
+tensor_pool = TensorPool()
+
 class MemoryTracker:
     """Track memory usage during model training"""
     
@@ -157,10 +208,23 @@ def free_memory(threshold_mb: Optional[int] = None):
     if threshold_mb is not None and allocated < threshold_mb:
         return False
     
-    # Perform cleanup
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-    gc.collect()
+    # Trigger a more aggressive memory cleanup
+    for _ in range(3):  # Multiple passes can help with fragmentation
+        # First clear CUDA cache
+        torch.cuda.empty_cache()
+        
+        # Force CUDA synchronization to complete any pending operations
+        torch.cuda.synchronize()
+        
+        # Run Python's garbage collection
+        gc.collect()
+        
+        # Try allocating and freeing a small tensor to help with defragmentation
+        try:
+            temp = torch.zeros(1024, 1024, device='cuda')
+            del temp
+        except:
+            pass
     
     # Return True if we freed memory
     new_allocated = torch.cuda.memory_allocated() / (1024**2)
@@ -180,30 +244,41 @@ def set_memory_fraction(fraction: float = 0.85):
 
 def setup_optimal_memory_config():
     """Setup optimal memory configuration for training"""
-    # Tune garbage collection
-    gc.set_threshold(900, 15, 15)  # Make GC less aggressive
+    # Tune garbage collection - less frequent but more thorough
+    gc.set_threshold(1200, 10, 10)  # Make GC less aggressive but more thorough
     
     # Set PyTorch memory allocation strategy
     if torch.cuda.is_available():
         # Set environment variables for better memory allocation
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True,garbage_collection_threshold:0.8"
+        # Use smaller split size to reduce fragmentation
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64,expandable_segments:True,garbage_collection_threshold:0.6,roundup_power2:True"
         
         # Clear any cached memory
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         
-        # Try to defragment memory
+        # Try to defragment memory with multiple passes
         try:
             total = torch.cuda.get_device_properties(0).total_memory
             allocated = torch.cuda.memory_allocated()
             
             # Only try to defragment if substantial memory is available
-            if allocated < total * 0.5:
-                # Allocate a large block then free it to consolidate fragments
-                block_size = int((total - allocated) * 0.7)
-                if block_size > 0:
-                    temp = torch.empty(block_size // 8, device='cuda', dtype=torch.float16)
-                    del temp
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-        except:
-            pass
+            if allocated < total * 0.7:
+                # Do multiple passes of allocation/deallocation to help memory defrag
+                for size_factor in [0.5, 0.3, 0.2]:
+                    block_size = int((total - allocated) * size_factor)
+                    if block_size > 0:
+                        try:
+                            temp = torch.empty(block_size // 8, device='cuda', dtype=torch.float16)
+                            del temp
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                        except RuntimeError:
+                            # If we hit OOM, stop the defrag attempts
+                            break
+                
+                # Force a final synchronization and garbage collection
+                torch.cuda.synchronize()
+                gc.collect()
+        except Exception as e:
+            print(f"Memory defragmentation failed: {e}")

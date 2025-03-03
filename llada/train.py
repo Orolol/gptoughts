@@ -970,6 +970,19 @@ def train_llada(args):
                     # On saute cette itération
                     continue
                 
+                # Import memory utilities
+                try:
+                    from memory_utils import free_memory, tensor_pool
+                except ImportError:
+                    free_memory = lambda: None
+                    tensor_pool = None
+                
+                # Reserve GPU memory for this iteration - helps maintain stable memory patterns
+                if torch.cuda.is_available() and not args.disable_non_blocking:
+                    # Clear memory but keep allocation patterns stable
+                    torch.cuda.synchronize()
+                    free_memory()
+                
                 # Create CUDA streams for overlapped execution
                 data_stream = torch.cuda.Stream() if torch.cuda.is_available() and not args.disable_non_blocking else None
                 compute_stream = torch.cuda.current_stream() if torch.cuda.is_available() else None
@@ -977,21 +990,44 @@ def train_llada(args):
                 # Initialize micro_step before using it
                 micro_step = 0
                 
+                # Pre-allocate tensors for each batch to reduce memory fragmentation
+                prefetched_data_all = [{} for _ in range(min(2, len(batches)))]
+                
                 # Pre-fetch first batch data to device asynchronously
-                if data_stream is not None and micro_step < len(batches):
+                if data_stream is not None and len(batches) > 0:
                     with torch.cuda.stream(data_stream):
-                        prefetched_data = {}
+                        # Batch 0
                         if args.use_streaming_dataset:
-                            prefetched_data['x'] = batches[0]['input_ids'].to(device, non_blocking=True)
-                            prefetched_data['y'] = batches[0]['labels'].to(device, non_blocking=True)
+                            prefetched_data_all[0]['x'] = batches[0]['input_ids'].to(device, non_blocking=True)
+                            prefetched_data_all[0]['y'] = batches[0]['labels'].to(device, non_blocking=True)
                         elif args.mode == 'pretrain':
                             x, y = batches[0]
-                            prefetched_data['x'] = x.to(device, non_blocking=True)
-                            prefetched_data['y'] = y.to(device, non_blocking=True)
+                            prefetched_data_all[0]['x'] = x.to(device, non_blocking=True)
+                            prefetched_data_all[0]['y'] = y.to(device, non_blocking=True)
                         else:
                             # SFT batch
-                            prefetched_data['batch'] = {k: v.to(device, non_blocking=True) 
-                                                     for k, v in batches[0].items()}
+                            prefetched_data_all[0]['batch'] = {k: v.to(device, non_blocking=True) 
+                                                          for k, v in batches[0].items()}
+                        
+                        # Batch 1 if available
+                        if len(batches) > 1 and len(prefetched_data_all) > 1:
+                            if args.use_streaming_dataset:
+                                prefetched_data_all[1]['x'] = batches[1]['input_ids'].to(device, non_blocking=True)
+                                prefetched_data_all[1]['y'] = batches[1]['labels'].to(device, non_blocking=True)
+                            elif args.mode == 'pretrain':
+                                x, y = batches[1]
+                                prefetched_data_all[1]['x'] = x.to(device, non_blocking=True)
+                                prefetched_data_all[1]['y'] = y.to(device, non_blocking=True)
+                            else:
+                                # SFT batch
+                                prefetched_data_all[1]['batch'] = {k: v.to(device, non_blocking=True) 
+                                                              for k, v in batches[1].items()}
+                
+                # Create a flag for background prefetching
+                prefetch_scheduled = [False] * len(batches)
+                prefetch_scheduled[0] = True  # First batch is already prefetched
+                if len(batches) > 1 and len(prefetched_data_all) > 1:
+                    prefetch_scheduled[1] = True  # Second batch too if available
                 
                 # Gradient accumulation loop
                 for micro_step in range(args.gradient_accumulation_steps):
@@ -1005,31 +1041,46 @@ def train_llada(args):
                             # Wait for the prefetched data to be ready
                             torch.cuda.current_stream().wait_stream(data_stream)
                             
+                            # Get the current prefetched data
+                            prefetch_idx = micro_step % len(prefetched_data_all)
+                            prefetched_data = prefetched_data_all[prefetch_idx]
+                            
                             # Use the prefetched data
                             if args.use_streaming_dataset:
-                                x = prefetched_data['x']
-                                y = prefetched_data['y']
+                                x = prefetched_data.get('x')
+                                y = prefetched_data.get('y')
                             elif args.mode == 'pretrain':
-                                x = prefetched_data['x']
-                                y = prefetched_data['y']
+                                x = prefetched_data.get('x')
+                                y = prefetched_data.get('y')
                             else:
                                 # SFT batch
-                                batch = prefetched_data['batch']
+                                batch = prefetched_data.get('batch', {})
                             
-                            # Pre-fetch next batch if available
-                            if micro_step + 1 < len(batches):
+                            # Schedule next prefetch if it's not already scheduled
+                            next_idx = micro_step + len(prefetched_data_all)
+                            if next_idx < len(batches) and not prefetch_scheduled[next_idx]:
                                 with torch.cuda.stream(data_stream):
+                                    # Determine which prefetch slot to use
+                                    next_prefetch_idx = next_idx % len(prefetched_data_all)
+                                    
+                                    # Clear previous data in this slot to release memory
+                                    prefetched_data_all[next_prefetch_idx].clear()
+                                    
+                                    # Load new batch data
                                     if args.use_streaming_dataset:
-                                        prefetched_data['x'] = batches[micro_step+1]['input_ids'].to(device, non_blocking=True)
-                                        prefetched_data['y'] = batches[micro_step+1]['labels'].to(device, non_blocking=True)
+                                        prefetched_data_all[next_prefetch_idx]['x'] = batches[next_idx]['input_ids'].to(device, non_blocking=True)
+                                        prefetched_data_all[next_prefetch_idx]['y'] = batches[next_idx]['labels'].to(device, non_blocking=True)
                                     elif args.mode == 'pretrain':
-                                        next_x, next_y = batches[micro_step+1]
-                                        prefetched_data['x'] = next_x.to(device, non_blocking=True)
-                                        prefetched_data['y'] = next_y.to(device, non_blocking=True)
+                                        next_x, next_y = batches[next_idx]
+                                        prefetched_data_all[next_prefetch_idx]['x'] = next_x.to(device, non_blocking=True)
+                                        prefetched_data_all[next_prefetch_idx]['y'] = next_y.to(device, non_blocking=True)
                                     else:
                                         # SFT batch
-                                        prefetched_data['batch'] = {k: v.to(device, non_blocking=True) 
-                                                                 for k, v in batches[micro_step+1].items()}
+                                        prefetched_data_all[next_prefetch_idx]['batch'] = {k: v.to(device, non_blocking=True) 
+                                                                                     for k, v in batches[next_idx].items()}
+                                
+                                # Mark as scheduled
+                                prefetch_scheduled[next_idx] = True
                         else:
                             # Standard synchronous data loading as fallback
                             if args.use_streaming_dataset:
@@ -1284,6 +1335,32 @@ def train_llada(args):
                 # Periodic memory cleanup
                 if iter_num % 100 == 0:
                     cleanup_memory()
+                
+                # Clean up tensor memory after each iteration
+                try:
+                    # Access tensor pool and clean it up to maintain stable memory
+                    from memory_utils import tensor_pool, free_memory
+                    tensor_pool.clear()
+                    
+                    # Light memory cleanup every iteration helps maintain stable patterns
+                    if iter_num % 5 == 0:
+                        free_memory()
+                except ImportError:
+                    # Fallback if memory_utils isn't properly imported
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                
+                # Clear any intermediate tensors from prefetched data
+                for data_dict in prefetched_data_all:
+                    data_dict.clear()
+                
+                if master_process and iter_num % 100 == 0:
+                    # Synchronize and print memory stats periodically
+                    torch.cuda.synchronize()
+                    if torch.cuda.is_available():
+                        allocated = torch.cuda.memory_allocated() / (1024**3)
+                        reserved = torch.cuda.memory_reserved() / (1024**3)
+                        print(f"Memory stats: Allocated {allocated:.2f} GB, Reserved {reserved:.2f} GB")
                 
                 iter_num += 1
                 local_iter_num += 1
