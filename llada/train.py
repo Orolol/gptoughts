@@ -452,6 +452,20 @@ def print_gpu_stats():
     
     print("==============================")
 
+def init_distributed(backend):
+    """Initialize PyTorch distributed training backend"""
+    import torch.distributed as dist
+    
+    if not dist.is_available():
+        raise RuntimeError("PyTorch distributed not available")
+        
+    # Initialize the process group
+    torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
+    dist.init_process_group(backend=backend)
+    
+    print(f"Initialized distributed training with backend: {backend}")
+    print(f"Rank: {os.environ['RANK']}, Local Rank: {os.environ['LOCAL_RANK']}, World Size: {os.environ['WORLD_SIZE']}")
+
 def train_llada(args):
     """Train a LLaDA model with diffusion-based learning"""
     # DDP init
@@ -959,6 +973,9 @@ def train_llada(args):
                 # Create CUDA streams for overlapped execution
                 data_stream = torch.cuda.Stream() if torch.cuda.is_available() and not args.disable_non_blocking else None
                 compute_stream = torch.cuda.current_stream() if torch.cuda.is_available() else None
+                
+                # Initialize micro_step before using it
+                micro_step = 0
                 
                 # Pre-fetch first batch data to device asynchronously
                 if data_stream is not None and micro_step < len(batches):
