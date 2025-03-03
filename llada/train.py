@@ -889,7 +889,7 @@ def train_llada(args):
                             batches = train_loader.get_accumulation_batches(args.gradient_accumulation_steps)
                             if master_process and iter_num % args.log_interval == 0:
                                 data_loading_time = time.time() - data_loading_start
-                                print(f"🔄 Data loading time (optimized): {data_loading_time*1000:.1f}ms for {args.gradient_accumulation_steps} batches")
+                                # print(f"🔄 Data loading time (optimized): {data_loading_time*1000:.1f}ms for {args.gradient_accumulation_steps} batches")
                                 if len(batches) != args.gradient_accumulation_steps:
                                     print(f"⚠️ Warning: Expected {args.gradient_accumulation_steps} batches, got {len(batches)}")
                         else:
@@ -934,7 +934,7 @@ def train_llada(args):
                                 
                                 if master_process and iter_num % args.log_interval == 0:
                                     data_loading_time = time.time() - data_loading_start
-                                    print(f"🔄 Data loading time (threaded): {data_loading_time*1000:.1f}ms for {args.gradient_accumulation_steps} batches")
+                                    # print(f"🔄 Data loading time (threaded): {data_loading_time*1000:.1f}ms for {args.gradient_accumulation_steps} batches")
                             else:
                                 # Fallback: get batches one by one
                                 for i in range(args.gradient_accumulation_steps):
@@ -962,7 +962,7 @@ def train_llada(args):
                                     # Detailed load time logging
                                     if master_process and iter_num % args.log_interval == 0:
                                         load_time = time.time() - load_start
-                                        print(f"🔄 Data loading time (batch {i+1}/{args.gradient_accumulation_steps}): {load_time*1000:.1f}ms")
+                                        #print(f"🔄 Data loading time (batch {i+1}/{args.gradient_accumulation_steps}): {load_time*1000:.1f}ms")
                 except StopIteration:
                     if args.use_streaming_dataset and master_process:
                         print("Fin de l'itération du dataloader, réinitialisation...")
@@ -1077,7 +1077,7 @@ def train_llada(args):
                                     else:
                                         # SFT batch
                                         prefetched_data_all[next_prefetch_idx]['batch'] = {k: v.to(device, non_blocking=True) 
-                                                                                     for k, v in batches[next_idx].items()}
+                                                                                    for k, v in batches[next_idx].items()}
                                 
                                 # Mark as scheduled
                                 prefetch_scheduled[next_idx] = True
@@ -1098,161 +1098,161 @@ def train_llada(args):
                                 batch = batches[micro_step]
                                 batch = {k: v.to(device, non_blocking=not args.disable_non_blocking) for k, v in batch.items()}
                         
-                        # Création d'une clé unique pour chaque taille d'entrée
-                        input_shape_key = None
-                        if args.use_streaming_dataset or args.mode == 'pretrain':
-                            input_shape_key = tuple(x.shape)
-                        else:
-                            input_shape_key = tuple(batch['input_ids'].shape)
-                            
-                        # Clé unique pour ce micro-step et cette forme d'entrée
-                        cuda_graph_key = (input_shape_key, micro_step % max_graphs_per_shape) if input_shape_key is not None else None
-                        use_graph_for_step = use_cuda_graph and cuda_graph_key is not None
+                    # Création d'une clé unique pour chaque taille d'entrée
+                    input_shape_key = None
+                    if args.use_streaming_dataset or args.mode == 'pretrain':
+                        input_shape_key = tuple(x.shape)
+                    else:
+                        input_shape_key = tuple(batch['input_ids'].shape)
                         
-                        # TRAITEMENT SELON LA STRATÉGIE: CUDA GRAPH RÉUTILISÉ, CAPTURE, OU EXÉCUTION NORMALE
-                        if use_graph_for_step and cuda_graph_key in cuda_graphs and iter_num > 1:
-                            # CAS 1: RÉUTILISATION D'UN GRAPHE CUDA EXISTANT
-                            with timing_stats.track(f"cuda_graph_replay_{micro_step}"):
-                                # Récupérer les entrées statiques précédemment créées
-                                static_inputs = static_input_shapes[cuda_graph_key]
-                                
-                                # Copier les nouvelles données dans les tenseurs statiques
-                                with torch.no_grad():
-                                    if args.use_streaming_dataset or args.mode == 'pretrain':
-                                        static_inputs['x'].copy_(x)
-                                        static_inputs['y'].copy_(y)
-                                    else:
-                                        for k, v in batch.items():
-                                            static_inputs[k].copy_(v)
-                                
-                                # Exécuter le graphe CUDA préalablement capturé
-                                cuda_graphs[cuda_graph_key].replay()
-                                
-
-                                # Récupérer les résultats depuis les tenseurs statiques
-                                loss_value = static_inputs['loss'].item()
-                                router_loss_value = static_inputs.get('router_loss', torch.tensor(0.0)).item()
-                                
-                                    # Mise à jour des statistiques
-                                loss_accumulator += loss_value
-                                router_loss_accumulator += router_loss_value
-                                
-                                # Comptabiliser les tokens traités
-                                batch_size = x.size(0) if args.use_streaming_dataset or args.mode == 'pretrain' else batch['input_ids'].size(0)
-                                batch_tokens = batch_size * args.block_size
-                                total_tokens += batch_tokens
-                                
-                            if iter_num % 100 == 0 and micro_step == 0:
-                                print(f"Réutilisation du graphe CUDA pour micro_step {micro_step}")
-                                
-                        elif use_graph_for_step and iter_num == 1 and micro_step < max_graphs_per_shape:
-                            # CAS 2: CAPTURE D'UN NOUVEAU GRAPHE CUDA
-                            with timing_stats.track(f"cuda_graph_capture_{micro_step}"):
-                                # Créer des copies des entrées
-                                static_inputs = {}
+                    # Clé unique pour ce micro-step et cette forme d'entrée
+                    cuda_graph_key = (input_shape_key, micro_step % max_graphs_per_shape) if input_shape_key is not None else None
+                    use_graph_for_step = use_cuda_graph and cuda_graph_key is not None
+                    
+                    # TRAITEMENT SELON LA STRATÉGIE: CUDA GRAPH RÉUTILISÉ, CAPTURE, OU EXÉCUTION NORMALE
+                    if use_graph_for_step and cuda_graph_key in cuda_graphs and iter_num > 1:
+                        # CAS 1: RÉUTILISATION D'UN GRAPHE CUDA EXISTANT
+                        with timing_stats.track(f"cuda_graph_replay_{micro_step}"):
+                            # Récupérer les entrées statiques précédemment créées
+                            static_inputs = static_input_shapes[cuda_graph_key]
+                            
+                            # Copier les nouvelles données dans les tenseurs statiques
+                            with torch.no_grad():
                                 if args.use_streaming_dataset or args.mode == 'pretrain':
-                                    static_inputs['x'] = x.clone()
-                                    static_inputs['y'] = y.clone()
+                                    static_inputs['x'].copy_(x)
+                                    static_inputs['y'].copy_(y)
                                 else:
-                                    static_inputs = {k: v.clone() for k, v in batch.items()}
-                                
-                                # Préparer les tenseurs de sortie
-                                static_inputs['loss'] = torch.zeros(1, device=device)
-                                if args.mode == 'pretrain':
-                                    static_inputs['router_loss'] = torch.zeros(1, device=device)
-                                
-                                # Synchroniser et préparer le graphe
-                                torch.cuda.synchronize()
-                                cuda_graphs[cuda_graph_key] = torch.cuda.CUDAGraph()
-                                
-                                # Capturer le graphe complet (forward + backward)
-                                with torch.cuda.graph(cuda_graphs[cuda_graph_key]):
-                                    # Forward
-                                    with torch.amp.autocast(enabled=True, device_type='cuda') if ctx else nullcontext():
-                                        if args.use_streaming_dataset or args.mode == 'pretrain':
-                                            outputs = model(static_inputs['x'], targets=static_inputs['y'])
-                                        else:
-                                            outputs = model(**{k: static_inputs[k] for k in batch.keys()})
-                                        
-                                        # Traitement de la loss
-                                        loss = outputs['loss']
-                                        static_inputs['loss'].copy_(loss.detach())
-                                        
-                                        # Router loss si présent
-                                        if args.mode == 'pretrain' and 'router_loss' in outputs:
-                                            router_loss = outputs['router_loss'] 
-                                            static_inputs['router_loss'].copy_(router_loss.detach())
-                                            # Combiner les pertes pour le backward
-                                            loss = loss + router_loss * args.router_loss_weight
-                                        
-                                        # Backward
-                                        micro_loss = loss / args.gradient_accumulation_steps
-                                        if scaler is not None:
-                                            scaler.scale(micro_loss).backward()
-                                        else:
-                                            micro_loss.backward()
-                                
-                                # Stocker le graphe et les entrées pour réutilisation
-                                static_input_shapes[cuda_graph_key] = static_inputs
-                                
-                                # Mise à jour des statistiques après la capture
-                                loss_value = static_inputs['loss'].item()
-                                router_loss_value = static_inputs.get('router_loss', torch.tensor(0.0)).item()
-                                loss_accumulator += loss_value
-                                router_loss_accumulator += router_loss_value
-                                
-                                # Comptabiliser les tokens traités
-                                batch_size = x.size(0) if args.use_streaming_dataset or args.mode == 'pretrain' else batch['input_ids'].size(0)
-                                batch_tokens = batch_size * args.block_size
-                                total_tokens += batch_tokens
-                                
-                                print(f"Nouveau graphe CUDA capturé pour micro_step {micro_step}")
-                        else:
-                            # CAS 3: EXÉCUTION NORMALE SANS CUDA GRAPH
-                            with timing_stats.track(f"forward_{micro_step}"):
-                                # Forward pass normal
+                                    for k, v in batch.items():
+                                        static_inputs[k].copy_(v)
+                            
+                            # Exécuter le graphe CUDA préalablement capturé
+                            cuda_graphs[cuda_graph_key].replay()
+                            
+
+                            # Récupérer les résultats depuis les tenseurs statiques
+                            loss_value = static_inputs['loss'].item()
+                            router_loss_value = static_inputs.get('router_loss', torch.tensor(0.0)).item()
+                            
+                                # Mise à jour des statistiques
+                            loss_accumulator += loss_value
+                            router_loss_accumulator += router_loss_value
+                            
+                            # Comptabiliser les tokens traités
+                            batch_size = x.size(0) if args.use_streaming_dataset or args.mode == 'pretrain' else batch['input_ids'].size(0)
+                            batch_tokens = batch_size * args.block_size
+                            total_tokens += batch_tokens
+                            
+                        if iter_num % 100 == 0 and micro_step == 0:
+                            print(f"Réutilisation du graphe CUDA pour micro_step {micro_step}")
+                            
+                    elif use_graph_for_step and iter_num == 1 and micro_step < max_graphs_per_shape:
+                        # CAS 2: CAPTURE D'UN NOUVEAU GRAPHE CUDA
+                        with timing_stats.track(f"cuda_graph_capture_{micro_step}"):
+                            # Créer des copies des entrées
+                            static_inputs = {}
+                            if args.use_streaming_dataset or args.mode == 'pretrain':
+                                static_inputs['x'] = x.clone()
+                                static_inputs['y'] = y.clone()
+                            else:
+                                static_inputs = {k: v.clone() for k, v in batch.items()}
+                            
+                            # Préparer les tenseurs de sortie
+                            static_inputs['loss'] = torch.zeros(1, device=device)
+                            if args.mode == 'pretrain':
+                                static_inputs['router_loss'] = torch.zeros(1, device=device)
+                            
+                            # Synchroniser et préparer le graphe
+                            torch.cuda.synchronize()
+                            cuda_graphs[cuda_graph_key] = torch.cuda.CUDAGraph()
+                            
+                            # Capturer le graphe complet (forward + backward)
+                            with torch.cuda.graph(cuda_graphs[cuda_graph_key]):
+                                # Forward
                                 with torch.amp.autocast(enabled=True, device_type='cuda') if ctx else nullcontext():
                                     if args.use_streaming_dataset or args.mode == 'pretrain':
-                                        outputs = model(x, targets=y)
+                                        outputs = model(static_inputs['x'], targets=static_inputs['y'])
                                     else:
-                                        outputs = model(**batch)
+                                        outputs = model(**{k: static_inputs[k] for k in batch.keys()})
                                     
-                                    # Traitement de la loss selon le format des outputs
-                                    if isinstance(outputs, dict):
-                                        loss = outputs['loss']
-                                        router_loss = outputs.get('router_loss', None)
-                                    elif isinstance(outputs, tuple) and len(outputs) >= 2:
-                                        # Tuple format (logits, loss, [router_loss])
-                                        _, loss = outputs[:2]
-                                        router_loss = outputs[2] if len(outputs) > 2 else None
-                                    else:
-                                        # Fallback 
-                                        loss = outputs
-                                        router_loss = None
+                                    # Traitement de la loss
+                                    loss = outputs['loss']
+                                    static_inputs['loss'].copy_(loss.detach())
                                     
                                     # Router loss si présent
-                                    if router_loss is not None and args.mode == 'pretrain':
-                                        router_loss = router_loss * args.router_loss_weight
-                                        loss = loss + router_loss
-                                        router_loss_value = router_loss.item()
-                                    else:
-                                        router_loss_value = 0.0
+                                    if args.mode == 'pretrain' and 'router_loss' in outputs:
+                                        router_loss = outputs['router_loss'] 
+                                        static_inputs['router_loss'].copy_(router_loss.detach())
+                                        # Combiner les pertes pour le backward
+                                        loss = loss + router_loss * args.router_loss_weight
                                     
-                                    # Mise à jour des statistiques
-                                    loss_accumulator += loss.item()
-                                    router_loss_accumulator += router_loss_value
-                                    
-                                    # Comptabiliser les tokens traités
-                                    batch_size = x.size(0) if args.use_streaming_dataset or args.mode == 'pretrain' else batch['input_ids'].size(0)
-                                    batch_tokens = batch_size * args.block_size
-                                    total_tokens += batch_tokens
-                                    
-                                    # Backward pass
+                                    # Backward
                                     micro_loss = loss / args.gradient_accumulation_steps
                                     if scaler is not None:
                                         scaler.scale(micro_loss).backward()
                                     else:
                                         micro_loss.backward()
+                            
+                            # Stocker le graphe et les entrées pour réutilisation
+                            static_input_shapes[cuda_graph_key] = static_inputs
+                            
+                            # Mise à jour des statistiques après la capture
+                            loss_value = static_inputs['loss'].item()
+                            router_loss_value = static_inputs.get('router_loss', torch.tensor(0.0)).item()
+                            loss_accumulator += loss_value
+                            router_loss_accumulator += router_loss_value
+                            
+                            # Comptabiliser les tokens traités
+                            batch_size = x.size(0) if args.use_streaming_dataset or args.mode == 'pretrain' else batch['input_ids'].size(0)
+                            batch_tokens = batch_size * args.block_size
+                            total_tokens += batch_tokens
+                            
+                            print(f"Nouveau graphe CUDA capturé pour micro_step {micro_step}")
+                    else:
+                        # CAS 3: EXÉCUTION NORMALE SANS CUDA GRAPH
+                            # Forward pass normal
+                        with torch.amp.autocast(enabled=True, device_type='cuda') if ctx else nullcontext():
+                            with timing_stats.track(f"forward_{micro_step}"):
+                                if args.use_streaming_dataset or args.mode == 'pretrain':
+                                    outputs = model(x, targets=y)
+                                else:
+                                    outputs = model(**batch)
+                                
+                                # Traitement de la loss selon le format des outputs
+                                if isinstance(outputs, dict):
+                                    loss = outputs['loss']
+                                    router_loss = outputs.get('router_loss', None)
+                                elif isinstance(outputs, tuple) and len(outputs) >= 2:
+                                    # Tuple format (logits, loss, [router_loss])
+                                    _, loss = outputs[:2]
+                                    router_loss = outputs[2] if len(outputs) > 2 else None
+                                else:
+                                    # Fallback 
+                                    loss = outputs
+                                    router_loss = None
+                                
+                                # Router loss si présent
+                                if router_loss is not None and args.mode == 'pretrain':
+                                    router_loss = router_loss * args.router_loss_weight
+                                    loss = loss + router_loss
+                                    router_loss_value = router_loss.item()
+                                else:
+                                    router_loss_value = 0.0
+                                
+                                # Mise à jour des statistiques
+                                loss_accumulator += loss.item()
+                                router_loss_accumulator += router_loss_value
+                                
+                                # Comptabiliser les tokens traités
+                                batch_size = x.size(0) if args.use_streaming_dataset or args.mode == 'pretrain' else batch['input_ids'].size(0)
+                                batch_tokens = batch_size * args.block_size
+                                total_tokens += batch_tokens
+                            with timing_stats.track(f"backward_{micro_step}"):
+                                # Backward pass
+                                micro_loss = loss / args.gradient_accumulation_steps
+                                if scaler is not None:
+                                    scaler.scale(micro_loss).backward()
+                                else:
+                                    micro_loss.backward()
                 
                 # Calculate tokens per second
                 tokens_per_sec = total_tokens / (time.time() - batch_start_time) if total_tokens > 0 else 0
@@ -1552,7 +1552,7 @@ def main():
     parser.add_argument('--beta1', type=float, default=0.9, help='Adam beta1')
     parser.add_argument('--beta2', type=float, default=0.95, help='Adam beta2')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping')
-    parser.add_argument('--router_loss_weight', type=float, default=0.001, help='Router loss weight')
+    parser.add_argument('--router_loss_weight', type=float, default=0.1, help='Router loss weight')
     
     # Training control
     parser.add_argument('--max_iters', type=int, default=100000, help='Max training iterations')
