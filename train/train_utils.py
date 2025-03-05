@@ -567,7 +567,6 @@ def calculate_model_flops(model, batch_size, seq_length, dtype=torch.float16):
     # Calculer le total des FLOPS par token
     num_layers = getattr(config, 'n_layer', 24)  # n_layer dans LLaDAConfig correspond à num_hidden_layers
     flops_per_token = num_layers * (attention_flops + mlp_flops * moe_factor)
-    flops_per_token = config.get('num_hidden_layers', 24) * (attention_flops + mlp_flops * moe_factor)
     
     # Calculer le total des FLOPS pour le batch
     total_flops = batch_size * seq_length * flops_per_token * dtype_factor
