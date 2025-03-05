@@ -19,7 +19,7 @@ def get_datasets(block_size, batch_size, device, tokenizer=None):
     """
     try:
         # Essayer d'abord d'importer FinewebDataset
-        from data.data_loader import FinewebDataset
+        from data.data_loader_original import FinewebDataset
         
         print("Using FinewebDataset for training")
         train_dataset = FinewebDataset(
