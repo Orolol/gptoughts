@@ -199,7 +199,7 @@ class LLaDAModel(nn.Module):
         return logits, loss, total_router_loss
     
     @torch.no_grad()
-    def generate(self, prompt, steps=32, gen_length=32, block_length=32, temperature=None, remasking='low_confidence'):
+    def generate(self, prompt, steps=32, gen_length=32, block_length=32, temperature=None, tokenizer=None, remasking='low_confidence'):
         """
         Generate text using LLaDA diffusion process.
         
