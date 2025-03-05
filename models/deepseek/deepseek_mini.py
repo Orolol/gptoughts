@@ -644,7 +644,17 @@ class DeepSeekMini(nn.Module):
             all_hidden_states = all_hidden_states + (hidden_states,)
 
         # Calculate total balance loss
-        total_balance_loss = torch.stack(all_balance_losses).mean()
+        # Ensure all elements in all_balance_losses are tensors, not tuples
+        tensor_balance_losses = []
+        for loss in all_balance_losses:
+            if isinstance(loss, tuple):
+                # Si c'est un tuple, on extrait le tenseur de perte (généralement le premier élément)
+                tensor_balance_losses.append(loss[0] if isinstance(loss[0], torch.Tensor) else torch.tensor(0.0, device=hidden_states.device))
+            else:
+                # Si c'est déjà un tenseur, on l'ajoute directement
+                tensor_balance_losses.append(loss)
+        
+        total_balance_loss = torch.stack(tensor_balance_losses).mean()
 
         if not return_dict:
             return tuple(v for v in [
