@@ -725,7 +725,7 @@ class Trainer:
     
     def evaluate_model(self):
         """Évalue le modèle sur les ensembles d'entraînement et de validation"""
-        from train_utils import estimate_loss
+        from train.train_utils import estimate_loss
         
         print("Validation")
         # Use utility function for loss estimation
@@ -742,22 +742,6 @@ class Trainer:
         
         print(f"step {self.iter_num}: train loss {losses['train']:.4f}, train ppl {losses['train_ppl']:.2f}, "
               f"val loss {losses['val']:.4f}, val ppl {losses['val_ppl']:.2f}")
-        
-        # Log to wandb if enabled
-        if hasattr(self.args, 'wandb_log') and self.args.wandb_log:
-            import wandb
-            wandb.log({
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "train/perplexity": losses['train_ppl'],
-                "val/perplexity": losses['val_ppl'],
-                # Include router losses if available
-                "train/router_loss": losses.get('train_router_loss', 0.0),
-                "val/router_loss": losses.get('val_router_loss', 0.0),
-                "lr": self.optimizer.param_groups[0]['lr'],
-                "iter": self.iter_num,
-                "total_tokens": self.total_tokens
-            })
         
         # Save checkpoint if best validation loss
         if losses['val'] < self.best_val_loss or self.args.always_save_checkpoint:
