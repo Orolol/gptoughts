@@ -1,6 +1,7 @@
 """
 Script d'entraînement générique pour les modèles LLM.
 Ce script peut être utilisé pour entraîner différents types de modèles (DeepSeek, LLaDA, etc.)
+Optimisé pour maximiser l'utilisation du GPU.
 """
 
 import os
@@ -20,11 +21,21 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import destroy_process_group, barrier as dist_barrier
 from torch.amp import GradScaler
 
-# Import des fonctions d'optimisation GPU
-from gpu_optimization import (
-    setup_cuda_optimizations, cleanup_memory, print_memory_stats, 
-    print_gpu_stats, preallocate_cuda_memory
-)
+# Essayer d'importer les fonctions d'optimisation GPU avancées
+try:
+    from gpu_optimization_enhanced import (
+        setup_enhanced_cuda_optimizations as setup_cuda_optimizations,
+        cleanup_memory, print_memory_stats, print_enhanced_gpu_stats as print_gpu_stats,
+        preallocate_cuda_memory, optimize_attention_operations
+    )
+    ENHANCED_OPTIMIZATIONS = True
+except ImportError:
+    # Fallback sur les optimisations standard
+    from gpu_optimization import (
+        setup_cuda_optimizations, cleanup_memory, print_memory_stats,
+        print_gpu_stats, preallocate_cuda_memory
+    )
+    ENHANCED_OPTIMIZATIONS = False
 
 # Import des fonctions utilitaires
 from train.train_utils import (
@@ -52,7 +63,7 @@ class Trainer:
         self.setup_training()
         
     def setup_environment(self):
-        """Configure l'environnement d'exécution (DDP, device, etc.)"""
+        """Configure l'environnement d'exécution (DDP, device, etc.) avec optimisations avancées"""
         # Distributed setup
         self.ddp = int(os.environ.get('RANK', -1)) != -1
         if self.ddp:
@@ -79,7 +90,14 @@ class Trainer:
         if hasattr(self.args, 'dtype'):
             self.dtype = self.args.dtype
         else:
-            self.dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+            # Choisir le meilleur dtype en fonction du GPU
+            if torch.cuda.is_available():
+                if torch.cuda.is_bf16_supported():
+                    self.dtype = 'bfloat16'  # Meilleur pour les GPUs récents (Ampere+)
+                else:
+                    self.dtype = 'float16'   # Pour les GPUs plus anciens
+            else:
+                self.dtype = 'float32'       # CPU
             
         print(f"Using dtype: {self.dtype}")
         self.ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[self.dtype]
@@ -88,12 +106,31 @@ class Trainer:
         # Apply CUDA optimizations if available
         if torch.cuda.is_available():
             setup_cuda_optimizations()
+            
+            # Optimiser les opérations d'attention si les optimisations avancées sont disponibles
+            if ENHANCED_OPTIMIZATIONS and hasattr(self.args, 'optimize_attention') and self.args.optimize_attention:
+                optimize_attention_operations()
+            
+            # Préallouer la mémoire CUDA si demandé
             if hasattr(self.args, 'preallocate_memory') and self.args.preallocate_memory:
                 preallocate_cuda_memory()
+                
+            # Afficher les statistiques GPU détaillées
+            if self.master_process:
+                print_gpu_stats()
         
         # Calculate tokens per iteration for logging
         self.tokens_per_iter = self.args.batch_size * self.args.block_size * self.args.gradient_accumulation_steps * self.ddp_world_size
         print(f"Tokens per iteration: {self.tokens_per_iter:,}")
+        
+        # Configurer les optimisations de mémoire CUDA
+        if torch.cuda.is_available():
+            # Réserver un pourcentage plus élevé de la mémoire pour PyTorch
+            torch.cuda.set_per_process_memory_fraction(0.95)
+            
+            # Configurer l'allocateur CUDA pour une meilleure gestion de la mémoire
+            if hasattr(torch.cuda, 'memory_stats'):
+                os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8"
         
     def setup_model(self):
         """Initialise le modèle en fonction du type spécifié"""
@@ -451,18 +488,32 @@ class Trainer:
         print_memory_stats("Initial")
     
     def train(self):
-        """Exécute la boucle d'entraînement principale"""
+        """Exécute la boucle d'entraînement principale avec optimisations GPU avancées"""
         model_type = self.args.model_type.lower()
+        
+        # Optimisations pour maximiser l'utilisation du GPU
+        if torch.cuda.is_available():
+            # Précharger les poids du modèle en mémoire GPU
+            for param in self.model.parameters():
+                if param.device.type != 'cuda':
+                    param.data = param.data.to(self.device)
+            
+            # Optimiser le scheduler de CUDA
+            if hasattr(torch.cuda, 'cudart'):
+                torch.cuda.cudart().cudaProfilerStart()
+            
+            # Synchroniser avant de commencer l'entraînement
+            torch.cuda.synchronize()
         
         # Training loop
         while True:
             # Determine and set the learning rate for this iteration
             with self.timing_stats.track("lr_update"):
                 lr = get_lr(
-                    self.iter_num, 
-                    self.args.warmup_iters, 
-                    self.args.lr_decay_iters, 
-                    self.args.learning_rate, 
+                    self.iter_num,
+                    self.args.warmup_iters,
+                    self.args.lr_decay_iters,
+                    self.args.learning_rate,
                     self.args.min_lr
                 ) if self.args.decay_lr else self.args.learning_rate
                 
@@ -483,39 +534,57 @@ class Trainer:
             
             # Forward backward update, with gradient accumulation
             with self.timing_stats.track("optimization"):
+                # Utiliser set_to_none=True pour une meilleure performance
                 self.optimizer.zero_grad(set_to_none=True)
                 total_loss = 0
                 total_router_loss = 0
                 skip_optimizer_step = False
                 
                 try:
+                    # Précharger le premier batch en dehors de la boucle pour masquer la latence
+                    try:
+                        next_batch = next(self.train_iterator)
+                    except StopIteration:
+                        self.train_iterator = iter(self.train_dataset)
+                        next_batch = next(self.train_iterator)
+                    
                     for micro_step in range(self.args.gradient_accumulation_steps):
                         if self.ddp:
+                            # Synchroniser les gradients seulement à la dernière étape d'accumulation
                             self.model.require_backward_grad_sync = (
                                 micro_step == self.args.gradient_accumulation_steps - 1
                             )
                         
                         # Track data loading time
                         with self.timing_stats.track("data_loading"):
+                            # Utiliser le batch préchargé
+                            batch = next_batch
+                            
+                            # Précharger le prochain batch en parallèle
                             try:
-                                batch = next(self.train_iterator)
+                                next_batch = next(self.train_iterator)
                             except StopIteration:
                                 self.train_iterator = iter(self.train_dataset)
-                                batch = next(self.train_iterator)
+                                next_batch = next(self.train_iterator)
                             
                             # Handle different batch formats
                             if isinstance(batch, dict):
-                                input_ids = batch['input_ids'].to(self.device)
-                                targets = batch.get('labels', input_ids).to(self.device)
+                                # Transférer les données au GPU de manière asynchrone
+                                input_ids = batch['input_ids'].to(self.device, non_blocking=True)
+                                targets = batch.get('labels', input_ids).to(self.device, non_blocking=True)
                             elif isinstance(batch, tuple) and len(batch) >= 2:
-                                input_ids = batch[0].to(self.device)
-                                targets = batch[-1].to(self.device)
+                                input_ids = batch[0].to(self.device, non_blocking=True)
+                                targets = batch[-1].to(self.device, non_blocking=True)
                             else:
-                                input_ids = batch.to(self.device)
-                                targets = batch.to(self.device)
+                                input_ids = batch.to(self.device, non_blocking=True)
+                                targets = batch.to(self.device, non_blocking=True)
                         
-                        # Forward pass
+                        # Forward pass avec optimisations
                         with self.timing_stats.track("forward"), torch.amp.autocast(enabled=True, device_type=self.device_type):
+                            # Synchroniser avant le forward pass pour s'assurer que les données sont sur le GPU
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                            
                             # Handle different model types
                             if model_type == 'deepseek':
                                 # DeepSeek model returns a dict
@@ -571,7 +640,7 @@ class Trainer:
                             if 'hidden_states' in locals():
                                 del hidden_states
                         
-                        # Backward pass
+                        # Backward pass avec optimisations
                         with self.timing_stats.track("backward"):
                             if loss is not None:
                                 # Scale loss for gradient accumulation
@@ -609,7 +678,7 @@ class Trainer:
                         dist_barrier()
                     continue
                 
-                # Optimizer step
+                # Optimizer step avec optimisations
                 with self.timing_stats.track("optimizer_step"):
                     if self.args.grad_clip != 0.0:
                         self.scaler.unscale_(self.optimizer)
@@ -618,8 +687,13 @@ class Trainer:
                             self.args.grad_clip
                         )
                     
+                    # Étape d'optimisation avec synchronisation
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                    
+                    # Synchroniser après l'étape d'optimisation pour maximiser l'utilisation du GPU
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
             
             # Timing and logging
             t1 = time.time()
@@ -628,6 +702,10 @@ class Trainer:
             
             if self.iter_num % self.args.log_interval == 0:
                 self.log_training_stats(total_loss, total_router_loss, dt, lr)
+                
+                # Afficher les statistiques GPU périodiquement
+                if self.iter_num % 100 == 0 and self.master_process and torch.cuda.is_available():
+                    print_gpu_stats()
                 
                 # Save checkpoint periodically
                 if self.iter_num % 1000 == 0 and self.master_process:
@@ -648,7 +726,12 @@ class Trainer:
         if self.ddp:
             destroy_process_group()
         
+        # Nettoyage final
         cleanup_memory()
+        
+        # Arrêter le profiler CUDA si activé
+        if torch.cuda.is_available() and hasattr(torch.cuda, 'cudart'):
+            torch.cuda.cudart().cudaProfilerStop()
         
         if self.master_process:
             print("Training finished!")
