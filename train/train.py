@@ -462,6 +462,7 @@ class Trainer:
                 print(f"Compilation failed: {e}")
                 print(traceback.format_exc())
                 self.args.compile = False
+            print("Compilation finished")
         
         # Initialize timing variables
         self.t0 = time.time()
