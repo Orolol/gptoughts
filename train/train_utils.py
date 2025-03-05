@@ -498,102 +498,103 @@ class AveragedTimingStats:
                     print(f"{name}: {time*1000:.1f}ms ({percentages[name]:.1f}%)")
     
     
-    def calculate_model_flops(model, batch_size, seq_length, dtype=torch.float16):
-        """
-        Calcule le nombre de FLOPS pour un modèle donné.
-        
-        Args:
-            model: Le modèle pour lequel calculer les FLOPS
-            batch_size: Taille du batch
-            seq_length: Longueur de la séquence
-            dtype: Type de données (torch.float16 par défaut pour les calculs en fp16)
-        
-        Returns:
-            float: Nombre total de FLOPS
-        """
-        # Déterminer le type de modèle et ses paramètres
-        model_type = model.__class__.__name__
-        
-        # Obtenir les paramètres de configuration du modèle
-        if hasattr(model, 'config'):
-            config = model.config
-        else:
-            # Si le modèle n'a pas d'attribut config, essayer de déduire les paramètres
-            config = {}
-            if hasattr(model, 'hidden_size'):
-                config['hidden_size'] = model.hidden_size
-            else:
-                config['hidden_size'] = 2048  # Valeur par défaut
-                
-            if hasattr(model, 'num_hidden_layers'):
-                config['num_hidden_layers'] = model.num_hidden_layers
-            else:
-                config['num_hidden_layers'] = 24  # Valeur par défaut
-                
-            if hasattr(model, 'num_attention_heads'):
-                config['num_attention_heads'] = model.num_attention_heads
-            else:
-                config['num_attention_heads'] = 16  # Valeur par défaut
-                
-            if hasattr(model, 'intermediate_size'):
-                config['intermediate_size'] = model.intermediate_size
-            else:
-                config['intermediate_size'] = 4096  # Valeur par défaut
-        
-        # Facteur de multiplication pour le type de données
-        # fp16 est 2x plus rapide que fp32 sur la plupart des GPUs modernes
-        dtype_factor = 2.0 if dtype == torch.float16 else 1.0
-        
-        # Calculer les FLOPS pour l'attention
-        # Pour chaque couche: 4 * hidden_size^2 (projections QKV et O) + 2 * seq_length * hidden_size (matmul QK et matmul V)
-        attention_flops = 4 * config.get('hidden_size', 2048)**2 + 2 * seq_length * config.get('hidden_size', 2048)
-        
-        # Calculer les FLOPS pour le MLP/FFN
-        # Pour chaque couche: 2 * hidden_size * intermediate_size (deux projections linéaires)
-        mlp_flops = 2 * config.get('hidden_size', 2048) * config.get('intermediate_size', 4096)
-        
-        # Calculer les FLOPS pour MoE si applicable
-        moe_factor = 1.0
-        if hasattr(config, 'num_experts') and hasattr(config, 'num_experts_per_token'):
-            # Pour MoE, on multiplie par le ratio d'experts utilisés par token
-            moe_factor = config.num_experts_per_token / config.num_experts
-        
-        # Calculer le total des FLOPS par token
-        flops_per_token = config.get('num_hidden_layers', 24) * (attention_flops + mlp_flops * moe_factor)
-        
-        # Calculer le total des FLOPS pour le batch
-        total_flops = batch_size * seq_length * flops_per_token * dtype_factor
-        
-        return total_flops
+
+def calculate_model_flops(model, batch_size, seq_length, dtype=torch.float16):
+    """
+    Calcule le nombre de FLOPS pour un modèle donné.
     
-    def estimate_mfu(model, batch_size, seq_length, dt, dtype=torch.float16):
-        """
-        Estime l'utilisation des FLOPS du modèle (MFU) en pourcentage.
-        
-        Args:
-            model: Le modèle pour lequel estimer la MFU
-            batch_size: Taille du batch
-            seq_length: Longueur de la séquence
-            dt: Temps d'exécution en secondes
-            dtype: Type de données (torch.float16 par défaut pour les calculs en fp16)
-        
-        Returns:
-            float: MFU en pourcentage
-        """
-        # Calculer les FLOPS totaux pour le modèle
-        total_flops = calculate_model_flops(model, batch_size, seq_length, dtype)
-        
-        # Obtenir les capacités de calcul du GPU
-        device = next(model.parameters()).device
-        if device.type == 'cuda' and hasattr(torch.cuda, 'get_device_capability'):
-            device_cap = torch.cuda.get_device_capability(device)
-            # Obtenir les FLOPS théoriques du GPU
-            gpu_flops = GPU_FLOPS.get(device_cap, 14e12)  # Défaut à A100 si non trouvé
+    Args:
+        model: Le modèle pour lequel calculer les FLOPS
+        batch_size: Taille du batch
+        seq_length: Longueur de la séquence
+        dtype: Type de données (torch.float16 par défaut pour les calculs en fp16)
+    
+    Returns:
+        float: Nombre total de FLOPS
+    """
+    # Déterminer le type de modèle et ses paramètres
+    model_type = model.__class__.__name__
+    
+    # Obtenir les paramètres de configuration du modèle
+    if hasattr(model, 'config'):
+        config = model.config
+    else:
+        # Si le modèle n'a pas d'attribut config, essayer de déduire les paramètres
+        config = {}
+        if hasattr(model, 'hidden_size'):
+            config['hidden_size'] = model.hidden_size
         else:
-            gpu_flops = 14e12  # Défaut si pas sur GPU ou si on ne peut pas détecter
-        
-        # Calculer la MFU
-        mfu = total_flops / (dt * gpu_flops)
-        
-        # Retourner en pourcentage
-        return mfu * 100
+            config['hidden_size'] = 2048  # Valeur par défaut
+            
+        if hasattr(model, 'num_hidden_layers'):
+            config['num_hidden_layers'] = model.num_hidden_layers
+        else:
+            config['num_hidden_layers'] = 24  # Valeur par défaut
+            
+        if hasattr(model, 'num_attention_heads'):
+            config['num_attention_heads'] = model.num_attention_heads
+        else:
+            config['num_attention_heads'] = 16  # Valeur par défaut
+            
+        if hasattr(model, 'intermediate_size'):
+            config['intermediate_size'] = model.intermediate_size
+        else:
+            config['intermediate_size'] = 4096  # Valeur par défaut
+    
+    # Facteur de multiplication pour le type de données
+    # fp16 est 2x plus rapide que fp32 sur la plupart des GPUs modernes
+    dtype_factor = 2.0 if dtype == torch.float16 else 1.0
+    
+    # Calculer les FLOPS pour l'attention
+    # Pour chaque couche: 4 * hidden_size^2 (projections QKV et O) + 2 * seq_length * hidden_size (matmul QK et matmul V)
+    attention_flops = 4 * config.get('hidden_size', 2048)**2 + 2 * seq_length * config.get('hidden_size', 2048)
+    
+    # Calculer les FLOPS pour le MLP/FFN
+    # Pour chaque couche: 2 * hidden_size * intermediate_size (deux projections linéaires)
+    mlp_flops = 2 * config.get('hidden_size', 2048) * config.get('intermediate_size', 4096)
+    
+    # Calculer les FLOPS pour MoE si applicable
+    moe_factor = 1.0
+    if hasattr(config, 'num_experts') and hasattr(config, 'num_experts_per_token'):
+        # Pour MoE, on multiplie par le ratio d'experts utilisés par token
+        moe_factor = config.num_experts_per_token / config.num_experts
+    
+    # Calculer le total des FLOPS par token
+    flops_per_token = config.get('num_hidden_layers', 24) * (attention_flops + mlp_flops * moe_factor)
+    
+    # Calculer le total des FLOPS pour le batch
+    total_flops = batch_size * seq_length * flops_per_token * dtype_factor
+    
+    return total_flops
+
+def estimate_mfu(model, batch_size, seq_length, dt, dtype=torch.float16):
+    """
+    Estime l'utilisation des FLOPS du modèle (MFU) en pourcentage.
+    
+    Args:
+        model: Le modèle pour lequel estimer la MFU
+        batch_size: Taille du batch
+        seq_length: Longueur de la séquence
+        dt: Temps d'exécution en secondes
+        dtype: Type de données (torch.float16 par défaut pour les calculs en fp16)
+    
+    Returns:
+        float: MFU en pourcentage
+    """
+    # Calculer les FLOPS totaux pour le modèle
+    total_flops = calculate_model_flops(model, batch_size, seq_length, dtype)
+    
+    # Obtenir les capacités de calcul du GPU
+    device = next(model.parameters()).device
+    if device.type == 'cuda' and hasattr(torch.cuda, 'get_device_capability'):
+        device_cap = torch.cuda.get_device_capability(device)
+        # Obtenir les FLOPS théoriques du GPU
+        gpu_flops = GPU_FLOPS.get(device_cap, 14e12)  # Défaut à A100 si non trouvé
+    else:
+        gpu_flops = 14e12  # Défaut si pas sur GPU ou si on ne peut pas détecter
+    
+    # Calculer la MFU
+    mfu = total_flops / (dt * gpu_flops)
+    
+    # Retourner en pourcentage
+    return mfu * 100
