@@ -525,7 +525,7 @@ class Trainer:
                 self.generate_sample_text()
             
             # Evaluate model periodically
-            if self.iter_num % self.args.eval_interval == 0 and self.master_process and self.iter_num > 0:
+            if False and self.iter_num % self.args.eval_interval == 0 and self.master_process and self.iter_num > 0:
                 self.evaluate_model()
             
             # Exit if eval_only is set
