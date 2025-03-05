@@ -1,436 +1,748 @@
 """
-This training script can be run both on a single gpu in debug mode,
-and also in a larger training run with distributed data parallel (ddp).
+Script d'entraînement générique pour les modèles LLM.
+Ce script peut être utilisé pour entraîner différents types de modèles (DeepSeek, LLaDA, etc.)
 """
 
 import os
 import time
-import pickle
-from contextlib import nullcontext
-import threading
-from queue import Queue
+import math
+import gc
 import glob
+import threading
+import argparse
+import traceback
+import random
+from queue import Queue
+from contextlib import nullcontext
+from collections import defaultdict
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import destroy_process_group, dist_barrier
-from torch.serialization import add_safe_globals
+from torch.distributed import destroy_process_group, barrier as dist_barrier
+from torch.amp import GradScaler
 
-from transformers import AutoTokenizer
+# Import des fonctions d'optimisation GPU
+from gpu_optimization import (
+    setup_cuda_optimizations, cleanup_memory, print_memory_stats, 
+    print_gpu_stats, preallocate_cuda_memory
+)
 
-from models.models.model import GPTConfig, GPT
-from models.llada.model import LLaDAModel, LLaDAConfig
-from data.data_loader_legacy import StreamingDataset
-from run_train import get_datasets
+# Import des fonctions utilitaires
 from train_utils import (
     get_gpu_count, setup_distributed, reduce_metrics, calculate_perplexity,
-    get_lr, cleanup_old_checkpoints, cleanup_memory, ensure_model_dtype,
-    print_memory_stats, setup_cuda_optimizations, save_checkpoint,
-    load_checkpoint, find_latest_checkpoint, get_context_manager,
-    generate_text, evaluate_model, estimate_loss
+    get_lr, cleanup_old_checkpoints, ensure_model_dtype,
+    save_checkpoint, load_checkpoint, find_latest_checkpoint, 
+    get_context_manager, AveragedTimingStats, generate_text
 )
 
-from rich.console import Console
-console = Console()
-
-access_token=os.getenv('HF_TOKEN')
-
-# -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
-# I/O
-out_dir = 'out'
-eval_interval = 1000
-log_interval = 1
-generate_interval = 100
-eval_iters = 100
-eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
-# wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
-# data
-dataset = 'openwebtext'
-data_dir = 'data/openwebtext'
-gradient_accumulation_steps = 1 # used to simulate larger batch sizes
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear layers?
-attention_backend = "sdpa" # Force specific attention backend (flash_attn_2, xformers, sdpa, or None for auto)
-
-# Configurations pour l'encoder et le decoder
-if torch.cuda.is_available():
-    device = f'cuda:{int(os.environ.get("LOCAL_RANK", 0))}'  # Use LOCAL_RANK for DDP
-    # batch_size = 16 # Réduire la taille du batch
-    # block_size = 512
-    
-    batch_size = 16
-    block_size = 64
-    
-    print(f"Using device: {device}")
-    print(f"Batch size: {batch_size}")
-    print(f"Block size: {block_size}")
-    
-    # Encoder config (plus petit)
-    encoder_n_layer = 8
-    encoder_n_head = 8  # 1024/16 = 64 par tête
-    encoder_n_embd = 768  # Doit être divisible par encoder_n_head
-    encoder_ratio_kv = 8  # 16/4 = 4 têtes KV
-    
-    # Decoder config (plus grand)
-    decoder_n_layer = 12
-    decoder_n_head = 12  # 1024/32 = 32 par tête
-    decoder_n_embd = 768  # Doit être divisible par decoder_n_head
-    decoder_ratio_kv = 8  # 32/4 = 8 têtes KV
-    
-    
-    # Optimisations mémoire
-    # gradient_accumulation_steps = max(1, 64 // (batch_size * torch.cuda.device_count()))  # Adjust for multi-GPU
-    gradient_accumulation_steps = 8  # Augmenter l'accumulation
-    
-    print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
-    
-    # Activer la gestion de mémoire optimisée
-    setup_cuda_optimizations()
-else:
-    device = 'cpu'
-    batch_size = 2
-    block_size = 64
-    
-    # Encoder config (minimal)
-    encoder_n_layer = 1
-    encoder_n_head = 1
-    encoder_n_embd = 2
-    encoder_ratio_kv = 1
-    
-    # Decoder config (minimal)
-    decoder_n_layer = 1
-    decoder_n_head = 1
-    decoder_n_embd = 2
-    decoder_ratio_kv = 1
-
-# adamw optimizer
-learning_rate = 1e-3 # ajusté pour AdEMAMix
-max_iters = 600000 # total number of training iterations
-weight_decay = 0.1
-beta1 = 0.9
-beta2 = 0.999
-beta3 = 0.9999  # nouveau paramètre pour AdEMAMix
-alpha = 8.0  # nouveau paramètre pour AdEMAMix
-beta3_warmup = alpha_warmup = 256_000  # périodes de warmup pour AdEMAMix
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
-# learning rate decay settings
-decay_lr = True # whether to decay the learning rate
-warmup_iters = 1000 / gradient_accumulation_steps # how many steps to warm up for
-lr_decay_iters = 600000 / gradient_accumulation_steps # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-# DDP settings
-backend = 'nccl' # 'nccl', 'gloo', etc.
-
-
-compile = False # use PyTorch 2.0 to compile the model to be faster
-# -----------------------------------------------------------------------------
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
-config = {k: globals()[k] for k in config_keys} # will be useful for logging
-# -----------------------------------------------------------------------------
-
-# various inits, derived attributes, I/O setup
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-if ddp:
-    ddp_rank, ddp_local_rank, ddp_world_size, device = setup_distributed(backend=backend)
-    master_process = ddp_rank == 0
-    seed_offset = ddp_rank
-else:
-    master_process = True
-    seed_offset = 0
-    ddp_world_size = 1
-
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
-
-if master_process:
-    os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
-device_type = 'cuda' if 'cuda' in device else 'cpu'
-# dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
-dtype = 'float16'
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = get_context_manager(device_type, dtype)
-
-print(f"Device type: {device_type}")
-print(f"PT dtype: {ptdtype}")
-
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True, access_token=access_token)
-tokenizer.pad_token = tokenizer.eos_token
-
-decode = lambda tokens: tokenizer.decode(tokens, skip_special_tokens=True)
-
-# init these up here, can override if init_from='resume'
-iter_num = 1
-best_val_loss = 1e9
-
-# model init
-vocab_size = len(tokenizer)
-
-# Créer les configurations pour l'encodeur et le décodeur
-encoder_config = GPTConfig(
-    n_layer=encoder_n_layer,
-    n_head=encoder_n_head,
-    n_embd=encoder_n_embd,
-    block_size=block_size,
-    ratio_kv=encoder_ratio_kv,
-    bias=bias,
-    vocab_size=vocab_size,
-    dropout=dropout,
-    attention_backend=attention_backend
-)
-
-decoder_config = GPTConfig(
-    n_layer=decoder_n_layer,
-    n_head=decoder_n_head,
-    n_embd=decoder_n_embd,
-    block_size=block_size,
-    ratio_kv=decoder_ratio_kv,
-    bias=bias,
-    vocab_size=vocab_size,
-    dropout=dropout,
-    attention_backend=attention_backend
-)
-
-# Store model arguments for checkpointing
-model_args = {
-    'llada_config': {
-        'block_size': block_size,
-        'vocab_size': vocab_size,
-        'n_layer': encoder_n_layer,
-        'n_head': encoder_n_head,
-        'n_embd': encoder_n_embd,
-        'dropout': dropout,
-        'bias': bias,
-        'ratio_kv': encoder_n_head // encoder_ratio_kv,
-        'use_checkpoint': False
-    },
-    'vocab_size': vocab_size,
-    'block_size': block_size
-}
-
-# Ajouter après les imports, avant le chargement du checkpoint
-add_safe_globals([GPTConfig])
-
-if init_from == 'resume':
-    print(f"Resuming training from {out_dir}")
-    # Trouver le dernier checkpoint
-    ckpt_path = find_latest_checkpoint(out_dir)
-    if ckpt_path is None:
-        print("No checkpoint found, starting from scratch")
-        init_from = 'scratch'
-    else:
-        print(f"Loading checkpoint from {ckpt_path}")
-        # Charger avec weights_only=True pour éviter de charger les buffers inutiles
-        checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+class Trainer:
+    """
+    Classe générique pour l'entraînement des modèles LLM.
+    """
+    def __init__(self, args):
+        """
+        Initialise le trainer avec les arguments fournis.
         
-        # Create LLaDAConfig from saved model_args
-        if 'llada_config' in checkpoint['model_args']:
-            # Use saved LLaDAConfig
-            llada_config_dict = checkpoint['model_args']['llada_config']
-            llada_config = LLaDAConfig(**llada_config_dict)
+        Args:
+            args: Arguments de configuration pour l'entraînement
+        """
+        self.args = args
+        self.setup_environment()
+        self.setup_model()
+        self.setup_datasets()
+        self.setup_training()
+        
+    def setup_environment(self):
+        """Configure l'environnement d'exécution (DDP, device, etc.)"""
+        # Distributed setup
+        self.ddp = int(os.environ.get('RANK', -1)) != -1
+        if self.ddp:
+            self.ddp_rank, self.ddp_local_rank, self.ddp_world_size, self.device = setup_distributed(backend=self.args.backend)
+            self.master_process = self.ddp_rank == 0
+            self.seed_offset = self.ddp_rank
         else:
-            # Create from encoder config for backward compatibility
-            llada_config = LLaDAConfig(
-                block_size=block_size,
-                vocab_size=encoder_config.vocab_size,
-                n_layer=encoder_config.n_layer,
-                n_head=encoder_config.n_head,
-                n_embd=encoder_config.n_embd,
-                dropout=dropout,
-                bias=bias,
-                ratio_kv=encoder_config.n_head // encoder_config.ratio_kv,
+            self.master_process = True
+            self.seed_offset = 0
+            self.ddp_world_size = 1
+            self.device = self.args.device if hasattr(self.args, 'device') else 'cuda:0' if torch.cuda.is_available() else 'cpu'
+        
+        # Create output directory
+        if self.master_process:
+            os.makedirs(self.args.output_dir, exist_ok=True)
+        
+        # Set random seed
+        torch.manual_seed(1337 + self.seed_offset)
+        
+        # Setup device and dtype
+        self.device_type = 'cuda' if 'cuda' in self.device else 'cpu'
+        
+        # Determine dtype based on model type and available hardware
+        if hasattr(self.args, 'dtype'):
+            self.dtype = self.args.dtype
+        else:
+            self.dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+            
+        print(f"Using dtype: {self.dtype}")
+        self.ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[self.dtype]
+        self.ctx = get_context_manager(self.device_type, self.dtype)
+        
+        # Apply CUDA optimizations if available
+        if torch.cuda.is_available():
+            setup_cuda_optimizations()
+            if hasattr(self.args, 'preallocate_memory') and self.args.preallocate_memory:
+                preallocate_cuda_memory()
+        
+        # Calculate tokens per iteration for logging
+        self.tokens_per_iter = self.args.batch_size * self.args.block_size * self.args.gradient_accumulation_steps * self.ddp_world_size
+        print(f"Tokens per iteration: {self.tokens_per_iter:,}")
+        
+    def setup_model(self):
+        """Initialise le modèle en fonction du type spécifié"""
+        # Determine model type and initialize
+        model_type = self.args.model_type.lower()
+        
+        if self.args.init_from == 'resume':
+            print(f"Attempting to resume training from {self.args.output_dir}")
+            ckpt_path = find_latest_checkpoint(self.args.output_dir)
+            if not ckpt_path:
+                print("No checkpoints found, initializing from scratch instead")
+                self.args.init_from = 'scratch'
+            else:
+                print(f"Loading checkpoint: {ckpt_path}")
+                self.load_model_from_checkpoint(ckpt_path)
+                return
+        
+        # Initialize from scratch
+        print(f"Initializing a new {model_type} model from scratch")
+        
+        if model_type == 'deepseek':
+            from deepseek import DeepSeekMini, DeepSeekMiniConfig
+            # Create config based on model size
+            config = self.create_deepseek_config()
+            self.model = DeepSeekMini(config)
+            
+        elif model_type == 'llada':
+            from models.llada.model import LLaDAModel, LLaDAConfig
+            # Create config based on model size
+            config = self.create_llada_config()
+            self.model = LLaDAModel(config)
+            
+        else:
+            from models.models.model import GPT, GPTConfig
+            # Create config based on model size
+            config = self.create_gpt_config()
+            self.model = GPT(config)
+        
+        # Store config for checkpointing
+        self.config = config
+        
+        # Move model to device
+        self.model = self.model.to(self.device)
+        
+        # Initialize optimizer
+        self.optimizer = self.model.configure_optimizers(
+            weight_decay=self.args.weight_decay,
+            learning_rate=self.args.learning_rate,
+            betas=(self.args.beta1, self.args.beta2),
+            device_type=self.device_type
+        )
+        
+        # Initialize gradient scaler for mixed precision
+        self.scaler = GradScaler(enabled=(self.dtype == 'bfloat16' or self.dtype == 'float16'))
+        
+        # Initialize training state
+        self.iter_num = 1
+        self.best_val_loss = float('inf')
+        
+        # Print model size
+        print(f"Number of parameters: {sum(p.numel() for p in self.model.parameters())/1e6:.2f}M")
+        
+    def create_deepseek_config(self):
+        """Crée une configuration pour le modèle DeepSeek Mini"""
+        from deepseek import DeepSeekMiniConfig
+        
+        # Determine model size parameters
+        if self.args.size == 'small':
+            config = DeepSeekMiniConfig(
+                vocab_size=self.args.vocab_size,
+                hidden_size=1024,
+                num_hidden_layers=8,
+                num_attention_heads=8,
+                head_dim=64,
+                intermediate_size=2816,
+                num_experts=8,
+                num_experts_per_token=2,
+                max_position_embeddings=self.args.block_size,
+                kv_compression_dim=64,
+                query_compression_dim=192,
+                rope_head_dim=32,
+                dropout=self.args.dropout,
+                attention_dropout=self.args.dropout,
+                hidden_dropout=self.args.dropout,
+                bias=self.args.bias
+            )
+        elif self.args.size == 'medium':
+            config = DeepSeekMiniConfig(
+                vocab_size=self.args.vocab_size,
+                hidden_size=2048,
+                num_hidden_layers=24,
+                num_attention_heads=16,
+                head_dim=128,
+                intermediate_size=4096,
+                num_experts=32,
+                num_experts_per_token=4,
+                max_position_embeddings=self.args.block_size,
+                kv_compression_dim=128,
+                query_compression_dim=384,
+                rope_head_dim=32,
+                dropout=self.args.dropout,
+                attention_dropout=self.args.dropout,
+                hidden_dropout=self.args.dropout,
+                bias=self.args.bias
+            )
+        else:  # large
+            config = DeepSeekMiniConfig(
+                vocab_size=self.args.vocab_size,
+                hidden_size=3072,
+                num_hidden_layers=32,
+                num_attention_heads=24,
+                head_dim=128,
+                intermediate_size=8192,
+                num_experts=64,
+                num_experts_per_token=4,
+                max_position_embeddings=self.args.block_size,
+                kv_compression_dim=256,
+                query_compression_dim=768,
+                rope_head_dim=32,
+                dropout=self.args.dropout,
+                attention_dropout=self.args.dropout,
+                hidden_dropout=self.args.dropout,
+                bias=self.args.bias
+            )
+        
+        return config
+    
+    def create_llada_config(self):
+        """Crée une configuration pour le modèle LLaDA"""
+        from models.llada.model import LLaDAConfig
+        
+        # Determine model size parameters
+        if self.args.size == 'small':
+            config = LLaDAConfig(
+                block_size=self.args.block_size,
+                vocab_size=self.args.vocab_size,
+                n_layer=8,
+                n_head=8,
+                n_embd=768,
+                dropout=self.args.dropout,
+                bias=self.args.bias,
+                ratio_kv=8,
+                use_checkpoint=False
+            )
+        elif self.args.size == 'medium':
+            config = LLaDAConfig(
+                block_size=self.args.block_size,
+                vocab_size=self.args.vocab_size,
+                n_layer=12,
+                n_head=12,
+                n_embd=1024,
+                dropout=self.args.dropout,
+                bias=self.args.bias,
+                ratio_kv=8,
+                use_checkpoint=False
+            )
+        else:  # large
+            config = LLaDAConfig(
+                block_size=self.args.block_size,
+                vocab_size=self.args.vocab_size,
+                n_layer=24,
+                n_head=16,
+                n_embd=1536,
+                dropout=self.args.dropout,
+                bias=self.args.bias,
+                ratio_kv=8,
                 use_checkpoint=False
             )
         
-        model = LLaDAModel(llada_config)
+        return config
+    
+    def create_gpt_config(self):
+        """Crée une configuration pour le modèle GPT standard"""
+        from models.models.model import GPTConfig
         
-        # Nettoyer le state dict avant chargement
-        state_dict = checkpoint['model']
-        unwanted_prefix = '_orig_mod.'
-        cleaned_state_dict = {}
+        # Determine model size parameters
+        if self.args.size == 'small':
+            config = GPTConfig(
+                n_layer=8,
+                n_head=8,
+                n_embd=768,
+                block_size=self.args.block_size,
+                bias=self.args.bias,
+                vocab_size=self.args.vocab_size,
+                dropout=self.args.dropout,
+                attention_backend=self.args.attention_backend if hasattr(self.args, 'attention_backend') else None
+            )
+        elif self.args.size == 'medium':
+            config = GPTConfig(
+                n_layer=12,
+                n_head=12,
+                n_embd=1024,
+                block_size=self.args.block_size,
+                bias=self.args.bias,
+                vocab_size=self.args.vocab_size,
+                dropout=self.args.dropout,
+                attention_backend=self.args.attention_backend if hasattr(self.args, 'attention_backend') else None
+            )
+        else:  # large
+            config = GPTConfig(
+                n_layer=24,
+                n_head=16,
+                n_embd=1536,
+                block_size=self.args.block_size,
+                bias=self.args.bias,
+                vocab_size=self.args.vocab_size,
+                dropout=self.args.dropout,
+                attention_backend=self.args.attention_backend if hasattr(self.args, 'attention_backend') else None
+            )
         
-        for k, v in state_dict.items():
-            if k.startswith(unwanted_prefix):
-                cleaned_state_dict[k[len(unwanted_prefix):]] = v
+        return config
+    
+    def load_model_from_checkpoint(self, ckpt_path):
+        """Charge un modèle à partir d'un checkpoint"""
+        checkpoint = torch.load(ckpt_path, map_location='cpu')
+        
+        # Determine model type
+        model_type = self.args.model_type.lower()
+        
+        if model_type == 'deepseek':
+            from deepseek import DeepSeekMini, DeepSeekMiniConfig
+            # Create new model with saved config
+            saved_config = DeepSeekMiniConfig(**checkpoint['model_args'])
+            self.model = DeepSeekMini(saved_config)
+            self.config = saved_config
+            
+        elif model_type == 'llada':
+            from models.llada.model import LLaDAModel, LLaDAConfig
+            # Create new model with saved config
+            if 'model_args' in checkpoint and isinstance(checkpoint['model_args'], dict):
+                if 'llada_config' in checkpoint['model_args']:
+                    llada_config_dict = checkpoint['model_args']['llada_config']
+                    saved_config = LLaDAConfig(**llada_config_dict)
+                else:
+                    # Fallback for older checkpoints
+                    saved_config = LLaDAConfig(**checkpoint['model_args'])
             else:
-                cleaned_state_dict[k] = v
+                # Create default config
+                saved_config = self.create_llada_config()
+                
+            self.model = LLaDAModel(saved_config)
+            self.config = saved_config
+            
+        else:
+            from models.models.model import GPT, GPTConfig
+            # Create new model with saved config
+            if 'model_args' in checkpoint and isinstance(checkpoint['model_args'], dict):
+                saved_config = GPTConfig(**checkpoint['model_args'])
+            else:
+                # Create default config
+                saved_config = self.create_gpt_config()
+                
+            self.model = GPT(saved_config)
+            self.config = saved_config
         
-        # Charger le state dict nettoyé
-        # Note: strict=False because LLaDAModel might have different structure
-        model.load_state_dict(cleaned_state_dict, strict=False)
-        optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+        # Load model and optimizer states
+        self.model, self.optimizer, self.iter_num, self.best_val_loss, _, _ = load_checkpoint(
+            ckpt_path, self.model, map_location='cpu'
+        )
         
-        # Libérer la mémoire explicitement
-        del checkpoint['model']
-        del state_dict
-        del cleaned_state_dict
-        torch.cuda.empty_cache()
+        if self.optimizer is None:
+            self.optimizer = self.model.configure_optimizers(
+                weight_decay=self.args.weight_decay,
+                learning_rate=self.args.learning_rate,
+                betas=(self.args.beta1, self.args.beta2),
+                device_type=self.device_type
+            )
         
-        # Charger l'optimiseur séparément et nettoyer ses états
-        if 'optimizer' in checkpoint:
-            optimizer_state = checkpoint['optimizer']
-            # Nettoyer les états de l'optimiseur qui pourraient être en float32
-            for state in optimizer_state['state'].values():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.to(dtype=ptdtype)
-            optimizer.load_state_dict(optimizer_state)
-            del optimizer_state
-            torch.cuda.empty_cache()
+        # Move model to device and ensure correct dtype
+        self.model = self.model.to(self.device)
+        self.model = ensure_model_dtype(self.model, self.ptdtype)
         
-        iter_num = checkpoint['iter_num'] + 1
-        best_val_loss = checkpoint['best_val_loss']
+        # Reset scaler
+        self.scaler = GradScaler(enabled=(self.dtype == 'bfloat16' or self.dtype == 'float16'))
         
-        # Libérer le reste de la mémoire
-        del checkpoint
-        torch.cuda.empty_cache()
-
-if init_from == 'scratch':
-    print("Initializing a new LLaDA model from scratch")
-    # Create LLaDAConfig from encoder config parameters
-    llada_config = LLaDAConfig(
-        block_size=block_size,
-        vocab_size=encoder_config.vocab_size,
-        n_layer=encoder_config.n_layer,
-        n_head=encoder_config.n_head,
-        n_embd=encoder_config.n_embd,
-        dropout=dropout,
-        bias=bias,
-        ratio_kv=encoder_config.n_head // encoder_config.ratio_kv,
-        use_checkpoint=False
-    )
-    model = LLaDAModel(llada_config)
-    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-
-# Juste avant le model.to(device):
-if compile:
-    print("Compiling the model with reduced optimization...")
-    compile_options = {
-        "mode": "max-autotune",
-        # "fullgraph": False,
-        # "dynamic": True,
-        # "backend": "inductor",
-    }
+        cleanup_memory()
     
-    # Disable gradient checkpointing before compilation
-    model.set_gradient_checkpointing(False)
+    def setup_datasets(self):
+        """Configure les datasets d'entraînement et de validation"""
+        # Import the get_datasets function from run_train
+        from run_train import get_datasets
+        
+        # Get datasets
+        if hasattr(self.args, 'tokenizer'):
+            self.train_dataset, self.val_dataset = get_datasets(
+                self.args.block_size, 
+                self.args.batch_size, 
+                self.device, 
+                tokenizer=self.args.tokenizer
+            )
+        else:
+            self.train_dataset, self.val_dataset = get_datasets(
+                self.args.block_size, 
+                self.args.batch_size, 
+                self.device
+            )
+        
+        # Create iterator
+        self.train_iterator = iter(self.train_dataset)
+        
+    def setup_training(self):
+        """Configure les paramètres d'entraînement"""
+        # Initialize timing stats
+        self.timing_stats = AveragedTimingStats(print_interval=100)
+        if hasattr(self.model, 'set_timing_stats'):
+            self.model.set_timing_stats(self.timing_stats)
+        
+        # Initialize DDP if needed
+        if self.ddp:
+            self.model = DDP(
+                self.model,
+                device_ids=[self.ddp_local_rank],
+                output_device=self.ddp_local_rank,
+                broadcast_buffers=False,
+                find_unused_parameters=False,
+                gradient_as_bucket_view=True
+            )
+            if hasattr(self.model.module, 'set_timing_stats'):
+                self.model.module.set_timing_stats(self.timing_stats)
+        
+        # Compile model if requested
+        if hasattr(self.args, 'compile') and self.args.compile:
+            print("Compiling model...")
+            if hasattr(self.model, 'set_gradient_checkpointing'):
+                self.model.set_gradient_checkpointing(True)
+            try:
+                self.model = torch.compile(self.model)
+            except Exception as e:
+                print(f"Compilation failed: {e}")
+                print(traceback.format_exc())
+                self.args.compile = False
+        
+        # Initialize timing variables
+        self.t0 = time.time()
+        self.local_iter_num = 0
+        self.running_mfu = -1.0
+        self.train_start_time = time.time()
+        self.total_tokens = 0
+        self.tokens_window = []  # Pour calculer une moyenne glissante des tokens/s
+        self.window_size = 10   # Taille de la fenêtre pour la moyenne glissante
+        
+        # Print training info
+        model_type = self.args.model_type.lower()
+        print(f"Starting training {model_type} model")
+        if model_type == 'deepseek':
+            print(f"Model size: {self.config.hidden_size}d, {self.config.num_hidden_layers}l, {self.config.num_attention_heads}h")
+            print(f"Using {self.config.num_experts} experts with top-{self.config.num_experts_per_token} routing")
+        elif model_type == 'llada':
+            print(f"Model size: {self.config.n_embd}d, {self.config.n_layer}l, {self.config.n_head}h")
+        else:
+            print(f"Model size: {self.config.n_embd}d, {self.config.n_layer}l, {self.config.n_head}h")
+            
+        print(f"Batch size: {self.args.batch_size}, Block size: {self.args.block_size}")
+        print(f"Gradient accumulation steps: {self.args.gradient_accumulation_steps}")
+        print_memory_stats("Initial")
     
-    try:
-        model = torch.compile(model, **compile_options)
-        print(f"Model compiled with mode: {compile_options['mode']}")
-    except Exception as e:
-        print(f"Warning: Model compilation failed, continuing without compilation: {e}")
-        compile = False
-        # Re-enable gradient checkpointing
-        model.set_gradient_checkpointing(True)
-
-model.to(device)
-
-# Configurer le gradient scaler
-scaler = torch.amp.GradScaler(enabled=(dtype == 'bfloat16' or dtype == 'float16'))
-
-# wrap model into DDP container
-if ddp:
-    model = DDP(
-        model, 
-        device_ids=[ddp_local_rank],
-        output_device=ddp_local_rank,
-        broadcast_buffers=False,
-        find_unused_parameters=False,  # Garder True
-        gradient_as_bucket_view=True
-    )
-
-    # Ajouter un hook pour déboguer les paramètres inutilisés si nécessaire
-    if os.environ.get('TORCH_DISTRIBUTED_DEBUG', '').upper() in ('INFO', 'DETAIL'):
-        def print_unused_parameters(model):
-            for name, param in model.named_parameters():
-                if param.grad is None:
-                    print(f"Parameter without gradient: {name}")
+    def train(self):
+        """Exécute la boucle d'entraînement principale"""
+        model_type = self.args.model_type.lower()
         
-        def hook(state):
-            print_unused_parameters(model.module)
+        # Training loop
+        while True:
+            # Determine and set the learning rate for this iteration
+            with self.timing_stats.track("lr_update"):
+                lr = get_lr(
+                    self.iter_num, 
+                    self.args.warmup_iters, 
+                    self.args.lr_decay_iters, 
+                    self.args.learning_rate, 
+                    self.args.min_lr
+                ) if self.args.decay_lr else self.args.learning_rate
+                
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = lr
+            
+            # Generate text periodically
+            if self.iter_num % 100 == 0 and self.master_process:
+                self.generate_sample_text()
+            
+            # Evaluate model periodically
+            if self.iter_num % self.args.eval_interval == 0 and self.master_process and self.iter_num > 0:
+                self.evaluate_model()
+            
+            # Exit if eval_only is set
+            if self.iter_num == 0 and self.args.eval_only:
+                break
+            
+            # Forward backward update, with gradient accumulation
+            with self.timing_stats.track("optimization"):
+                self.optimizer.zero_grad(set_to_none=True)
+                total_loss = 0
+                total_router_loss = 0
+                skip_optimizer_step = False
+                
+                try:
+                    for micro_step in range(self.args.gradient_accumulation_steps):
+                        if self.ddp:
+                            self.model.require_backward_grad_sync = (
+                                micro_step == self.args.gradient_accumulation_steps - 1
+                            )
+                        
+                        # Track data loading time
+                        with self.timing_stats.track("data_loading"):
+                            try:
+                                batch = next(self.train_iterator)
+                            except StopIteration:
+                                self.train_iterator = iter(self.train_dataset)
+                                batch = next(self.train_iterator)
+                            
+                            # Handle different batch formats
+                            if isinstance(batch, dict):
+                                input_ids = batch['input_ids'].to(self.device)
+                                targets = batch.get('labels', input_ids).to(self.device)
+                            elif isinstance(batch, tuple) and len(batch) >= 2:
+                                input_ids = batch[0].to(self.device)
+                                targets = batch[-1].to(self.device)
+                            else:
+                                input_ids = batch.to(self.device)
+                                targets = batch.to(self.device)
+                        
+                        # Forward pass
+                        with self.timing_stats.track("forward"), torch.amp.autocast(enabled=True, device_type=self.device_type):
+                            # Handle different model types
+                            if model_type == 'deepseek':
+                                # DeepSeek model returns a dict
+                                outputs = self.model(
+                                    input_ids=input_ids,
+                                    attention_mask=None,  # Will be created automatically if needed
+                                )
+                                
+                                # Unpack outputs
+                                hidden_states = outputs["last_hidden_state"]
+                                balance_loss = outputs.get("balance_loss", 0)
+                                
+                                # Calculate loss
+                                raw_model = self.model.module if self.ddp else self.model
+                                logits = hidden_states @ raw_model.embed_tokens.weight.t()
+                                shift_logits = logits[..., :-1, :].contiguous()
+                                shift_labels = targets[..., 1:].contiguous()
+                                
+                                loss = F.cross_entropy(
+                                    shift_logits.view(-1, shift_logits.size(-1)),
+                                    shift_labels.view(-1),
+                                    ignore_index=-1
+                                )
+                                
+                                # Track tokens
+                                batch_tokens = input_ids.ne(0).sum().item()  # Assuming 0 is pad token
+                                
+                            elif model_type == 'llada':
+                                # LLaDA model
+                                logits, loss, router_loss = self.model(input_ids, targets=targets)
+                                balance_loss = router_loss if router_loss is not None else 0
+                                
+                                # Track tokens
+                                batch_tokens = input_ids.numel()
+                                
+                            else:
+                                # Standard GPT model
+                                logits, loss = self.model(input_ids, targets=targets)
+                                balance_loss = 0
+                                
+                                # Track tokens
+                                batch_tokens = input_ids.numel()
+                            
+                            # Update token counts
+                            self.total_tokens += batch_tokens
+                            self.tokens_window.append((time.time(), batch_tokens))
+                            if len(self.tokens_window) > self.window_size:
+                                self.tokens_window.pop(0)
+                            
+                            # Clean up to save memory
+                            if 'logits' in locals():
+                                del logits
+                            if 'hidden_states' in locals():
+                                del hidden_states
+                        
+                        # Backward pass
+                        with self.timing_stats.track("backward"):
+                            if loss is not None:
+                                # Scale loss for gradient accumulation
+                                loss = loss / self.args.gradient_accumulation_steps
+                                
+                                # Add router loss if available
+                                if balance_loss != 0:
+                                    balance_loss = balance_loss / self.args.gradient_accumulation_steps
+                                    router_loss_coef = getattr(self.args, 'router_z_loss_coef', 0.001)
+                                    combined_loss = loss + router_loss_coef * balance_loss
+                                else:
+                                    combined_loss = loss
+                                
+                                # Backward pass with scaler
+                                scaled_loss = self.scaler.scale(combined_loss)
+                                scaled_loss.backward()
+                                
+                                # Track losses
+                                total_loss += loss.item()
+                                if balance_loss != 0:
+                                    total_router_loss += balance_loss.item()
+                                
+                                # Clean up
+                                del loss
+                                if balance_loss != 0:
+                                    del balance_loss
+                                del combined_loss
+                                del scaled_loss
+                
+                except Exception as e:
+                    print(f"Training iteration failed: {e}")
+                    print(traceback.format_exc())
+                    cleanup_memory()
+                    if self.ddp:
+                        dist_barrier()
+                    continue
+                
+                # Optimizer step
+                with self.timing_stats.track("optimizer_step"):
+                    if self.args.grad_clip != 0.0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters() if not self.ddp else self.model.module.parameters(),
+                            self.args.grad_clip
+                        )
+                    
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+            
+            # Timing and logging
+            t1 = time.time()
+            dt = t1 - self.t0
+            self.t0 = t1
+            
+            if self.iter_num % self.args.log_interval == 0:
+                self.log_training_stats(total_loss, total_router_loss, dt, lr)
+                
+                # Save checkpoint periodically
+                if self.iter_num % 1000 == 0 and self.master_process:
+                    self.save_training_checkpoint()
+            
+            self.iter_num += 1
+            self.local_iter_num += 1
+            
+            # Periodic memory cleanup
+            if self.iter_num % 100 == 0:
+                cleanup_memory()
+            
+            # Termination conditions
+            if self.iter_num > self.args.max_iters:
+                break
         
-        model.register_comm_hook(None, hook)
-
-# Initialize datasets
-train_dataset, val_dataset = get_datasets(block_size, batch_size, device)
-print(f"vocab_size: {len(train_dataset.tokenizer)}")
-
-# Get vocab size from the dataset
-vocab_size = len(train_dataset.tokenizer)
-print(f"vocab_size: {vocab_size}")
-
-# logging
-if wandb_log and master_process:
-    import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
-
-print("Initializing training loop...")
-
-# Créer une queue pour la génération
-generation_queue = Queue()
-
-# Fonction de génération qui tourne dans un thread séparé
-def generation_worker():
-    while True:
-        if not generation_queue.empty():
-            encoder_input = generation_queue.get()
-            with torch.no_grad():
-                generated = generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8, tokenizer=tokenizer)
-                print(f"\nGenerated text: {generated}\n")
-
-# Démarrer le thread de génération avant la boucle d'entraînement
-generation_thread = threading.Thread(
-    target=generation_worker, 
-    daemon=True
-)
-# generation_thread.start()
-
-# training loop
-train_iterator = iter(train_dataset)
-encoder_input, decoder_input, target = next(train_iterator)
-t0 = time.time()
-local_iter_num = 0
-raw_model = model.module if ddp else model
-running_mfu = -1.0
-
-print("Starting training...")
-
-train_start_time = time.time()
-total_tokens = 0
-t0 = time.time()
-
-print_memory_stats("Initial")
-
-while True:
-    # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num, warmup_iters, lr_decay_iters, learning_rate, min_lr) if decay_lr else learning_rate
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process and iter_num > 0:
+        # Cleanup
+        if self.ddp:
+            destroy_process_group()
+        
+        cleanup_memory()
+        
+        if self.master_process:
+            print("Training finished!")
+    
+    def generate_sample_text(self):
+        """Génère un exemple de texte avec le modèle actuel"""
+        model_type = self.args.model_type.lower()
+        
+        print("\nText Generation:")
+        
+        # Get a prompt
+        if hasattr(self.args, 'prompt_templates') and self.args.prompt_templates:
+            prompt = random.choice(self.args.prompt_templates)
+        else:
+            prompt = "Once upon a time"
+        
+        # Tokenize the prompt
+        if hasattr(self.args, 'tokenizer'):
+            tokenizer = self.args.tokenizer
+            input_tokens = tokenizer.encode(
+                prompt,
+                add_special_tokens=True,
+                truncation=False,
+                padding=False,
+                return_tensors='pt'
+            ).to(self.device)
+        else:
+            # Simple fallback if no tokenizer
+            input_tokens = torch.tensor([[1, 2, 3]]).to(self.device)  # Dummy tokens
+        
+        try:
+            with torch.no_grad(), torch.amp.autocast(enabled=True, device_type=self.device_type):
+                # Generate text
+                raw_model = self.model.module if self.ddp else self.model
+                
+                if model_type == 'deepseek':
+                    output_ids = raw_model.generate(
+                        input_tokens,
+                        max_new_tokens=min(100, self.args.block_size - 10),
+                        temperature=0.7,
+                        top_k=40
+                    )
+                else:
+                    # Use the generic generate_text function
+                    output_text = generate_text(
+                        raw_model,
+                        input_tokens,
+                        max_new_tokens=min(100, self.args.block_size - 10),
+                        temperature=0.7,
+                        tokenizer=tokenizer if hasattr(self.args, 'tokenizer') else None
+                    )
+                    print(f"Generated text: {prompt} {output_text}\n")
+                    return
+                
+                # Decode the generated text
+                if hasattr(self.args, 'tokenizer'):
+                    generated_text = tokenizer.decode(
+                        output_ids[0],
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=True
+                    )
+                    print(f"Generated text: {prompt} {generated_text}\n")
+                else:
+                    print(f"Generated tokens: {output_ids[0].tolist()}\n")
+                    
+        except Exception as e:
+            print(f"Generation error: {str(e)}")
+            print(traceback.format_exc())
+    
+    def evaluate_model(self):
+        """Évalue le modèle sur les ensembles d'entraînement et de validation"""
+        from train_utils import estimate_loss
+        
         print("Validation")
         # Use utility function for loss estimation
-        losses = estimate_loss(model, train_dataset, val_dataset, eval_iters, device, ctx, ddp, ddp_world_size)
+        losses = estimate_loss(
+            self.model, 
+            self.train_dataset, 
+            self.val_dataset, 
+            self.args.eval_iters, 
+            self.device, 
+            self.ctx, 
+            self.ddp, 
+            self.ddp_world_size
+        )
         
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, train ppl {losses['train_ppl']:.2f}, "
+        print(f"step {self.iter_num}: train loss {losses['train']:.4f}, train ppl {losses['train_ppl']:.2f}, "
               f"val loss {losses['val']:.4f}, val ppl {losses['val_ppl']:.2f}")
-        print(f"Total tokens processed: {train_dataset.get_total_tokens():,}")
-        print_memory_stats("After validation")
         
-        if wandb_log:
+        # Log to wandb if enabled
+        if hasattr(self.args, 'wandb_log') and self.args.wandb_log:
+            import wandb
             wandb.log({
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
@@ -439,256 +751,111 @@ while True:
                 # Include router losses if available
                 "train/router_loss": losses.get('train_router_loss', 0.0),
                 "val/router_loss": losses.get('val_router_loss', 0.0),
-                "lr": lr,
-                "iter": iter_num,
-                "total_tokens": train_dataset.get_total_tokens()
+                "lr": self.optimizer.param_groups[0]['lr'],
+                "iter": self.iter_num,
+                "total_tokens": self.total_tokens
             })
-            
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint_path = save_checkpoint(
-                    raw_model, 
-                    optimizer, 
-                    model_args, 
-                    iter_num, 
-                    best_val_loss, 
-                    config,
-                    out_dir,
-                    losses['val']
-                )
-                cleanup_memory()
-                cleanup_old_checkpoints(out_dir)
-                
-        # Generate examples for evaluation
-        if iter_num % generate_interval == 0 and master_process:
-            print("\nGenerating examples:")
-            example_results = evaluate_model(
-                raw_model, 
-                val_dataset, 
-                ctx, 
-                num_examples=2, 
-                max_tokens=50, 
-                temperature=0.8,
-                tokenizer=tokenizer
-            )
-            
-            for i, result in enumerate(example_results):
-                print(f"Example {i+1}:")
-                print(f"Input: {result['input']}")
-                print(f"Generated: {result['generated']}")
-                print("-" * 50)
-                
-            if wandb_log:
-                wandb_examples = []
-                for result in example_results:
-                    wandb_examples.append([result['input'], result['generated']])
-                wandb.log({
-                    "examples": wandb.Table(
-                        columns=["Input", "Generated"],
-                        data=wandb_examples
-                    )
-                })
-                
-    if iter_num == 0 and eval_only:
-        break
-
-    # Continue avec le code normal d'entraînement
-    optimizer.zero_grad(set_to_none=True)
-    skip_optimizer_step = False
+        
+        # Save checkpoint if best validation loss
+        if losses['val'] < self.best_val_loss or self.args.always_save_checkpoint:
+            self.best_val_loss = losses['val']
+            if self.iter_num > 0:
+                self.save_training_checkpoint(val_loss=losses['val'])
     
-    # Déclarer les variables pour la prochaine itération
-    encoder_input_next, decoder_input_next, target_next = None, None, None
-    loss = None
-    current_router_loss = None  # Store the router loss for logging
-
-    try:
-        for micro_step in range(gradient_accumulation_steps):
-            if ddp:
-                # Only synchronize gradients on the last micro step
-                model.require_backward_grad_sync = (
-                    micro_step == gradient_accumulation_steps - 1
-                )
-            
-            try:
-                encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-            except StopIteration:
-                train_iterator = iter(train_dataset)
-                encoder_input_next, decoder_input_next, target_next = next(train_iterator)
-            
-            # Forward pass with error handling
-            try:
-                with ctx:
-                    logits, loss, router_loss = model(encoder_input, targets=target)
-                    # Store the router loss for logging
-                    if micro_step == 0 and router_loss is not None:
-                        current_router_loss = router_loss.item()
-                        
-                    if loss is not None:
-                        # Add router loss if available
-                        if router_loss is not None:
-                            # Scale router loss by a factor (typically 0.01 to 0.1)
-                            router_loss_scale = 0.01
-                            loss = loss + router_loss_scale * router_loss
-                        
-                        # Scale loss for gradient accumulation
-                        loss = loss / gradient_accumulation_steps
-                        # Scale for mixed precision
-                        scaled_loss = scaler.scale(loss)
-                        # Backward pass
-                        scaled_loss.backward()
-            except RuntimeError as e:
-                import traceback
-                print("\n=== Error Stack Trace ===")
-                print(f"Process rank: {ddp_rank if ddp else 'N/A'}")
-                print(f"Error: {str(e)}")
-                print("\nFull stack trace:")
-                print(traceback.format_exc())
-                print("=" * 50)
-                skip_optimizer_step = True
-                break
-
-            
-            # Move data preparation for next iteration here
-            encoder_input, decoder_input, target = (
-                encoder_input_next, 
-                decoder_input_next,
-                target_next
-            )
-            
-        # Optimizer step if no errors occurred
-        if not skip_optimizer_step and loss is not None:
-            if scaler.is_enabled() and scaler._scale is not None:
-                # Unscale gradients and clip
-                if grad_clip != 0.0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                # Step with scaler
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                # Normal optimizer step
-                if grad_clip != 0.0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
-            
-            # Zero gradients after optimizer step
-            optimizer.zero_grad(set_to_none=True)
-            
-    except Exception as e:
-        import traceback
-        print(f"Training iteration failed: {e}")
-        print(traceback.format_exc())
-        if ddp:
-            dist_barrier()  # Synchronize processes before continuing
-        continue
-
-    # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-
-    # Mettre à jour total_tokens avant la réduction
-    step_tokens = (batch_size * block_size) * gradient_accumulation_steps
-    total_tokens += step_tokens
-
-    if iter_num % log_interval == 0:
-        # Calculer les métriques locales (par GPU)
-        lossf = loss.item() * gradient_accumulation_steps if loss is not None else 0.0
-        elapsed = time.time() - train_start_time
-        local_dt = dt
-        local_tokens = total_tokens
-        local_tps = step_tokens / dt
-
-        # Métriques agrégées (tous les GPUs)
-        if ddp:
-            # Créer des tensors sur le GPU pour la réduction
-            global_loss = torch.tensor(lossf, device=device)
-            global_dt = torch.tensor(dt, device=device)
-            global_tokens = torch.tensor(total_tokens, device=device)
-            
-            # Réduire les métriques à travers tous les processus
-            all_reduce(global_loss, op=ReduceOp.SUM)
-            all_reduce(global_dt, op=ReduceOp.SUM)
-            all_reduce(global_tokens, op=ReduceOp.SUM)
-            
-            # Calculer les moyennes
-            global_loss = global_loss.item() / ddp_world_size
-            global_dt = global_dt.item() / ddp_world_size
-            global_tokens = global_tokens.item()  # Ne pas diviser les tokens, on veut le total
-            global_tps = global_tokens / elapsed
+    def log_training_stats(self, total_loss, total_router_loss, dt, lr):
+        """Affiche les statistiques d'entraînement"""
+        lossf = total_loss
+        router_lossf = total_router_loss
+        
+        # Calculate tokens/s on the sliding window
+        if len(self.tokens_window) > 1:
+            window_time = self.tokens_window[-1][0] - self.tokens_window[0][0]
+            window_tokens = sum(tokens for _, tokens in self.tokens_window)
+            current_tokens_per_sec = window_tokens / window_time if window_time > 0 else 0
         else:
-            global_loss = lossf
-            global_dt = dt
-            global_tokens = local_tokens
-            global_tps = local_tps
-
-        # Afficher les logs uniquement sur le processus maître
-        if master_process:
-            # Log global (tous les GPUs combinés)
-            print(
-                f"iter_num: {iter_num}, "
-                f"iter tokens: {step_tokens:.2f}M, "
-                f"loss: {global_loss:.4f}, "
-                f"total_tps: {global_tps:.1f} t/s, "
-                f"total_tokens: {global_tokens/1e6:.2f}M, "
-                f"time/step: {global_dt*1000:.2f}ms, "
-                f"time: {elapsed/60:.2f}min, "
-                f"Total GPU: {ddp_world_size}"
-            )
-            
-
-            if wandb_log:
-                wandb.log({
-                    "iter": iter_num,
-                    "loss": global_loss,
-                    "router_loss": current_router_loss if current_router_loss is not None else 0.0,
-                    "tokens_per_sec/gpu": local_tps,
-                    "tokens_per_sec/total": global_tps,
-                    "tokens/gpu": local_tokens,
-                    "tokens/total": global_tokens,
-                    "learning_rate": lr,
-                    "step_time_ms": local_dt * 1000
-                })
-
-    iter_num += 1
-    local_iter_num += 1
-    encoder_input, decoder_input, target = encoder_input_next, decoder_input_next, target_next
+            current_tokens_per_sec = 0
+        
+        total_time = time.time() - self.train_start_time
+        avg_tokens_per_sec = self.total_tokens / total_time if total_time > 0 else 0
+        
+        # Calculate MFU if model supports it
+        if hasattr(self.model, 'estimate_mfu') and self.local_iter_num >= 5:
+            raw_model = self.model.module if self.ddp else self.model
+            mfu = raw_model.estimate_mfu(self.args.batch_size * self.args.gradient_accumulation_steps, dt)
+            self.running_mfu = mfu if self.running_mfu == -1.0 else 0.9*self.running_mfu + 0.1*mfu
+            mfu_str = f", mfu {self.running_mfu*100:.2f}%"
+        else:
+            mfu_str = ""
+        
+        # Print stats
+        if router_lossf > 0:
+            print(f"iter {self.iter_num}: loss {lossf:.4f}, router_loss {router_lossf:.4f}, "
+                  f"time {dt*1000:.2f}ms, lr {lr:.2e}, "
+                  f"tt {self.total_tokens:,}, t/s {current_tokens_per_sec:.2f}, "
+                  f"avgt/s {avg_tokens_per_sec:.2f}{mfu_str}")
+        else:
+            print(f"iter {self.iter_num}: loss {lossf:.4f}, "
+                  f"time {dt*1000:.2f}ms, lr {lr:.2e}, "
+                  f"tt {self.total_tokens:,}, t/s {current_tokens_per_sec:.2f}, "
+                  f"avgt/s {avg_tokens_per_sec:.2f}{mfu_str}")
+        
+        # Update timing stats
+        self.timing_stats.step()
+        
+        # Print timing stats if needed
+        if self.timing_stats.should_print():
+            self.timing_stats.print_stats()
+        
+        # Log to wandb if enabled
+        if hasattr(self.args, 'wandb_log') and self.args.wandb_log:
+            import wandb
+            wandb.log({
+                "iter": self.iter_num,
+                "loss": lossf,
+                "router_loss": router_lossf,
+                "tokens_per_sec": current_tokens_per_sec,
+                "avg_tokens_per_sec": avg_tokens_per_sec,
+                "learning_rate": lr,
+                "step_time_ms": dt * 1000
+            })
     
-    # termination conditions
-    if iter_num > max_iters:
-        break
-
-    # Dans la boucle d'entraînement, après chaque N itérations
-    if iter_num % 100 == 0:  # Ajuster la fréquence selon vos besoins
-        if device_type == 'cuda':
-            # Forcer la synchronisation CUDA
-            torch.cuda.synchronize()
-            
-        # Collecter manuellement le garbage
+    def save_training_checkpoint(self, val_loss=None):
+        """Sauvegarde un checkpoint d'entraînement"""
+        raw_model = self.model.module if self.ddp else self.model
+        
+        # Get model args based on model type
+        model_type = self.args.model_type.lower()
+        if model_type == 'deepseek':
+            model_args = self.config.__dict__
+        else:
+            model_args = self.config.__dict__
+        
+        # Save checkpoint
+        checkpoint_path = save_checkpoint(
+            raw_model,
+            self.optimizer,
+            model_args,
+            self.iter_num,
+            self.best_val_loss,
+            vars(self.args),
+            self.args.output_dir,
+            val_loss
+        )
+        
+        print(f"Saved checkpoint to {checkpoint_path}")
+        
+        # Cleanup
         cleanup_memory()
+        cleanup_old_checkpoints(self.args.output_dir, keep_num=self.args.keep_checkpoints if hasattr(self.args, 'keep_checkpoints') else 3)
 
-    if iter_num % 100 == 0:  # Pour profiler périodiquement
-        torch.cuda.synchronize()
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
 
-    if iter_num % 100 == 0:
-        end_event.record()
-        torch.cuda.synchronize()
-        print(f"CUDA time: {start_event.elapsed_time(end_event)}ms")
+def main():
+    """Point d'entrée principal pour l'entraînement"""
+    # Ce code est appelé lorsque train.py est exécuté directement
+    # Il est préférable d'utiliser run_train.py comme point d'entrée
+    print("Please use run_train.py as the entry point for training.")
+    print("Example: python run_train.py --model_type deepseek --size small")
 
-if ddp:
-    destroy_process_group()
 
-# Nettoyage final CUDA
-cleanup_memory()
-
-# Après l'initialisation des datasets
-if master_process:
-    print(f"Train dataset size: {len(train_dataset)}")
-    print(f"Val dataset size: {len(val_dataset)}")
-    # Vérifier un échantillon
-    sample_encoder, sample_decoder, sample_target = next(iter(train_dataset))
-    print(f"Sample batch shapes - encoder: {sample_encoder.shape}, decoder: {sample_decoder.shape}, target: {sample_target.shape}")
+if __name__ == '__main__':
+    main()

@@ -1,3 +1,7 @@
+"""
+Fonctions utilitaires pour l'entraînement des modèles LLM.
+"""
+
 import os
 import gc
 import glob
@@ -5,6 +9,12 @@ import math
 import time
 import torch
 from torch.distributed import init_process_group, destroy_process_group, all_reduce, ReduceOp
+from contextlib import nullcontext
+
+# Import des fonctions d'optimisation GPU
+from gpu_optimization import (
+    cleanup_memory, print_memory_stats, setup_cuda_optimizations
+)
 
 def get_gpu_count():
     """Return the number of available GPUs."""
@@ -112,13 +122,6 @@ def cleanup_old_checkpoints(out_dir, keep_num=3):
         except Exception as e:
             print(f"Error removing checkpoint {ckpt}: {e}")
 
-def cleanup_memory():
-    """Clean up GPU memory"""
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        if gc.isenabled():
-            gc.collect()
-
 def ensure_model_dtype(model, dtype):
     """
     Ensure model parameters are in the correct dtype
@@ -131,37 +134,6 @@ def ensure_model_dtype(model, dtype):
     for param in model.parameters():
         param.data = param.data.to(dtype=dtype)
     return model
-
-def print_memory_stats(prefix=""):
-    """Print GPU memory statistics for debugging"""
-    if not torch.cuda.is_available():
-        return
-        
-    print(f"{prefix} Memory stats:")
-    print(f"Allocated: {torch.cuda.memory_allocated()/1e9:.2f}GB")
-    print(f"Reserved: {torch.cuda.memory_reserved()/1e9:.2f}GB")
-    print(f"Max allocated: {torch.cuda.max_memory_allocated()/1e9:.2f}GB")
-
-def setup_cuda_optimizations():
-    """Apply optimizations for CUDA environment"""
-    if not torch.cuda.is_available():
-        return
-        
-    # Memory management optimizations
-    torch.multiprocessing.set_sharing_strategy('file_system')
-    torch.cuda.empty_cache()
-    
-    # Performance optimizations
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-    
-    # Configure memory pagination
-    torch.cuda.set_per_process_memory_fraction(0.95)
-    
-    # Disable automatic garbage collection
-    gc.disable()
 
 def save_checkpoint(model, optimizer, model_args, iter_num, best_val_loss, config, out_dir, val_loss=None):
     """
@@ -287,8 +259,6 @@ def get_context_manager(device_type, dtype):
     Returns:
         Context manager for mixed precision
     """
-    from contextlib import nullcontext
-    
     if device_type == 'cpu':
         return nullcontext()
         
@@ -348,13 +318,13 @@ def estimate_loss(model, train_dataset, val_dataset, eval_iters, device, ctx, dd
 
 def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8, top_k=40, tokenizer=None):
     """
-    Generate text using the LLaDA model
+    Generate text using the model
     Args:
-        model: LLaDA model
+        model: Model with generate method
         encoder_input: Input tensor [batch, seq_len]
         max_new_tokens: Maximum number of tokens to generate
         temperature: Temperature for sampling
-        top_k: Top-k for sampling (not used in LLaDA)
+        top_k: Top-k for sampling
         tokenizer: Tokenizer for decoding (optional)
     Returns:
         str: Generated text
@@ -363,7 +333,7 @@ def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8, top_
     
     with torch.no_grad():
         with torch.amp.autocast(enabled=True, device_type='cuda'):
-            # Use the LLaDA model's generate method
+            # Use the model's generate method
             output_tokens, output_text = model.generate(
                 prompt=encoder_input,
                 steps=32,  # Number of diffusion steps
@@ -426,4 +396,80 @@ def evaluate_model(model, eval_dataset, ctx, num_examples=5, max_tokens=50, temp
                 'generated': generated
             })
     
-    return results 
+    return results
+
+class AveragedTimingStats:
+    """Track detailed timing information for model training"""
+    def __init__(self, print_interval=100):
+        self.timings = defaultdict(list)
+        self.print_interval = print_interval
+        self.current_step = 0
+        self.current_context = []
+        
+    @contextmanager
+    def track(self, name):
+        self.current_context.append(name)
+        start_time = time.time()
+        try:
+            yield
+        finally:
+            duration = time.time() - start_time
+            # Only track the first level and its immediate children
+            if len(self.current_context) <= 2:
+                full_name = '/'.join(self.current_context)
+                self.timings[full_name].append(duration)
+            self.current_context.pop()
+    
+    def step(self):
+        self.current_step += 1
+    
+    def should_print(self):
+        return self.current_step % self.print_interval == 0
+    
+    def get_averaged_stats(self):
+        if not self.timings:
+            return {}, {}
+        
+        # Calculate averages
+        avg_timings = {}
+        for name, times in self.timings.items():
+            avg_timings[name] = sum(times) / len(times)
+        
+        # Get total time from root operations
+        total_time = sum(avg_timings[name] for name in avg_timings if '/' not in name)
+        
+        # Calculate percentages
+        percentages = {}
+        for name, time in avg_timings.items():
+            percentages[name] = (time / total_time) * 100 if total_time > 0 else 0
+        
+        # Clear timings for next window
+        self.timings.clear()
+        
+        return avg_timings, percentages
+    
+    def print_stats(self):
+        timings, percentages = self.get_averaged_stats()
+        if not timings:
+            return
+        
+        print(f"\nTiming breakdown over last {self.print_interval} iterations:")
+        
+        # Sort by time spent (descending)
+        sorted_timings = sorted(
+            timings.items(), 
+            key=lambda x: x[1], 
+            reverse=True
+        )
+        
+        # Print root operations first
+        print("\nMain operations:")
+        for name, time in sorted_timings:
+            if '/' not in name:
+                print(f"{name}: {time*1000:.1f}ms ({percentages[name]:.1f}%)")
+        
+        # Print sub-operations
+        print("\nDetailed breakdown:")
+        for name, time in sorted_timings:
+            if '/' in name:
+                print(f"{name}: {time*1000:.1f}ms ({percentages[name]:.1f}%)")
