@@ -167,7 +167,7 @@ class Trainer:
                 hidden_size=1024,
                 num_hidden_layers=8,
                 num_attention_heads=8,
-                head_dim=64,
+                head_dim=128,  # Modifié de 64 à 128 pour assurer que num_attention_heads * head_dim == hidden_size
                 intermediate_size=2816,
                 num_experts=8,
                 num_experts_per_token=2,
