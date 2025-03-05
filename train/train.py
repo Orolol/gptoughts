@@ -242,8 +242,8 @@ class Trainer:
             config = LLaDAConfig(
                 block_size=self.args.block_size,
                 vocab_size=self.args.vocab_size,
-                n_layer=12,
-                n_head=12,
+                n_layer=16,
+                n_head=16,
                 n_embd=1024,
                 dropout=self.args.dropout,
                 bias=self.args.bias,
