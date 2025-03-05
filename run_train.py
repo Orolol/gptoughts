@@ -27,7 +27,8 @@ def get_datasets(block_size, batch_size, device, tokenizer=None):
             max_length=block_size,
             buffer_size=batch_size * 4,
             shuffle=True,
-            tokenizer=tokenizer
+            tokenizer=tokenizer,
+            batch_size=batch_size
         )
         
         val_dataset = FinewebDataset(
@@ -35,7 +36,8 @@ def get_datasets(block_size, batch_size, device, tokenizer=None):
             max_length=block_size,
             buffer_size=batch_size * 2,
             shuffle=False,
-            tokenizer=tokenizer
+            tokenizer=tokenizer,
+            batch_size=batch_size
         )
         
     except ImportError:
@@ -164,7 +166,7 @@ def main():
                        help='Backend d\'attention à utiliser')
     
     # Paramètres d'optimisation
-    parser.add_argument('--learning_rate', type=float, default=3e-4,
+    parser.add_argument('--learning_rate', type=float, default=5e-5,
                        help='Taux d\'apprentissage')
     parser.add_argument('--max_iters', type=int, default=100000,
                        help='Nombre maximal d\'itérations')
@@ -178,11 +180,11 @@ def main():
                        help='Clip de gradient')
     parser.add_argument('--decay_lr', action='store_true',
                        help='Décroissance du taux d\'apprentissage')
-    parser.add_argument('--warmup_iters', type=int, default=2000,
+    parser.add_argument('--warmup_iters', type=int, default=200,
                        help='Nombre d\'itérations de warmup')
     parser.add_argument('--lr_decay_iters', type=int, default=600000,
                        help='Nombre d\'itérations pour la décroissance du taux d\'apprentissage')
-    parser.add_argument('--min_lr', type=float, default=3e-5,
+    parser.add_argument('--min_lr', type=float, default=3e-6,
                        help='Taux d\'apprentissage minimal')
     
     # Paramètres DDP
