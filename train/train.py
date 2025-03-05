@@ -115,7 +115,7 @@ class Trainer:
         print(f"Initializing a new {model_type} model from scratch")
         
         if model_type == 'deepseek':
-            from deepseek import DeepSeekMini, DeepSeekMiniConfig
+            from models.deepseek import DeepSeekMini, DeepSeekMiniConfig
             # Create config based on model size
             config = self.create_deepseek_config()
             self.model = DeepSeekMini(config)
@@ -158,7 +158,7 @@ class Trainer:
         
     def create_deepseek_config(self):
         """Crée une configuration pour le modèle DeepSeek Mini"""
-        from deepseek import DeepSeekMiniConfig
+        from models.deepseek import DeepSeekMiniConfig
         
         # Determine model size parameters
         if self.args.size == 'small':
@@ -314,7 +314,7 @@ class Trainer:
         model_type = self.args.model_type.lower()
         
         if model_type == 'deepseek':
-            from deepseek import DeepSeekMini, DeepSeekMiniConfig
+            from models.deepseek import DeepSeekMini, DeepSeekMiniConfig
             # Create new model with saved config
             saved_config = DeepSeekMiniConfig(**checkpoint['model_args'])
             self.model = DeepSeekMini(saved_config)
