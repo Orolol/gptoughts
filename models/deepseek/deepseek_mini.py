@@ -11,6 +11,9 @@ import time
 from collections import defaultdict
 from contextlib import nullcontext
 
+# Import des fonctions de calcul de FLOPS et MFU
+from train.train_utils import estimate_mfu as utils_estimate_mfu
+
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization"""
     
@@ -874,29 +877,13 @@ class DeepSeekMini(nn.Module):
 
     def estimate_mfu(self, batch_size: int, dt: float) -> float:
         """Estimate model flops utilization (MFU) in percentage."""
-        # Calculate total flops per token
-        total_flops = batch_size * self.config.max_position_embeddings * self.config.num_hidden_layers * (
-            # Attention flops
-            8 * self.config.hidden_size * self.config.max_position_embeddings +
-            # MLP flops (assuming average expert utilization of num_experts_per_token/num_experts)
-            2 * 4 * self.config.hidden_size * self.config.intermediate_size * 
-            (self.config.num_experts_per_token / self.config.num_experts)
+        # Utiliser la fonction importée de train_utils.py
+        # Passer le modèle, la taille du batch, la longueur de séquence, le temps d'exécution
+        # et le type de données (fp16 pour les calculs en fp16)
+        return utils_estimate_mfu(
+            model=self,
+            batch_size=batch_size,
+            seq_length=self.config.max_position_embeddings,
+            dt=dt,
+            dtype=torch.float16  # Utiliser fp16 comme demandé
         )
-        
-        # Get device compute capability
-        if hasattr(torch.cuda, 'get_device_capability'):
-            device = next(self.parameters()).device
-            if device.type == 'cuda':
-                gpu_flops = {
-                    (7, 0): 14e12,    # A100
-                    (8, 0): 19e12,    # A100
-                    (8, 6): 36e12,    # H100
-                    (9, 0): 39e12     # H200
-                }.get(torch.cuda.get_device_capability(device), 14e12)  # Default to A100
-            else:
-                gpu_flops = 14e12  # Default to A100 if not on GPU
-        else:
-            gpu_flops = 14e12  # Default if can't detect
-        
-        mfu = total_flops / (dt * gpu_flops)
-        return mfu 

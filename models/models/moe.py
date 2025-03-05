@@ -14,6 +14,9 @@ from contextlib import nullcontext
 import threading
 from queue import Queue
 
+# Import des fonctions de calcul de FLOPS et MFU
+from train.train_utils import estimate_mfu as utils_estimate_mfu
+
 class Router(nn.Module):
     """
     Router module that determines which expert should process each token.
@@ -662,43 +665,18 @@ class MoEEncoderDecoderGPT(nn.Module):
 
     def estimate_mfu(self, batch_size: int, dt: float) -> float:
         """Estimate model flops utilization (MFU) in percentage."""
-        # Encoder flops
-        encoder_flops = batch_size * self.encoder_config.block_size * self.encoder_config.n_layer * (
-            # Attention
-            8 * self.encoder_config.n_embd * self.encoder_config.block_size +
-            # MLP (assuming average expert utilization of k/num_experts)
-            2 * 4 * self.encoder_config.n_embd * self.encoder_config.n_embd * (2/8)
+        # Utiliser la fonction importée de train_utils.py
+        # Pour un modèle encoder-decoder, nous utilisons la longueur de séquence maximale
+        # entre l'encodeur et le décodeur
+        seq_length = max(self.encoder_config.block_size, self.decoder_config.block_size)
+        
+        return utils_estimate_mfu(
+            model=self,
+            batch_size=batch_size,
+            seq_length=seq_length,
+            dt=dt,
+            dtype=torch.float16  # Utiliser fp16 comme demandé
         )
-        
-        # Decoder flops
-        decoder_flops = batch_size * self.decoder_config.block_size * self.decoder_config.n_layer * (
-            # Self-attention
-            8 * self.decoder_config.n_embd * self.decoder_config.block_size +
-            # Cross-attention
-            8 * self.decoder_config.n_embd * self.encoder_config.block_size +
-            # MLP (assuming average expert utilization of k/num_experts)
-            2 * 4 * self.decoder_config.n_embd * self.decoder_config.n_embd * (2/8)
-        )
-        
-        total_flops = encoder_flops + decoder_flops
-        
-        # Get device compute capability
-        if hasattr(torch.cuda, 'get_device_capability'):
-            device = next(self.parameters()).device
-            if device.type == 'cuda':
-                gpu_flops = {
-                    (7, 0): 14e12,    # A100
-                    (8, 0): 19e12,    # A100
-                    (8, 6): 36e12,    # H100
-                    (9, 0): 39e12     # H200
-                }.get(torch.cuda.get_device_capability(device), 14e12)  # Default to A100
-            else:
-                gpu_flops = 14e12  # Default to A100 if not on GPU
-        else:
-            gpu_flops = 14e12  # Default if can't detect
-        
-        mfu = total_flops / (dt * gpu_flops)
-        return mfu 
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """

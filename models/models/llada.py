@@ -12,6 +12,8 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 import os
 
+from train.train_utils import estimate_mfu as utils_estimate_mfu
+
 @dataclass
 class LLaDAConfig:
     """Configuration class for LLaDA model hyperparameters."""
@@ -716,6 +718,19 @@ class LLaDAModel(nn.Module):
     def set_timing_stats(self, timing_stats):
         """Set the timing stats object for profiling"""
         self.timing_stats = timing_stats
+    
+    def estimate_mfu(self, batch_size: int, dt: float) -> float:
+        """Estime l'utilisation des FLOPS du modèle (MFU) en pourcentage."""
+        # Utiliser la fonction importée de train_utils.py
+        # Passer le modèle, la taille du batch, la longueur de séquence, le temps d'exécution
+        # et le type de données (fp16 pour les calculs en fp16)
+        return utils_estimate_mfu(
+            model=self,
+            batch_size=batch_size,
+            seq_length=self.config.block_size,
+            dt=dt,
+            dtype=torch.float16  # Utiliser fp16 comme demandé
+        )
 
     def forward_process(self, input_ids, eps=1e-3):
         """Apply random masking with varying ratios for diffusion process"""

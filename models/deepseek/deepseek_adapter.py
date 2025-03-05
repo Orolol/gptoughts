@@ -8,6 +8,7 @@ import torch.nn as nn
 from typing import Optional, Dict, Any, List, Tuple, Union
 
 from models.deepseek.deepseek import Transformer, ModelArgs
+from train.train_utils import estimate_mfu as utils_estimate_mfu
 
 class DeepSeekMiniConfig:
     """
@@ -257,32 +258,13 @@ class DeepSeekMini(nn.Module):
     
     def estimate_mfu(self, batch_size: int, dt: float) -> float:
         """Estime l'utilisation des FLOPS du modèle (MFU) en pourcentage."""
-        # Calculer le nombre total de FLOPS par token
-        n_params = sum(p.numel() for p in self.parameters())
-        config = self.model_args
-        
-        # Estimation approximative des FLOPS
-        total_flops = batch_size * config.max_seq_len * config.n_layers * (
-            # FLOPS d'attention
-            8 * config.dim * config.max_seq_len +
-            # FLOPS de MLP
-            2 * 4 * config.dim * config.inter_dim
+        # Utiliser la fonction importée de train_utils.py
+        # Passer le modèle, la taille du batch, la longueur de séquence, le temps d'exécution
+        # et le type de données (fp16 pour les calculs en fp16)
+        return utils_estimate_mfu(
+            model=self,
+            batch_size=batch_size,
+            seq_length=self.model_args.max_seq_len,
+            dt=dt,
+            dtype=torch.float16  # Utiliser fp16 comme demandé
         )
-        
-        # Obtenir la capacité de calcul du GPU
-        if hasattr(torch.cuda, 'get_device_capability'):
-            device = next(self.parameters()).device
-            if device.type == 'cuda':
-                gpu_flops = {
-                    (7, 0): 14e12,    # A100
-                    (8, 0): 19e12,    # A100
-                    (8, 6): 36e12,    # H100
-                    (9, 0): 39e12     # H200
-                }.get(torch.cuda.get_device_capability(device), 14e12)  # Par défaut A100
-            else:
-                gpu_flops = 14e12  # Par défaut si pas sur GPU
-        else:
-            gpu_flops = 14e12  # Par défaut si impossible de détecter
-        
-        mfu = total_flops / (dt * gpu_flops)
-        return mfu

@@ -12,6 +12,7 @@ import gc
 
 from ..config import LLaDAConfig
 from .block import LLaDABlock
+from train.train_utils import estimate_mfu as utils_estimate_mfu
 
 class LLaDAModel(nn.Module):
     """
@@ -377,6 +378,19 @@ class LLaDAModel(nn.Module):
     def set_gradient_checkpointing(self, value):
         """Enable or disable gradient checkpointing"""
         self.use_checkpoint = value
+    
+    def estimate_mfu(self, batch_size: int, dt: float) -> float:
+        """Estime l'utilisation des FLOPS du modèle (MFU) en pourcentage."""
+        # Utiliser la fonction importée de train_utils.py
+        # Passer le modèle, la taille du batch, la longueur de séquence, le temps d'exécution
+        # et le type de données (fp16 pour les calculs en fp16)
+        return utils_estimate_mfu(
+            model=self,
+            batch_size=batch_size,
+            seq_length=self.config.block_size,
+            dt=dt,
+            dtype=torch.float16  # Utiliser fp16 comme demandé
+        )
         
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """
