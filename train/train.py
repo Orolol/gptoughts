@@ -29,7 +29,7 @@ from gpu_optimization import (
 )
 
 # Import des fonctions utilitaires
-from train_utils import (
+from train.train_utils import (
     get_gpu_count, setup_distributed, reduce_metrics, calculate_perplexity,
     get_lr, cleanup_old_checkpoints, ensure_model_dtype,
     save_checkpoint, load_checkpoint, find_latest_checkpoint, 
