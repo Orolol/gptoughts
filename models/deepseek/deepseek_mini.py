@@ -252,6 +252,24 @@ class MLAAttention(nn.Module):
         
         # Apply attention mask if provided
         if attention_mask is not None:
+            # Adapter le masque d'attention à la longueur de la séquence de clés
+            # lorsqu'on utilise past_key_value
+            if past_key_value is not None:
+                # Obtenir la longueur de la séquence de clés
+                key_length = k_latent.size(2)
+                
+                # Si le masque d'attention est plus petit que la longueur de la séquence de clés,
+                # nous devons l'étendre pour couvrir toute la séquence
+                if attention_mask.size(-1) < key_length:
+                    # Créer un nouveau masque qui couvre toute la séquence
+                    # Les tokens précédents sont autorisés (0), les nouveaux tokens sont masqués (valeur très négative)
+                    prefix_mask = torch.zeros(
+                        (batch_size, 1, 1, key_length - attention_mask.size(-1)),
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device
+                    )
+                    attention_mask = torch.cat([prefix_mask, attention_mask], dim=-1)
+            
             attn_weights = attn_weights + attention_mask
         
         # Softmax and dropout
