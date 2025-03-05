@@ -9,7 +9,7 @@ import math
 import time
 import torch
 from torch.distributed import init_process_group, destroy_process_group, all_reduce, ReduceOp
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 
 # Import des fonctions d'optimisation GPU
 from gpu_optimization import (
