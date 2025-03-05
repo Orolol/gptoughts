@@ -686,7 +686,8 @@ class DeepSeekMini(nn.Module):
     def generate(
         self,
         input_ids: torch.LongTensor,
-        max_length: int,
+        max_length: Optional[int] = None,
+        max_new_tokens: Optional[int] = None,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
@@ -699,6 +700,14 @@ class DeepSeekMini(nn.Module):
         batch_size, cur_length = input_ids.shape
         device = input_ids.device
         
+        # Vérifier qu'au moins un des paramètres max_length ou max_new_tokens est fourni
+        if max_length is None and max_new_tokens is None:
+            raise ValueError("Vous devez spécifier soit max_length soit max_new_tokens")
+            
+        # Calculer max_length à partir de max_new_tokens si nécessaire
+        if max_length is None:
+            max_length = cur_length + max_new_tokens
+            
         if pad_token_id is None:
             pad_token_id = 0  # Default to 0
         if eos_token_id is None:
