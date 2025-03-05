@@ -74,7 +74,7 @@ class LLaDARouter(nn.Module):
         
         # Import tensor pool for memory reuse
         try:
-            from memory_utils import tensor_pool
+            from train.memory_utils import tensor_pool
         except ImportError:
             tensor_pool = None
         
@@ -407,18 +407,12 @@ class LLaDAExpertGroup(nn.Module):
                         # Clean up memory after each group
                         del group_hidden, group_x
                     
-<<<<<<< HEAD:llada/llada.py
                     # Scale the expert contribution and add to shared output
                     return shared_output + 0.1 * combined_output
                 except Exception as e:
                     print(f"Warning: Error processing expert group: {e}")
                     # Return shared output on error
                     return shared_output
-=======
-                    # Clean up memory after each group
-                    del group_hidden, group_x
-               
->>>>>>> 10abfe8 (feat: Update training script, split files):models/models/llada.py
             
             # If we didn't use parallel adapters, just return shared output
             return shared_output

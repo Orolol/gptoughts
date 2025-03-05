@@ -22,7 +22,7 @@ from transformers import AutoTokenizer
 
 from models.models.model import GPTConfig, GPT
 from models.llada.model import LLaDAModel, LLaDAConfig
-from data.openwebtext.data_loader import StreamingDataset
+from data.data_loader_legacy import StreamingDataset
 from run_train import get_datasets
 from train_utils import (
     get_gpu_count, setup_distributed, reduce_metrics, calculate_perplexity,
@@ -129,12 +129,8 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 
-<<<<<<< HEAD
-compile = True # use PyTorch 2.0 to compile the model to be faster
-=======
 
 compile = False # use PyTorch 2.0 to compile the model to be faster
->>>>>>> 10abfe8 (feat: Update training script, split files)
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file

@@ -22,7 +22,7 @@ from torch.serialization import add_safe_globals
 
 from transformers import AutoTokenizer
 from deepseek_mini import DeepSeekMini, DeepSeekMiniConfig
-from data.openwebtext.data_loader import StreamingDataset
+from data.data_loader_legacy import StreamingDataset
 from run_train import get_datasets
 
 import traceback
