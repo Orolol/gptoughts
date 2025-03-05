@@ -348,64 +348,40 @@ def estimate_loss(model, train_dataset, val_dataset, eval_iters, device, ctx, dd
 
 def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8, top_k=40, tokenizer=None):
     """
-    Generate text using an encoder-decoder model
+    Generate text using the LLaDA model
     Args:
-        model: Encoder-decoder model
-        encoder_input: Input tensor for the encoder [batch, seq_len]
+        model: LLaDA model
+        encoder_input: Input tensor [batch, seq_len]
         max_new_tokens: Maximum number of tokens to generate
         temperature: Temperature for sampling
-        top_k: Top-k for sampling
+        top_k: Top-k for sampling (not used in LLaDA)
         tokenizer: Tokenizer for decoding (optional)
     Returns:
         str: Generated text
     """
     model.eval()
-    device = encoder_input.device
-    batch_size = encoder_input.size(0)
-    
-    # Create initial decoder input (start token)
-    pad_token_id = tokenizer.pad_token_id if tokenizer else 0
-    bos_token_id = tokenizer.bos_token_id if tokenizer else 1
-    
-    # Initialize decoder input with start token
-    decoder_input = torch.full((batch_size, 1), bos_token_id, dtype=torch.long, device=device)
     
     with torch.no_grad():
         with torch.amp.autocast(enabled=True, device_type='cuda'):
-            # Get encoder outputs (only need to do this once)
-            encoder_outputs = model.encoder(encoder_input)
-            
-            # Generate tokens one by one
-            for _ in range(max_new_tokens):
-                # Forward pass through decoder
-                logits = model.decoder(decoder_input, encoder_outputs=encoder_outputs)
-                
-                # Get logits for the next token (last token in sequence)
-                logits = logits[:, -1, :] / temperature
-                
-                # Apply top-k filtering
-                if top_k > 0:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = float('-inf')
-                
-                # Apply softmax to get probabilities
-                probs = torch.nn.functional.softmax(logits, dim=-1)
-                
-                # Sample from the distribution
-                next_token = torch.multinomial(probs, num_samples=1)
-                
-                # Append to decoder input
-                decoder_input = torch.cat((decoder_input, next_token), dim=1)
-                
-                # Stop if we generate an EOS token
-                if tokenizer and (next_token == tokenizer.eos_token_id).any():
-                    break
+            # Use the LLaDA model's generate method
+            output_tokens, output_text = model.generate(
+                prompt=encoder_input,
+                steps=32,  # Number of diffusion steps
+                gen_length=max_new_tokens,
+                block_length=max_new_tokens,
+                temperature=temperature,
+                tokenizer=tokenizer
+            )
     
-    # Convert token IDs to text
+    # If output_text is already provided by the model, use it
+    if output_text is not None:
+        return output_text
+    
+    # Otherwise, decode the tokens if tokenizer is available
     if tokenizer:
-        output_text = tokenizer.decode(decoder_input[0].tolist(), skip_special_tokens=True)
+        output_text = tokenizer.decode(output_tokens[0].tolist(), skip_special_tokens=True)
     else:
-        output_text = decoder_input[0].tolist()
+        output_text = output_tokens[0].tolist()
     
     return output_text
 

@@ -10,6 +10,7 @@ import gc
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
+import os
 
 @dataclass
 class LLaDAConfig:
@@ -82,7 +83,7 @@ class LLaDARouter(nn.Module):
         torch.set_float32_matmul_precision('high')
         
         # Compute router logits with memory optimization - force TF32 precision
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.amp.autocast(enabled=True, device_type='cuda'):
             try:
                 # Pin memory for optimal GPU transfer
                 with torch.cuda.stream(torch.cuda.Stream()):
@@ -325,7 +326,7 @@ class LLaDAExpertGroup(nn.Module):
         batch_size, seq_len, hidden_dim = x.shape
         
         # Get shared representations - ensure we use TF32 for better performance
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.amp.autocast(enabled=True, device_type='cuda'):
             # Pin tensor for faster operations
             if not x.is_contiguous():
                 x = x.contiguous()
@@ -406,15 +407,84 @@ class LLaDAExpertGroup(nn.Module):
                         # Clean up memory after each group
                         del group_hidden, group_x
                     
+<<<<<<< HEAD:llada/llada.py
                     # Scale the expert contribution and add to shared output
                     return shared_output + 0.1 * combined_output
                 except Exception as e:
                     print(f"Warning: Error processing expert group: {e}")
                     # Return shared output on error
                     return shared_output
+=======
+                    # Clean up memory after each group
+                    del group_hidden, group_x
+               
+>>>>>>> 10abfe8 (feat: Update training script, split files):models/models/llada.py
             
             # If we didn't use parallel adapters, just return shared output
             return shared_output
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization"""
+    
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.weight * self._norm(x.float()).type_as(x)
+
+class RoPE(nn.Module):
+    """
+    Rotary Position Embeddings implementation.
+    Based on the paper: https://arxiv.org/abs/2104.09864
+    """
+    def __init__(self, dim: int, max_seq_len: int = 2048, base: int = 10000):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+        
+        # Cache cos and sin values
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_seq_len).type_as(inv_freq)
+        freqs = torch.einsum('i,j->ij', t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        
+        # Reshape for broadcasting: [1, 1, seq_len, dim]
+        self.register_buffer('cos_cached', emb.cos().view(1, 1, max_seq_len, dim), persistent=False)
+        self.register_buffer('sin_cached', emb.sin().view(1, 1, max_seq_len, dim), persistent=False)
+
+    def _rotate_half(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
+        B, H, T, D = x.shape
+        
+        # Reshape with explicit dimensions
+        x_reshaped = x.view(B, H, T, D // 2, 2)
+        x1, x2 = x_reshaped[..., 0], x_reshaped[..., 1]
+        
+        # Get the cos and sin values for the current sequence length
+        cos = self.cos_cached[:, :, :seq_len, :(D//2)]
+        sin = self.sin_cached[:, :, :seq_len, :(D//2)]
+        
+        # Ensure broadcasting works correctly
+        cos = cos.expand(B, H, -1, -1)
+        sin = sin.expand(B, H, -1, -1)
+        
+        # Apply rotation
+        rotated = torch.stack([
+            x1 * cos - x2 * sin,
+            x2 * cos + x1 * sin,
+        ], dim=-1)
+        
+        return rotated.view(B, H, T, D)
+
+    def forward(self, x: torch.Tensor, seq_len: Optional[int] = None) -> torch.Tensor:
+        if seq_len is None:
+            seq_len = x.shape[-2]
+        return self._rotate_half(x, seq_len)
 
 class LLaDAAttention(nn.Module):
     """
@@ -442,8 +512,16 @@ class LLaDAAttention(nn.Module):
         
         # Head size
         self.head_size = config.n_embd // config.n_head
+        
+        # Add RoPE positional embeddings
+        self.rope = RoPE(self.head_size, config.block_size)
+        
+        # For KV caching during generation
+        self.kv_cache_enabled = False
+        self._cached_k = None
+        self._cached_v = None
 
-    def forward(self, x):
+    def forward(self, x, use_kv_cache=False):
         batch_size, seq_len, n_embd = x.shape
         
         # Ensure inputs are contiguous for better performance
@@ -451,7 +529,7 @@ class LLaDAAttention(nn.Module):
             x = x.contiguous()
         
         # Use a single matrix multiply for qkv projection to maximize GPU utilization
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.amp.autocast(enabled=True, device_type='cuda'):
             # Calculate query, key, values with a single operation
             qkv = self.c_attn(x)
             q, k, v = qkv.split(self.n_embd, dim=2)
@@ -462,8 +540,23 @@ class LLaDAAttention(nn.Module):
             q = q.view(batch_size, seq_len, self.n_head, self.head_size).transpose(1, 2).contiguous()
             v = v.view(batch_size, seq_len, self.n_head, self.head_size).transpose(1, 2).contiguous()
             
+            # Apply RoPE to queries and keys
+            q = self.rope(q, seq_len)
+            k = self.rope(k, seq_len)
+            
             # Free memory
             del qkv
+            
+            # Handle KV caching for faster generation
+            if use_kv_cache and self.kv_cache_enabled:
+                if self._cached_k is not None and self._cached_v is not None:
+                    # Concatenate current k,v with cached k,v
+                    k = torch.cat([self._cached_k, k], dim=2)
+                    v = torch.cat([self._cached_v, v], dim=2)
+                
+                # Update the cache
+                self._cached_k = k
+                self._cached_v = v
             
             # Configure Flash Attention if available
             try:
@@ -508,9 +601,9 @@ class LLaDABlock(nn.Module):
     """
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.ln_1 = RMSNorm(config.n_embd)
         self.attn = LLaDAAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.ln_2 = RMSNorm(config.n_embd)
         
         # MoE components
         self.router = LLaDARouter(config.n_embd, config.num_experts, config.k)
@@ -522,9 +615,9 @@ class LLaDABlock(nn.Module):
         # Gradient checkpointing flag
         self.use_checkpoint = False
 
-    def forward(self, x):
+    def forward(self, x, use_kv_cache=False):
         # Process with pipelined operations for better GPU utilization
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.amp.autocast(enabled=True, device_type='cuda'):
             # Ensure input is in contiguous memory for better performance
             if not x.is_contiguous():
                 x = x.contiguous()
@@ -533,7 +626,7 @@ class LLaDABlock(nn.Module):
             ln1_out = self.ln_1(x)
             
             # Run attention with tensor cores
-            attn_out = self.attn(ln1_out)
+            attn_out = self.attn(ln1_out, use_kv_cache=use_kv_cache)
             
             # Add residual connection and normalize for MoE in one step
             moe_input = self.ln_2(x + attn_out)
@@ -542,7 +635,7 @@ class LLaDABlock(nn.Module):
             del ln1_out, attn_out
             
             # Run router with tensor cores - ensure high precision
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast(enabled=False, device_type='cuda'):
                 routing_weights, dispatch_mask, router_loss = self.router(moe_input)
             
             # Ensure dispatch_mask has correct shape for expert processing
@@ -689,6 +782,7 @@ class LLaDAModel(nn.Module):
                         # Optimize memory allocator for large tensors
                         torch.cuda.empty_cache()
                         torch.cuda.synchronize()
+                        import os
                         
                         # Tune cache allocator
                         if hasattr(torch.cuda, "memory_stats") and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
@@ -763,14 +857,16 @@ class LLaDAModel(nn.Module):
         # Track router loss
         total_router_loss = torch.tensor(0.0, device=device)
         
-        # Process through transformer blocks with error handling
+        # Forward pass through transformer blocks with appropriate autocast settings
         for i, block in enumerate(self.blocks):
             try:
                 if self.use_checkpoint and self.training:
                     x, router_loss = checkpoint.checkpoint(block, x)
                 else:
                     with torch.amp.autocast(enabled=True, device_type='cuda'):
-                        x, router_loss = block(x)
+                        # Use KV caching during generation (when not training)
+                        use_kv_cache = not self.training and hasattr(block.attn, 'kv_cache_enabled') and block.attn.kv_cache_enabled
+                        x, router_loss = block(x, use_kv_cache=use_kv_cache)
                 
                 total_router_loss = total_router_loss + router_loss
             except Exception as e:
@@ -855,6 +951,8 @@ class LLaDAModel(nn.Module):
     def generate(self, prompt, steps=128, gen_length=128, block_length=128, temperature=None, remasking=None, tokenizer=None):
         """Generate text using LLaDA diffusion process"""
         try:
+            import os
+            import gc
             device = prompt.device
             
             # Set temperature and remasking from config if not specified
@@ -865,6 +963,9 @@ class LLaDAModel(nn.Module):
             gen_length = max(1, min(gen_length, 1024))  # Limit max generation length
             block_length = max(1, min(block_length, gen_length))  # Ensure valid block length
             steps = max(1, min(steps, 100))  # Limit max steps
+            
+            # Enable KV caching for faster generation
+            self.enable_kv_cache()
             
             # Make sure mask_token_id is safe
             safe_mask_token_id = min(self.mask_token_id, self.config.vocab_size - 1)
@@ -1046,6 +1147,18 @@ class LLaDAModel(nn.Module):
                 del block_mask_index, num_transfer_tokens
                 torch.cuda.empty_cache()
             
+            # Log and clean up
+            if os.environ.get('DEBUG_LLADA'):
+                print(f"Generation complete. Final tokens: {x[0]}")
+            
+            # Disable KV caching after generation
+            self.disable_kv_cache()
+            
+            # Memory cleanup
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             # Detokenize the output if requested (and return both tokens and text)
             text_output = self.detokenize_output(x[0], tokenizer)
             
@@ -1069,6 +1182,9 @@ class LLaDAModel(nn.Module):
         device = prompt.device
         seq = torch.cat([prompt, answer])[None, :].repeat(batch_size, 1).to(device)
         prompt_index = torch.arange(seq.shape[1], device=device) < len(prompt)
+        
+        # Enable KV caching for faster inference
+        self.enable_kv_cache()
         
         losses = []
         for _ in range(mc_num // batch_size):
@@ -1103,6 +1219,9 @@ class LLaDAModel(nn.Module):
             adjusted_loss = loss.sum() / mask_ratio.sum()
             
             losses.append(adjusted_loss.item())
+        
+        # Disable KV caching after inference
+        self.disable_kv_cache()
         
         # Return negative log-likelihood
         return -sum(losses) / len(losses)
@@ -1254,6 +1373,25 @@ class LLaDAModel(nn.Module):
         except Exception as e:
             return f"Detokenization error: {str(e)}"
 
+    def reset_kv_cache(self):
+        """Reset the key-value cache for faster generation."""
+        for block in self.blocks:
+            if hasattr(block.attn, '_cached_k'):
+                block.attn._cached_k = None
+                block.attn._cached_v = None
+    
+    def enable_kv_cache(self):
+        """Enable key-value caching for faster generation."""
+        for block in self.blocks:
+            block.attn.kv_cache_enabled = True
+    
+    def disable_kv_cache(self):
+        """Disable key-value caching."""
+        for block in self.blocks:
+            block.attn.kv_cache_enabled = False
+            block.attn._cached_k = None
+            block.attn._cached_v = None
+
 def generate_example_wrapper(model, prompt_tokens, tokenizer=None, steps=32, gen_length=32, temperature=0.7):
     """
     Wrapper function for generate_example that displays both token IDs and text.
@@ -1380,5 +1518,8 @@ def generate_and_display(model, text=None, tokens=None, tokenizer=None, steps=32
         return output_tokens, output_text
         
     except Exception as e:
+        # print the stack trace
+        import traceback
+        traceback.print_exc()
         print(f"Generation error: {str(e)}")
         return None, f"Error: {str(e)}"

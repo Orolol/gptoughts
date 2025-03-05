@@ -702,79 +702,22 @@ class MoEEncoderDecoderGPT(nn.Module):
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """
-        Configure the AdamW optimizer with weight decay.
-        Handles parameter groups for experts and non-expert parameters separately.
+        Configure optimizer for MoE models with specialized parameter groups.
+        
+        Args:
+            weight_decay: Weight decay coefficient
+            learning_rate: Learning rate
+            betas: Adam beta parameters
+            device_type: Device type ('cuda' or 'cpu')
+            
+        Returns:
+            Configured optimizer
         """
-        # Collect all parameters
-        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
-        
-        # Create parameter groups
-        expert_params = []
-        router_params = []
-        other_params = []
-        
-        for name, param in param_dict.items():
-            if any(expert_type in name.lower() for expert_type in ['expert_group', 'shared_mlp', 'expert_proj', 'expert_adapters']):
-                expert_params.append(param)
-            elif 'router' in name.lower():
-                router_params.append(param)
-            else:
-                other_params.append(param)
-        
-        # Debug print
-        # print("\nParameter classification:")
-        # for name, param in param_dict.items():
-        #     if any(expert_type in name.lower() for expert_type in ['expert_group', 'shared_mlp', 'expert_proj', 'expert_adapters']):
-        #         print(f"Expert param: {name} - {param.numel():,} parameters")
-        #     elif 'router' in name.lower():
-        #         print(f"Router param: {name} - {param.numel():,} parameters")
-        #     else:
-        #         print(f"Other param: {name} - {param.numel():,} parameters")
-        
-        # Create optimizer groups with different hyperparameters
-        optim_groups = [
-            # Expert parameters
-            {
-                'params': expert_params,
-                'weight_decay': weight_decay,
-                'lr': learning_rate
-            },
-            # Router parameters (lower learning rate)
-            {
-                'params': router_params,
-                'weight_decay': 0.0,  # No weight decay for router
-                'lr': learning_rate  # Lower learning rate for stability
-            },
-            # Other parameters
-            {
-                'params': other_params,
-                'weight_decay': weight_decay,
-                'lr': learning_rate
-            }
-        ]
-        
-        # Print parameter counts
-        num_expert_params = sum(p.numel() for p in expert_params)
-        num_router_params = sum(p.numel() for p in router_params)
-        num_other_params = sum(p.numel() for p in other_params)
-        
-        print(f"\nParameter counts:")
-        print(f"Expert parameters: {num_expert_params:,}")
-        print(f"Router parameters: {num_router_params:,}")
-        print(f"Other parameters: {num_other_params:,}")
-        
-        # Create AdamW optimizer with fused implementation if available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        
-        optimizer = torch.optim.AdamW(
-            optim_groups,
-            lr=learning_rate,
+        from models.optimizers import configure_optimizer_for_moe
+        return configure_optimizer_for_moe(
+            model=self,
+            weight_decay=weight_decay,
+            learning_rate=learning_rate,
             betas=betas,
-            **extra_args
-        )
-        
-        print(f"Using fused AdamW: {use_fused}")
-        
-        return optimizer 
+            device_type=device_type
+        ) 

@@ -19,9 +19,9 @@ from torch.distributed import destroy_process_group, dist_barrier
 from torch.serialization import add_safe_globals
 
 from transformers import AutoTokenizer
-import pickle
 
-from model import GPTConfig, GPT, EncoderDecoderGPT
+from models.models.model import GPTConfig, GPT
+from models.llada.model import LLaDAModel, LLaDAConfig
 from data.openwebtext.data_loader import StreamingDataset
 from run_train import get_datasets
 from train_utils import (
@@ -47,7 +47,7 @@ generate_interval = 100
 eval_iters = 100
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'resume' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -129,7 +129,12 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 
+<<<<<<< HEAD
 compile = True # use PyTorch 2.0 to compile the model to be faster
+=======
+
+compile = False # use PyTorch 2.0 to compile the model to be faster
+>>>>>>> 10abfe8 (feat: Update training script, split files)
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -204,8 +209,17 @@ decoder_config = GPTConfig(
 
 # Store model arguments for checkpointing
 model_args = {
-    'encoder_config': encoder_config,
-    'decoder_config': decoder_config,
+    'llada_config': {
+        'block_size': block_size,
+        'vocab_size': vocab_size,
+        'n_layer': encoder_n_layer,
+        'n_head': encoder_n_head,
+        'n_embd': encoder_n_embd,
+        'dropout': dropout,
+        'bias': bias,
+        'ratio_kv': encoder_n_head // encoder_ratio_kv,
+        'use_checkpoint': False
+    },
     'vocab_size': vocab_size,
     'block_size': block_size
 }
@@ -214,27 +228,94 @@ model_args = {
 add_safe_globals([GPTConfig])
 
 if init_from == 'resume':
-    print(f"Attempting to resume training from {out_dir}")
+    print(f"Resuming training from {out_dir}")
+    # Trouver le dernier checkpoint
     ckpt_path = find_latest_checkpoint(out_dir)
-    if not ckpt_path:
-        print("No checkpoints found, initializing from scratch instead")
+    if ckpt_path is None:
+        print("No checkpoint found, starting from scratch")
         init_from = 'scratch'
     else:
-        print(f"Loading checkpoint: {ckpt_path}")
-        model = EncoderDecoderGPT(encoder_config, decoder_config)
-        model, optimizer, iter_num, best_val_loss, _, _ = load_checkpoint(
-            ckpt_path, model, map_location='cpu'
-        )
-        if optimizer is None:
-            optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+        print(f"Loading checkpoint from {ckpt_path}")
+        # Charger avec weights_only=True pour éviter de charger les buffers inutiles
+        checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=True)
         
-        # Ensure model parameters are in the correct dtype
-        model = ensure_model_dtype(model, ptdtype)
-        cleanup_memory()
+        # Create LLaDAConfig from saved model_args
+        if 'llada_config' in checkpoint['model_args']:
+            # Use saved LLaDAConfig
+            llada_config_dict = checkpoint['model_args']['llada_config']
+            llada_config = LLaDAConfig(**llada_config_dict)
+        else:
+            # Create from encoder config for backward compatibility
+            llada_config = LLaDAConfig(
+                block_size=block_size,
+                vocab_size=encoder_config.vocab_size,
+                n_layer=encoder_config.n_layer,
+                n_head=encoder_config.n_head,
+                n_embd=encoder_config.n_embd,
+                dropout=dropout,
+                bias=bias,
+                ratio_kv=encoder_config.n_head // encoder_config.ratio_kv,
+                use_checkpoint=False
+            )
+        
+        model = LLaDAModel(llada_config)
+        
+        # Nettoyer le state dict avant chargement
+        state_dict = checkpoint['model']
+        unwanted_prefix = '_orig_mod.'
+        cleaned_state_dict = {}
+        
+        for k, v in state_dict.items():
+            if k.startswith(unwanted_prefix):
+                cleaned_state_dict[k[len(unwanted_prefix):]] = v
+            else:
+                cleaned_state_dict[k] = v
+        
+        # Charger le state dict nettoyé
+        # Note: strict=False because LLaDAModel might have different structure
+        model.load_state_dict(cleaned_state_dict, strict=False)
+        optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+        
+        # Libérer la mémoire explicitement
+        del checkpoint['model']
+        del state_dict
+        del cleaned_state_dict
+        torch.cuda.empty_cache()
+        
+        # Charger l'optimiseur séparément et nettoyer ses états
+        if 'optimizer' in checkpoint:
+            optimizer_state = checkpoint['optimizer']
+            # Nettoyer les états de l'optimiseur qui pourraient être en float32
+            for state in optimizer_state['state'].values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(dtype=ptdtype)
+            optimizer.load_state_dict(optimizer_state)
+            del optimizer_state
+            torch.cuda.empty_cache()
+        
+        iter_num = checkpoint['iter_num'] + 1
+        best_val_loss = checkpoint['best_val_loss']
+        
+        # Libérer le reste de la mémoire
+        del checkpoint
+        torch.cuda.empty_cache()
 
 if init_from == 'scratch':
-    print("Initializing a new encoder-decoder model from scratch")
-    model = EncoderDecoderGPT(encoder_config, decoder_config)
+    print("Initializing a new LLaDA model from scratch")
+    # Create LLaDAConfig from encoder config parameters
+    llada_config = LLaDAConfig(
+        block_size=block_size,
+        vocab_size=encoder_config.vocab_size,
+        n_layer=encoder_config.n_layer,
+        n_head=encoder_config.n_head,
+        n_embd=encoder_config.n_embd,
+        dropout=dropout,
+        bias=bias,
+        ratio_kv=encoder_config.n_head // encoder_config.ratio_kv,
+        use_checkpoint=False
+    )
+    model = LLaDAModel(llada_config)
     optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 
 # Juste avant le model.to(device):
@@ -355,13 +436,15 @@ while True:
         
         if wandb_log:
             wandb.log({
-                "iter": iter_num,
                 "train/loss": losses['train'],
-                "train/perplexity": losses['train_ppl'],
                 "val/loss": losses['val'],
+                "train/perplexity": losses['train_ppl'],
                 "val/perplexity": losses['val_ppl'],
+                # Include router losses if available
+                "train/router_loss": losses.get('train_router_loss', 0.0),
+                "val/router_loss": losses.get('val_router_loss', 0.0),
                 "lr": lr,
-                "mfu": running_mfu*100,
+                "iter": iter_num,
                 "total_tokens": train_dataset.get_total_tokens()
             })
             
@@ -421,6 +504,7 @@ while True:
     # Déclarer les variables pour la prochaine itération
     encoder_input_next, decoder_input_next, target_next = None, None, None
     loss = None
+    current_router_loss = None  # Store the router loss for logging
 
     try:
         for micro_step in range(gradient_accumulation_steps):
@@ -439,15 +523,24 @@ while True:
             # Forward pass with error handling
             try:
                 with ctx:
-                    logits, current_loss = model(encoder_input, decoder_input, target)
-                    if current_loss is not None:
+                    logits, loss, router_loss = model(encoder_input, targets=target)
+                    # Store the router loss for logging
+                    if micro_step == 0 and router_loss is not None:
+                        current_router_loss = router_loss.item()
+                        
+                    if loss is not None:
+                        # Add router loss if available
+                        if router_loss is not None:
+                            # Scale router loss by a factor (typically 0.01 to 0.1)
+                            router_loss_scale = 0.01
+                            loss = loss + router_loss_scale * router_loss
+                        
                         # Scale loss for gradient accumulation
-                        current_loss = current_loss / gradient_accumulation_steps
+                        loss = loss / gradient_accumulation_steps
                         # Scale for mixed precision
-                        scaled_loss = scaler.scale(current_loss)
+                        scaled_loss = scaler.scale(loss)
                         # Backward pass
                         scaled_loss.backward()
-                        loss = current_loss
             except RuntimeError as e:
                 import traceback
                 print("\n=== Error Stack Trace ===")
@@ -487,7 +580,9 @@ while True:
             optimizer.zero_grad(set_to_none=True)
             
     except Exception as e:
+        import traceback
         print(f"Training iteration failed: {e}")
+        print(traceback.format_exc())
         if ddp:
             dist_barrier()  # Synchronize processes before continuing
         continue
@@ -537,6 +632,7 @@ while True:
             # Log global (tous les GPUs combinés)
             print(
                 f"iter_num: {iter_num}, "
+                f"iter tokens: {step_tokens:.2f}M, "
                 f"loss: {global_loss:.4f}, "
                 f"total_tps: {global_tps:.1f} t/s, "
                 f"total_tokens: {global_tokens/1e6:.2f}M, "
@@ -550,6 +646,7 @@ while True:
                 wandb.log({
                     "iter": iter_num,
                     "loss": global_loss,
+                    "router_loss": current_router_loss if current_router_loss is not None else 0.0,
                     "tokens_per_sec/gpu": local_tps,
                     "tokens_per_sec/total": global_tps,
                     "tokens/gpu": local_tokens,

@@ -7,8 +7,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-from torch.cuda.amp import GradScaler
+from torch.utils.data import DataLoader
+from torch.amp import GradScaler
 from contextlib import nullcontext
 import gc
 import glob
@@ -18,26 +18,22 @@ from collections import defaultdict
 from contextlib import contextmanager
 import sys
 import traceback
-from memory_utils import (
-    MemoryTracker, optimized_memory_context, free_memory, 
-    set_memory_fraction, setup_optimal_memory_config
-)
+from datasets import load_dataset
+import wandb
+
 # Add parent directory to path to import from root project
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Import utilities
 from train_utils import (
-    get_gpu_count, setup_distributed, reduce_metrics, calculate_perplexity,
     get_lr, cleanup_old_checkpoints, cleanup_memory, ensure_model_dtype,
-    print_memory_stats, setup_cuda_optimizations, save_checkpoint,
-    load_checkpoint, find_latest_checkpoint, get_context_manager
+    print_memory_stats, save_checkpoint, load_checkpoint, find_latest_checkpoint
 )
 
 # Import data loaders
-from data_loader import FinewebDataset
-from data_loader_llada import create_llm_data_loader
+from llada.data_loadar_llada import create_llm_data_loader
 
-from llada import LLaDAConfig, LLaDAModel
+from llada.llada import LLaDAConfig, LLaDAModel
 from llada.llada import generate_example_wrapper, generate_and_display
 
 # CUDA optimizations - optimized configuration
@@ -179,50 +175,95 @@ class TimingStats:
             result.append(f"{name}: {timing:.4f}s total, {avg_time:.6f}s avg, {percentage:.2f}%")
         return "\n".join(result)
 
-class TextDataset(Dataset):
-    """Simple text dataset for demonstration"""
-    def __init__(self, data, block_size):
-        self.data = data
-        self.block_size = block_size
+class StreamingBatchLoader(torch.utils.data.IterableDataset):
+    """Simple streaming data loader that always keeps one tokenized batch ready.
+    Works with HuggingFace datasets in streaming mode and returns batches of 
+    size batch_size * gradient_accumulation_steps."""
+    
+    def __init__(self, dataset_name, dataset_split, tokenizer, batch_size, gradient_accumulation_steps, 
+                 max_length=1024, text_column="text"):
+        super().__init__()
+        self.dataset_name = dataset_name
+        self.dataset_split = dataset_split
+        self.tokenizer = tokenizer
+        self.batch_size = batch_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.max_length = max_length
+        self.text_column = text_column
+        self.worker_id = 0
+        self.num_workers = 0
+    
+    def _tokenize_function(self, examples):
+        return self.tokenizer(
+            examples[self.text_column],
+            max_length=self.max_length,
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt"
+        )
+    
+    def _get_stream(self):
+        # Each worker will get its own stream
+        return load_dataset(self.dataset_name, split=self.dataset_split, streaming=True)
+    
+    def __iter__(self):
+        # Set up worker info for distributed loading
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            self.worker_id = worker_info.id
+            self.num_workers = worker_info.num_workers
         
-    def __len__(self):
-        return len(self.data) - self.block_size
+        # Get a stream of data
+        stream = self._get_stream()
+        stream_iter = iter(stream)
         
-    def __getitem__(self, idx):
-        # Get chunk of data of block_size
-        chunk = self.data[idx:idx + self.block_size + 1]
-        x = torch.tensor(chunk[:-1], dtype=torch.long)
-        y = torch.tensor(chunk[1:], dtype=torch.long)
-        return x, y
-
-class SFTDataset(Dataset):
-    """Dataset for supervised fine-tuning with prompt-response pairs"""
-    def __init__(self, data, block_size):
-        self.data = data
-        self.block_size = block_size
-        
-    def __len__(self):
-        return len(self.data)
-        
-    def __getitem__(self, idx):
-        # Get prompt-response pair
-        prompt, response = self.data[idx]
-        
-        # Ensure total length doesn't exceed block_size
-        total_length = len(prompt) + len(response)
-        if total_length > self.block_size:
-            # Truncate from the right (response end)
-            response = response[:self.block_size - len(prompt)]
+        # Process the stream one batch at a time
+        while True:
+            # Collect samples for a single batch (not the full gradient accumulation batch)
+            batch_samples = []
+            for _ in range(self.batch_size):
+                try:
+                    sample = next(stream_iter)
+                    batch_samples.append(sample[self.text_column])
+                except StopIteration:
+                    # Restart dataset if we reached the end during batch collection
+                    stream_iter = iter(self._get_stream())
+                    sample = next(stream_iter)
+                    batch_samples.append(sample[self.text_column])
             
-        # Combine prompt and response
-        combined = prompt + response
-        x = torch.tensor(combined, dtype=torch.long)
-        prompt_length = torch.tensor(len(prompt), dtype=torch.long)
-        
-        return {
-            'input_ids': x,
-            'prompt_lengths': prompt_length
-        }
+            # Tokenize the collected samples
+            if not batch_samples:
+                continue
+                
+            tokenized_batch = self._tokenize_function({"text": batch_samples})
+            input_ids = tokenized_batch["input_ids"]
+            
+            # Yield x and y (for autoregressive prediction they are the same)
+            yield input_ids, input_ids
+
+def create_streaming_loader(dataset_name, dataset_split, tokenizer, batch_size, gradient_accumulation_steps, 
+                           max_length=1024, text_column="text", num_workers=4):
+    """Create a DataLoader using our StreamingBatchLoader for efficient multiprocessing."""
+    dataset = StreamingBatchLoader(
+        dataset_name=dataset_name,
+        dataset_split=dataset_split,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        max_length=max_length,
+        text_column=text_column
+    )
+    
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=None,  # We handle batching in the dataset
+        num_workers=num_workers,
+        pin_memory=True, 
+        persistent_workers=True,
+        prefetch_factor=4
+    )
+    
+    return loader
 
 def preallocate_cuda_memory():
     """Preallocate CUDA memory to avoid fragmentation and improve performance"""
@@ -233,25 +274,33 @@ def preallocate_cuda_memory():
             # Calculate available memory
             free_mem, total_mem = torch.cuda.mem_get_info(device)
             
-            # Use a more conservative allocation to avoid OOM errors (75% of free memory)
-            mem_to_allocate = int(free_mem * 0.75)
+            # Use a more conservative allocation to avoid OOM errors (65% of free memory)
+            mem_to_allocate = int(free_mem * 0.65)
             
-            # Allocate in multiple smaller blocks instead of one large block
-            # This creates a more stable memory pool and reduces fragmentation
-            block_size = mem_to_allocate // 8
+            # Clear existing allocations first
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            
+            # Allocate in fewer, larger blocks to reduce fragmentation
+            # Using 4 blocks instead of 8 for more efficient memory usage
+            block_size = mem_to_allocate // 4
             allocations = []
             
             # Allocate blocks sequentially
-            for i in range(8):
+            for i in range(4):
                 try:
-                    # Use float16 instead of float32 to allocate more efficiently
+                    # Use float16 for more efficient allocation
                     allocations.append(torch.empty(block_size // 2, 
-                                                 dtype=torch.float16, 
-                                                 device='cuda'))
-                    print(f"Allocated block {i+1}/8 ({block_size/(1024**3):.2f} GB)")
+                                               dtype=torch.float16, 
+                                               device='cuda'))
+                    print(f"Allocated block {i+1}/4 ({block_size/(1024**3):.2f} GB)")
                 except RuntimeError as e:
-                    print(f"Stopped at block {i+1}/8: {e}")
+                    print(f"Stopped at block {i+1}/4: {e}")
                     break
+            
+            # Hold allocations for a moment to allow cache optimization
+            torch.cuda.synchronize()
+            time.sleep(0.5)
             
             # Free the allocations but keep them in CUDA cache
             for block in allocations:
@@ -361,6 +410,10 @@ def setup_cuda_optimizations():
     # Common optimizations
     torch.backends.cudnn.benchmark = True
     
+    gc.enable()
+    
+    torch.cuda.set_per_process_memory_fraction(0.95)
+    
     # Architecture-specific optimizations
     if detected_arch == "hopper":
         # H100/H800 - High-end HPC GPUs
@@ -370,7 +423,7 @@ def setup_cuda_optimizations():
         
         # Don't set a fixed memory fraction - let PyTorch manage dynamically
         # Instead set these memory-related environment variables
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.9"
         
         # Enable cudnn benchmark mode for optimizing convolution algorithms
         torch.backends.cudnn.benchmark = True
@@ -397,12 +450,16 @@ def setup_cuda_optimizations():
         
     elif detected_arch == "consumer":
         # Consumer GPUs (RTX 3000/4000 series)
-        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
+        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"  # Reduced from 8 to prevent fragmentation
         
         # More conservative memory settings for consumer GPUs
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8"
+        torch.cuda.empty_cache()  # Clear cache before starting
         
-        print("Consumer GPU optimizations applied: multiple connections, dynamic memory management")
+        # More aggressive GC settings for consumer GPUs
+        gc.set_threshold(100, 5, 2)  # More frequent collection
+        
+        print("Consumer GPU optimizations applied: optimized connections and memory management")
         
     else:
         # Unknown or older GPU - generic optimizations
@@ -445,48 +502,51 @@ def setup_cuda_optimizations():
     print("CUDA optimization configuration complete")
 
 def print_gpu_stats():
-    """Affiche des statistiques détaillées sur l'utilisation du GPU."""
+    """Print detailed GPU usage statistics"""
     if not torch.cuda.is_available():
+        print("CUDA not available")
         return
-        
-    # Obtenir les propriétés du GPU
+
     device = torch.cuda.current_device()
-    gpu_properties = torch.cuda.get_device_properties(device)
-    gpu_name = gpu_properties.name
+    device_properties = torch.cuda.get_device_properties(device)
     
-    # Obtenir les informations de mémoire
-    reserved = torch.cuda.memory_reserved(device) / 1024**2
-    allocated = torch.cuda.memory_allocated(device) / 1024**2
-    max_reserved = torch.cuda.max_memory_reserved(device) / 1024**2
-    max_allocated = torch.cuda.max_memory_allocated(device) / 1024**2
-    
-    # Calcul de la fragmentation (approximation)
-    fragmentation = 0
-    if reserved > 0:
-        fragmentation = (reserved - allocated) / reserved * 100
-    
-    # Affichage
-    print(f"\n===== GPU Stats ({gpu_name}) =====")
-    print(f"Mémoire réservée: {reserved:.1f}MB (max: {max_reserved:.1f}MB)")
-    print(f"Mémoire allouée: {allocated:.1f}MB (max: {max_allocated:.1f}MB)")
-    print(f"Fragmentation estimée: {fragmentation:.1f}%")
-    
-    # Essayer d'obtenir des statistiques supplémentaires si nvidia-smi est disponible
+    # Get memory information
     try:
-        import subprocess
-        result = subprocess.run(['nvidia-smi', '--query-gpu=utilization.gpu,utilization.memory,temperature.gpu', 
-                                 '--format=csv,noheader,nounits'], 
-                               stdout=subprocess.PIPE, 
-                               stderr=subprocess.PIPE,
-                               text=True)
+        free_mem, total_mem = torch.cuda.mem_get_info(device)
+        allocated_mem = torch.cuda.memory_allocated(device)
+        reserved_mem = torch.cuda.memory_reserved(device)
         
-        if result.returncode == 0:
-            gpu_util, mem_util, temp = result.stdout.strip().split(',')
-            print(f"Utilisation GPU: {gpu_util.strip()}%, Utilisation Mémoire: {mem_util.strip()}%, Température: {temp.strip()}°C")
-    except:
-        pass
-    
-    print("==============================")
+        # Calculate percentages
+        used_percent = 100 - (free_mem / total_mem * 100)
+        allocated_percent = allocated_mem / total_mem * 100
+        reserved_percent = reserved_mem / total_mem * 100
+        
+        # Get fragmentation info if available
+        fragmentation = "N/A"
+        if hasattr(torch.cuda, "memory_stats") and callable(getattr(torch.cuda, "memory_stats")):
+            stats = torch.cuda.memory_stats(device)
+            if "allocated_bytes.all.peak" in stats and "reserved_bytes.all.peak" in stats:
+                peak_allocated = stats["allocated_bytes.all.peak"]
+                peak_reserved = stats["reserved_bytes.all.peak"]
+                if peak_reserved > 0:
+                    fragmentation = f"{(1 - peak_allocated / peak_reserved) * 100:.1f}%"
+        
+        # Display memory information
+        print("\n=== GPU Memory Status ===")
+        print(f"Device: {device_properties.name}")
+        print(f"Memory: {free_mem/(1024**3):.2f}GB free / {total_mem/(1024**3):.2f}GB total ({used_percent:.1f}% used)")
+        print(f"Allocated: {allocated_mem/(1024**3):.2f}GB ({allocated_percent:.1f}%)")
+        print(f"Reserved: {reserved_mem/(1024**3):.2f}GB ({reserved_percent:.1f}%)")
+        print(f"Fragmentation: {fragmentation}")
+        print(f"Memory states: {torch.cuda.memory_stats(device)['reserved_bytes.all.current'] / (1024**3):.2f}GB reserved currently")
+        print("========================\n")
+    except (RuntimeError, AttributeError) as e:
+        print(f"Error getting memory info: {e}")
+        
+    # Print device info
+    print(f"Device: {device_properties.name}")
+    print(f"Compute capability: {device_properties.major}.{device_properties.minor}")
+
 
 def init_distributed(backend):
     """Initialize PyTorch distributed training backend"""
@@ -568,10 +628,10 @@ def train_llada(args):
     device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
     if args.dtype == 'float16':
         ctx = torch.amp.autocast(enabled=True, device_type='cuda')
-        scaler = GradScaler()
+        scaler = GradScaler(device==device_type)
     elif args.dtype == 'bfloat16' and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         ctx = torch.amp.autocast(enabled=True, device_type='cuda')
-        scaler = GradScaler()
+        scaler = GradScaler(device==device_type)
     else:
         ctx = nullcontext()
         scaler = None
@@ -627,7 +687,7 @@ def train_llada(args):
             betas=(args.beta1, args.beta2),
             device_type=device_type
         )
-        iter_num = 0
+        iter_num = 1
         best_val_loss = float('inf')
         
         # Initialize learning rate scheduler as None since we're using manual LR updates
@@ -637,7 +697,7 @@ def train_llada(args):
     print(f"Number of parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
     
     # Set up timing stats
-    timing_stats = AveragedTimingStats(print_interval=10)
+    timing_stats = AveragedTimingStats(print_interval=50)
     model.set_timing_stats(timing_stats)
     
     # Initialize DDP if needed
@@ -686,75 +746,39 @@ def train_llada(args):
     
     # Helper function to get a new loader instance
     def get_train_loader():
-        if args.use_streaming_dataset:
-            # Determine recommended number of workers based on CPUs
-            cpu_count = os.cpu_count() or 4
-            num_workers = min(4, max(1, cpu_count // 2))
-            
-            # Create optimized data loader
-            return create_llm_data_loader(
-                tokenizer=tokenizer,
-                batch_size=args.batch_size,
-                max_length=args.block_size,
-                gradient_accumulation_steps=args.gradient_accumulation_steps,
-                buffer_size=max(8, args.buffer_size),
-                num_workers=num_workers,
-                report_interval=100
-            )
-        else:
-            # Use the simple datasets for demonstration
-            if args.mode == 'pretrain':
-                # Random data for pre-training
-                # Use a slightly smaller upper bound to avoid edge cases
-                safe_vocab_size = min(args.vocab_size, args.vocab_size - 100)
-                data = torch.randint(0, safe_vocab_size, (10000,)).tolist()
-                dataset = TextDataset(data, args.block_size)
-                return DataLoader(
-                    dataset, 
-                    batch_size=args.batch_size, 
-                    shuffle=True,
-                    pin_memory=True,
-                    num_workers=2
-                )
-            else:
-                # Simple supervised fine-tuning data
-                # Create prompt-response pairs
-                data = [
-                    ([1, 2, 3, 4, 5], [6, 7, 8, 9, 10]),  # prompt, response
-                    ([11, 12, 13], [14, 15, 16, 17, 18, 19, 20]),
-                    ([21, 22, 23, 24], [25, 26, 27, 28, 29])
-                ]
-                dataset = SFTDataset(data, args.block_size)
-                return DataLoader(
-                    dataset, 
-                    batch_size=args.batch_size, 
-                    shuffle=True,
-                    pin_memory=True,
-                    num_workers=2
-                )
-    
-    if args.use_streaming_dataset:
-        print("Using streaming dataset")
-        from transformers import AutoTokenizer
+
+        num_workers = min(8, max(4, os.cpu_count() // 2))
         
-        # Initialize tokenizer
-        access_token = os.getenv('HF_TOKEN')
-        tokenizer = AutoTokenizer.from_pretrained(
-            "meta-llama/Llama-3.2-1B-Instruct", 
-            use_fast=True, 
-            access_token=access_token
+        # Use our accelerated DataLoader with StreamingBatchLoader
+        return create_streaming_loader(
+            dataset_name=args.dataset_name if hasattr(args, 'dataset_name') else 'HuggingFaceFW/fineweb-edu',
+            dataset_split=args.dataset_split if hasattr(args, 'dataset_split') else 'train',
+            tokenizer=tokenizer,
+            batch_size=args.batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            max_length=args.block_size,
+            text_column="text",
+            num_workers=num_workers
         )
-        tokenizer.pad_token = tokenizer.eos_token
+
+
+    print("Using streaming dataset")
+    from transformers import AutoTokenizer
+    
+    # Initialize tokenizer
+    access_token = os.getenv('HF_TOKEN')
+    tokenizer = AutoTokenizer.from_pretrained(
+        "meta-llama/Llama-3.2-1B-Instruct", 
+        use_fast=True, 
+        access_token=access_token
+    )
+    tokenizer.pad_token = tokenizer.eos_token
         
-        # Determine recommended number of workers based on CPUs
-        cpu_count = os.cpu_count() or 4
-        num_workers = min(4, max(1, cpu_count // 2))
-        
-        print(f"Using optimized LLMDataLoader with {num_workers} workers")
-        print(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
     
     # Get initial train loader
     train_loader = get_train_loader()
+    # Create an iterator from the DataLoader
+    train_iter = iter(train_loader)
     
     # Initialize timing
     t0 = time.time()
@@ -846,250 +870,33 @@ def train_llada(args):
                 # Réinitialiser DDP sync si nécessaire
                 if ddp:
                     model.require_backward_grad_sync = (args.gradient_accumulation_steps == 1)
-                
-                # Check CUDA graph compatibility first
-                cuda_graphs_compatible = False
-                if args.use_cuda_graphs:
-                    cuda_graphs_compatible, compatibility_message = check_cuda_graph_compatibility()
-                    if not cuda_graphs_compatible:
-                        print(f"CUDA graphs disabled: {compatibility_message}")
-                
-                # Configuration for CUDA Graphs
-                use_cuda_graph = (args.use_cuda_graphs and 
-                                  cuda_graphs_compatible and
-                                  torch.cuda.is_available() and 
-                                  hasattr(torch.cuda, 'CUDAGraph') and 
-                                  not ddp and 
-                                  device_type == 'cuda')
-                
-                # Important optimization: use CUDA graphs smarter - disable for uneven batch sizes
-                # Don't use for extremely large gradient accumulation steps, but increase threshold
-                if args.gradient_accumulation_steps > 8:
-                    use_cuda_graph = False
-                    if args.use_cuda_graphs and iter_num == 0:
-                        print("CUDA Graphs disabled because gradient_accumulation_steps > 8")
-                elif use_cuda_graph and iter_num == 0:
-                    print("CUDA Graphs enabled - first iteration will serve as warmup")
-                    
-                    # Hardware-specific CUDA graph settings
-                    if torch.cuda.is_available():
-                        gpu_name = torch.cuda.get_device_name().lower()
-                        
-                        # Detect problematic GPUs for CUDA graphs and adjust settings
-                        is_consumer_gpu = any(x in gpu_name for x in ['2070', '2080', '3060', '3070', '3080', '3090', '1660', '1060'])
-                        if is_consumer_gpu:
-                            if args.cuda_graphs_safe_mode:
-                                print(f"Using safer CUDA graph settings for consumer GPU: {gpu_name}")
-                                # Use more conservative settings for consumer GPUs
-                                max_graphs_per_shape = 1  # Only keep one graph per input shape
-                                
-                                # Enable synchronizations between operations
-                                os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-                            else:
-                                print(f"Warning: Consumer GPU detected ({gpu_name}). Consider using --cuda_graphs_safe_mode for stability")
+
                 
                 # GPU monitoring if requested
                 if args.gpu_monitor_interval > 0 and iter_num % args.gpu_monitor_interval == 0 and master_process:
                     print_gpu_stats()
-                
-                # More aggressive cache for CUDA graphs - only need 1 graph per size typically
-                max_graphs_per_shape = 1
-                static_input_shapes = {}
-                cuda_graphs = {}
-                
-                # Make sure CUDA graphs memory is managed efficiently
-                if use_cuda_graph and hasattr(torch.cuda, "graphs"):
-                    # Try to use the more memory-efficient CUDA graph API if available
-                    if hasattr(torch.cuda.graphs, "graph_pool_handle"):
-                        # Set memory pool for graphs to be more efficient
+                    
+                with timing_stats.track("data_preloading"):
+                    # Check if data loader has a method to fetch multiple batches at once
+                    data_loading_start = time.time()
+                    
+                    # For StreamingBatchLoader with DataLoader, we'll get batches for each gradient accumulation step
+                    batches = []
+                    for _ in range(args.gradient_accumulation_steps):
                         try:
-                            torch.cuda.graphs.graph_pool_handle()
-                        except:
-                            pass
+                            batch = next(train_iter)
+                            batches.append(batch)
+                        except StopIteration:
+                            # If we hit the end of the dataset, restart it
+                            train_iter = iter(train_loader)
+                            batch = next(train_iter)
+                            batches.append(batch)
+                    
+                    if master_process and iter_num % args.log_interval == 0:
+                        data_loading_time = time.time() - data_loading_start
+                        # print(f"🔄 DataLoader loading time: {data_loading_time*1000:.1f}ms for {len(batches)} batches")
                 
-                # Pre-load batches for all micro-steps
-                # Use multi-threaded, async loading for better performance
-                batches = []
-                batch_futures = []
-                use_threading = True
-                
-                def load_batch_worker(train_loader, mode, queue, idx):
-                    """Worker function to load batches in separate threads"""
-                    try:
-                        if args.use_streaming_dataset:
-                            batch = next(train_loader)
-                            queue.put((idx, batch))
-                        elif mode == 'pretrain':
-                            if isinstance(train_loader, DataLoader):
-                                x, y = next(iter(train_loader))
-                                queue.put((idx, (x, y)))
-                            else:
-                                x, y = next(train_loader)
-                                queue.put((idx, (x, y)))
-                        else:
-                            # SFT batch
-                            if isinstance(train_loader, DataLoader):
-                                batch = next(iter(train_loader))
-                                queue.put((idx, batch))
-                            else:
-                                batch = next(train_loader)
-                                queue.put((idx, batch))
-                    except StopIteration:
-                        queue.put((idx, None))
-                    except Exception as e:
-                        print(f"Batch loading error: {e}")
-                        queue.put((idx, None))
-                
-                try:
-                    with timing_stats.track("data_preloading"):
-                        # Check if data loader has a method to fetch multiple batches at once
-                        data_loading_start = time.time()
-                        
-                        if args.use_streaming_dataset and hasattr(train_loader, 'get_accumulation_batches'):
-                            # Optimized method to get all batches at once
-                            batches = train_loader.get_accumulation_batches(args.gradient_accumulation_steps)
-                            if master_process and iter_num % args.log_interval == 0:
-                                data_loading_time = time.time() - data_loading_start
-                                # print(f"🔄 Data loading time (optimized): {data_loading_time*1000:.1f}ms for {args.gradient_accumulation_steps} batches")
-                                if len(batches) != args.gradient_accumulation_steps:
-                                    print(f"⚠️ Warning: Expected {args.gradient_accumulation_steps} batches, got {len(batches)}")
-                        else:
-                            # Use threaded batch loading for better performance
-                            if use_threading:
-                                import queue
-                                batch_queue = queue.Queue()
-                                threads = []
-                                
-                                # Start all loading threads at once
-                                for i in range(args.gradient_accumulation_steps):
-                                    thread = threading.Thread(
-                                        target=load_batch_worker,
-                                        args=(train_loader, args.mode, batch_queue, i)
-                                    )
-                                    thread.daemon = True
-                                    thread.start()
-                                    threads.append(thread)
-                                
-                                # Initialize batches list with None placeholders
-                                batches = [None] * args.gradient_accumulation_steps
-                                
-                                # Collect results as they complete
-                                completed = 0
-                                while completed < args.gradient_accumulation_steps:
-                                    try:
-                                        idx, batch = batch_queue.get(timeout=1.0)
-                                        if batch is None:
-                                            raise StopIteration
-                                        batches[idx] = batch
-                                        completed += 1
-                                    except queue.Empty:
-                                        # Check if any threads have died
-                                        if not any(t.is_alive() for t in threads):
-                                            if completed == 0:
-                                                raise StopIteration
-                                            break
-                                
-                                # If we didn't get all batches, we need to raise StopIteration
-                                if None in batches:
-                                    raise StopIteration
-                                
-                                if master_process and iter_num % args.log_interval == 0:
-                                    data_loading_time = time.time() - data_loading_start
-                                    # print(f"🔄 Data loading time (threaded): {data_loading_time*1000:.1f}ms for {args.gradient_accumulation_steps} batches")
-                            else:
-                                # Fallback: get batches one by one
-                                for i in range(args.gradient_accumulation_steps):
-                                    load_start = time.time()
-                                    if args.use_streaming_dataset:
-                                        # New optimized data loader
-                                        batch = next(train_loader)
-                                        batches.append(batch)
-                                    elif args.mode == 'pretrain':
-                                        if isinstance(train_loader, DataLoader):
-                                            x, y = next(iter(train_loader))
-                                            batches.append((x, y))
-                                        else:
-                                            x, y = next(train_loader)
-                                            batches.append((x, y))
-                                    else:
-                                        # SFT batch
-                                        if isinstance(train_loader, DataLoader):
-                                            batch = next(iter(train_loader))
-                                            batches.append(batch)
-                                        else:
-                                            batch = next(train_loader)
-                                            batches.append(batch)
-                                    
-                                    # Detailed load time logging
-                                    if master_process and iter_num % args.log_interval == 0:
-                                        load_time = time.time() - load_start
-                                        #print(f"🔄 Data loading time (batch {i+1}/{args.gradient_accumulation_steps}): {load_time*1000:.1f}ms")
-                except StopIteration:
-                    if args.use_streaming_dataset and master_process:
-                        print("Fin de l'itération du dataloader, réinitialisation...")
-                    train_loader = get_train_loader()
-                    # On saute cette itération
-                    continue
-                
-                # Import memory utilities
-                try:
-                    from memory_utils import free_memory, tensor_pool
-                except ImportError:
-                    free_memory = lambda: None
-                    tensor_pool = None
-                
-                # Reserve GPU memory for this iteration - helps maintain stable memory patterns
-                if torch.cuda.is_available() and not args.disable_non_blocking:
-                    # Clear memory but keep allocation patterns stable
-                    torch.cuda.synchronize()
-                    free_memory()
-                
-                # Create CUDA streams for overlapped execution
-                data_stream = torch.cuda.Stream() if torch.cuda.is_available() and not args.disable_non_blocking else None
-                compute_stream = torch.cuda.current_stream() if torch.cuda.is_available() else None
-                
-                # Initialize micro_step before using it
-                micro_step = 0
-                
-                # Pre-allocate tensors for each batch to reduce memory fragmentation
-                prefetched_data_all = [{} for _ in range(min(2, len(batches)))]
-                
-                # Pre-fetch first batch data to device asynchronously
-                if data_stream is not None and len(batches) > 0:
-                    with torch.cuda.stream(data_stream):
-                        # Batch 0
-                        if args.use_streaming_dataset:
-                            prefetched_data_all[0]['x'] = batches[0]['input_ids'].to(device, non_blocking=True)
-                            prefetched_data_all[0]['y'] = batches[0]['labels'].to(device, non_blocking=True)
-                        elif args.mode == 'pretrain':
-                            x, y = batches[0]
-                            prefetched_data_all[0]['x'] = x.to(device, non_blocking=True)
-                            prefetched_data_all[0]['y'] = y.to(device, non_blocking=True)
-                        else:
-                            # SFT batch
-                            prefetched_data_all[0]['batch'] = {k: v.to(device, non_blocking=True) 
-                                                          for k, v in batches[0].items()}
-                        
-                        # Batch 1 if available
-                        if len(batches) > 1 and len(prefetched_data_all) > 1:
-                            if args.use_streaming_dataset:
-                                prefetched_data_all[1]['x'] = batches[1]['input_ids'].to(device, non_blocking=True)
-                                prefetched_data_all[1]['y'] = batches[1]['labels'].to(device, non_blocking=True)
-                            elif args.mode == 'pretrain':
-                                x, y = batches[1]
-                                prefetched_data_all[1]['x'] = x.to(device, non_blocking=True)
-                                prefetched_data_all[1]['y'] = y.to(device, non_blocking=True)
-                            else:
-                                # SFT batch
-                                prefetched_data_all[1]['batch'] = {k: v.to(device, non_blocking=True) 
-                                                              for k, v in batches[1].items()}
-                
-                # Create a flag for background prefetching
-                prefetch_scheduled = [False] * len(batches)
-                prefetch_scheduled[0] = True  # First batch is already prefetched
-                if len(batches) > 1 and len(prefetched_data_all) > 1:
-                    prefetch_scheduled[1] = True  # Second batch too if available
-                
+
                 # Gradient accumulation loop
                 for micro_step in range(args.gradient_accumulation_steps):
                     # Enable DDP gradient sync only for the last micro_step
@@ -1098,389 +905,58 @@ def train_llada(args):
                     
                     # Fetch data from the pre-loaded batches
                     with timing_stats.track(f"data_loading_{micro_step}"):
-                        if data_stream is not None and micro_step < len(batches):
-                            # Wait for the prefetched data to be ready
-                            torch.cuda.current_stream().wait_stream(data_stream)
+                        # Use the pre-chunked tensors with optimized transfer
+                        # Always use non_blocking=True for better overlapping of data transfer and computation
+                        x = batches[micro_step][0].to(device, non_blocking=True)
+                        y = batches[micro_step][1].to(device, non_blocking=True)
+                        
+                        # Pin memory to speed up CPU->GPU transfers if not already done
+                        torch.cuda.synchronize()  # Ensure data transfer is complete before computation
+                       
+                    with torch.amp.autocast(enabled=True, device_type='cuda') if ctx else nullcontext():
+                        with timing_stats.track(f"forward_{micro_step}"):
+                            # For stable training iterations, capture CUDA graph
+
+                            outputs = model(x, targets=y)
                             
-                            # Get the current prefetched data
-                            prefetch_idx = micro_step % len(prefetched_data_all)
-                            prefetched_data = prefetched_data_all[prefetch_idx]
-                            
-                            # Use the prefetched data
-                            if args.use_streaming_dataset:
-                                x = prefetched_data.get('x')
-                                y = prefetched_data.get('y')
-                            elif args.mode == 'pretrain':
-                                x = prefetched_data.get('x')
-                                y = prefetched_data.get('y')
+                            # Process loss based on output format
+                            if isinstance(outputs, dict):
+                                loss = outputs['loss']
+                                router_loss = outputs.get('router_loss', None)
+                            elif isinstance(outputs, tuple) and len(outputs) >= 2:
+                                # Tuple format (logits, loss, [router_loss])
+                                _, loss = outputs[:2]
+                                router_loss = outputs[2] if len(outputs) > 2 else None
                             else:
-                                # SFT batch
-                                batch = prefetched_data.get('batch', {})
-                            
-                            # Schedule next prefetch if it's not already scheduled
-                            next_idx = micro_step + len(prefetched_data_all)
-                            if next_idx < len(batches) and not prefetch_scheduled[next_idx]:
-                                with torch.cuda.stream(data_stream):
-                                    # Determine which prefetch slot to use
-                                    next_prefetch_idx = next_idx % len(prefetched_data_all)
-                                    
-                                    # Clear previous data in this slot to release memory
-                                    prefetched_data_all[next_prefetch_idx].clear()
-                                    
-                                    # Load new batch data
-                                    if args.use_streaming_dataset:
-                                        prefetched_data_all[next_prefetch_idx]['x'] = batches[next_idx]['input_ids'].to(device, non_blocking=True)
-                                        prefetched_data_all[next_prefetch_idx]['y'] = batches[next_idx]['labels'].to(device, non_blocking=True)
-                                    elif args.mode == 'pretrain':
-                                        next_x, next_y = batches[next_idx]
-                                        prefetched_data_all[next_prefetch_idx]['x'] = next_x.to(device, non_blocking=True)
-                                        prefetched_data_all[next_prefetch_idx]['y'] = next_y.to(device, non_blocking=True)
-                                    else:
-                                        # SFT batch
-                                        prefetched_data_all[next_prefetch_idx]['batch'] = {k: v.to(device, non_blocking=True) 
-                                                                                    for k, v in batches[next_idx].items()}
+                                # Fallback 
+                                loss = outputs
+                                router_loss = None
                                 
-                                # Mark as scheduled
-                                prefetch_scheduled[next_idx] = True
-                        else:
-                            # Standard synchronous data loading as fallback
-                            if args.use_streaming_dataset:
-                                batch = batches[micro_step]
-                                # Transfer data in non-blocking and asynchronous mode
-                                with torch.cuda.stream(torch.cuda.Stream()) if not args.disable_non_blocking else nullcontext():
-                                    x = batch['input_ids'].to(device, non_blocking=not args.disable_non_blocking)
-                                    y = batch['labels'].to(device, non_blocking=not args.disable_non_blocking)
-                            elif args.mode == 'pretrain':
-                                x, y = batches[micro_step]
-                                x = x.to(device, non_blocking=not args.disable_non_blocking)
-                                y = y.to(device, non_blocking=not args.disable_non_blocking)
+                            # Router loss if present
+                            if router_loss is not None and args.mode == 'pretrain':
+                                router_loss = router_loss * args.router_loss_weight
+                                loss = loss + router_loss
+                                router_loss_value = router_loss.item()
+                                
+    
                             else:
-                                # SFT batch
-                                batch = batches[micro_step]
-                                batch = {k: v.to(device, non_blocking=not args.disable_non_blocking) for k, v in batch.items()}
-                        
-                    # Création d'une clé unique pour chaque taille d'entrée
-                    input_shape_key = None
-                    if args.use_streaming_dataset or args.mode == 'pretrain':
-                        input_shape_key = tuple(x.shape)
-                    else:
-                        input_shape_key = tuple(batch['input_ids'].shape)
-                        
-                    # Clé unique pour ce micro-step et cette forme d'entrée
-                    cuda_graph_key = (input_shape_key, micro_step % max_graphs_per_shape) if input_shape_key is not None else None
-                    use_graph_for_step = use_cuda_graph and cuda_graph_key is not None
-                    
-                    # TRAITEMENT SELON LA STRATÉGIE: CUDA GRAPH RÉUTILISÉ, CAPTURE, OU EXÉCUTION NORMALE
-                    if use_graph_for_step and cuda_graph_key in cuda_graphs and iter_num > 1:
-                        # CASE 1: REUSE EXISTING CUDA GRAPH
-                        try:
-                            with timing_stats.track(f"cuda_graph_replay_{micro_step}"):
-                                # Get previously created static inputs
-                                static_inputs = static_input_shapes[cuda_graph_key]
-                                
-                                # Copy new data to static tensors with shape validation
-                                with torch.no_grad():
-                                    if args.use_streaming_dataset or args.mode == 'pretrain':
-                                        # First validate input shapes match exactly
-                                        if static_inputs['x'].shape != x.shape or static_inputs['y'].shape != y.shape:
-                                            raise RuntimeError(f"Input shapes changed: expected {static_inputs['x'].shape}, got {x.shape}")
-                                        
-                                        # Safe copy with synchronization to avoid race conditions
-                                        static_inputs['x'].copy_(x)
-                                        static_inputs['y'].copy_(y)
-                                    else:
-                                        for k, v in batch.items():
-                                            if k not in static_inputs:
-                                                raise RuntimeError(f"Missing key {k} in static inputs")
-                                            if static_inputs[k].shape != v.shape:
-                                                raise RuntimeError(f"Shape mismatch for {k}: expected {static_inputs[k].shape}, got {v.shape}")
-                                            static_inputs[k].copy_(v)
-                                
-                                # Ensure all copies are complete before replay
-                                torch.cuda.synchronize()
-                                
-                                # Execute the previously captured CUDA graph
-                                cuda_graphs[cuda_graph_key].replay()
-                                
-                                # Wait for graph execution to complete
-                                torch.cuda.synchronize()
-                                
-                                # Get results from static tensors
-                                loss_value = static_inputs['loss'].item()
-                                router_loss_value = static_inputs.get('router_loss', torch.tensor(0.0)).item()
-                                
-                                # Update statistics
-                                loss_accumulator += loss_value
-                                router_loss_accumulator += router_loss_value
-                                
-                                # Count processed tokens
-                                batch_size = x.size(0) if args.use_streaming_dataset or args.mode == 'pretrain' else batch['input_ids'].size(0)
-                                batch_tokens = batch_size * args.block_size
-                                total_tokens += batch_tokens
+                                router_loss_value = 0.0
                             
-                            if iter_num % 100 == 0 and micro_step == 0:
-                                print(f"Successfully replayed CUDA graph for micro_step {micro_step}")
-                        
-                        except Exception as e:
-                            print(f"CUDA graph replay failed: {e}")
-                            print("Falling back to normal execution")
-                            
-                            # Clean up the broken graph
-                            if cuda_graph_key in cuda_graphs:
-                                del cuda_graphs[cuda_graph_key]
-                            if cuda_graph_key in static_input_shapes:
-                                del static_input_shapes[cuda_graph_key]
-                            
-                            torch.cuda.empty_cache()
-                            torch.cuda.synchronize()
-                            
-                            # Disable graph usage for future iterations
-                            use_cuda_graph = False
-                            
-                            # Execute normally as fallback
-                            with torch.amp.autocast(enabled=True, device_type='cuda') if ctx else nullcontext():
-                                if args.use_streaming_dataset or args.mode == 'pretrain':
-                                    outputs = model(x, targets=y)
-                                else:
-                                    outputs = model(**batch)
-                                
-                                # Handle different output formats
-                                if isinstance(outputs, dict):
-                                    loss = outputs['loss']
-                                    router_loss = outputs.get('router_loss', None)
-                                elif isinstance(outputs, tuple) and len(outputs) >= 2:
-                                    _, loss = outputs[:2]
-                                    router_loss = outputs[2] if len(outputs) > 2 else None
-                                else:
-                                    loss = outputs
-                                    router_loss = None
-                                
-                                # Process router loss if present
-                                if router_loss is not None and args.mode == 'pretrain':
-                                    router_loss = router_loss * args.router_loss_weight
-                                    loss = loss + router_loss
-                                    router_loss_value = router_loss.item()
-                                else:
-                                    router_loss_value = 0.0
-                                
-                                # Update statistics
-                                loss_accumulator += loss.item()
-                                router_loss_accumulator += router_loss_value
-                                
-                                # Count tokens
-                                batch_size = x.size(0) if args.use_streaming_dataset or args.mode == 'pretrain' else batch['input_ids'].size(0)
-                                batch_tokens = batch_size * args.block_size
-                                total_tokens += batch_tokens
-                                
-                                # Backward pass
-                                micro_loss = loss / args.gradient_accumulation_steps
-                                if scaler is not None:
-                                    scaler.scale(micro_loss).backward()
-                                else:
-                                    micro_loss.backward()
-                            
-                    elif use_graph_for_step and iter_num == 1 and micro_step < max_graphs_per_shape:
-                        # CAS 2: CAPTURE D'UN NOUVEAU GRAPHE CUDA
-                        with timing_stats.track(f"cuda_graph_capture_{micro_step}"):
-                            try:
-                                # Create local copies of inputs to avoid modifications during capture
-                                static_inputs = {}
-                                if args.use_streaming_dataset or args.mode == 'pretrain':
-                                    static_inputs['x'] = x.clone()
-                                    static_inputs['y'] = y.clone()
-                                else:
-                                    static_inputs = {k: v.clone() for k, v in batch.items()}
-                                
-                                # Prepare output tensors
-                                static_inputs['loss'] = torch.zeros(1, device=device)
-                                if args.mode == 'pretrain':
-                                    static_inputs['router_loss'] = torch.zeros(1, device=device)
-                                
-                                # Make sure everything is on the same device
-                                for k, v in static_inputs.items():
-                                    if isinstance(v, torch.Tensor) and v.device != device:
-                                        static_inputs[k] = v.to(device)
-                                
-                                # Ensure CUDA is synchronized before capture
-                                torch.cuda.synchronize()
-                                
-                                # Empty cache to minimize chance of memory fragmentation
-                                torch.cuda.empty_cache()
-                                torch.cuda.synchronize()
-                                
-                                # Create a fresh graph instance
-                                cuda_graphs[cuda_graph_key] = torch.cuda.CUDAGraph()
-                                
-                                # Pre-run a single forward-backward pass outside the graph to warmup
-                                with torch.no_grad():
-                                    if args.use_streaming_dataset or args.mode == 'pretrain':
-                                        _ = model(static_inputs['x'], targets=static_inputs['y'])
-                                    else:
-                                        _ = model(**{k: static_inputs[k] for k in batch.keys()})
-                                
-                                # Capture the graph with robust error handling
-                                with torch.cuda.graph(cuda_graphs[cuda_graph_key]):
-                                    # Forward pass
-                                    # Use nullcontext instead of autocast to avoid capture issues
-                                    # autocast can cause problems during graph capture
-                                    with nullcontext():
-                                        if args.use_streaming_dataset or args.mode == 'pretrain':
-                                            outputs = model(static_inputs['x'], targets=static_inputs['y'])
-                                        else:
-                                            outputs = model(**{k: static_inputs[k] for k in batch.keys()})
-                                        
-                                        # Process loss
-                                        if isinstance(outputs, dict) and 'loss' in outputs:
-                                            loss = outputs['loss']
-                                        elif isinstance(outputs, tuple) and len(outputs) > 1:
-                                            _, loss = outputs[:2]
-                                        else:
-                                            loss = outputs
-                                        
-                                        static_inputs['loss'].copy_(loss.detach())
-                                        
-                                        # Router loss if present
-                                        router_loss = None
-                                        if args.mode == 'pretrain':
-                                            if isinstance(outputs, dict) and 'router_loss' in outputs:
-                                                router_loss = outputs['router_loss']
-                                            elif isinstance(outputs, tuple) and len(outputs) > 2:
-                                                router_loss = outputs[2]
-                                            
-                                            if router_loss is not None:
-                                                static_inputs['router_loss'].copy_(router_loss.detach())
-                                                # Combine losses for backward
-                                                loss = loss + router_loss * args.router_loss_weight
-                                        
-                                        # Backward pass
-                                        micro_loss = loss / args.gradient_accumulation_steps
-                                        if scaler is not None:
-                                            scaler.scale(micro_loss).backward()
-                                        else:
-                                            micro_loss.backward()
-                                
-                                # Store the graph and inputs for reuse
-                                static_input_shapes[cuda_graph_key] = static_inputs
-                                
-                                # Sync again after capture to ensure everything is complete
-                                torch.cuda.synchronize()
-                                
-                                print(f"Successfully captured CUDA graph for micro_step {micro_step}")
-                            except RuntimeError as e:
-                                print(f"CUDA graph capture failed: {e}")
-                                print("Falling back to non-graph execution for this step")
-                                # Clear any partial graph to avoid resource leaks
-                                if cuda_graph_key in cuda_graphs:
-                                    del cuda_graphs[cuda_graph_key]
-                                
-                                # Force PyTorch to clean up any hanging resources
-                                torch.cuda.empty_cache()
-                                torch.cuda.synchronize()
-                                
-                                # Disable graph usage for all future iterations to avoid repeated errors
-                                use_cuda_graph = False
-                                
-                                # Execute normally as a fallback
-                                # Forward pass normal
-                                with torch.amp.autocast(enabled=True, device_type='cuda') if ctx else nullcontext():
-                                    if args.use_streaming_dataset or args.mode == 'pretrain':
-                                        outputs = model(x, targets=y)
-                                    else:
-                                        outputs = model(**batch)
-                                    
-                                    # Handle different output formats
-                                    if isinstance(outputs, dict):
-                                        loss = outputs['loss']
-                                        router_loss = outputs.get('router_loss', None)
-                                    elif isinstance(outputs, tuple) and len(outputs) >= 2:
-                                        _, loss = outputs[:2]
-                                        router_loss = outputs[2] if len(outputs) > 2 else None
-                                    else:
-                                        loss = outputs
-                                        router_loss = None
-                                    
-                                    # Router loss if present
-                                    if router_loss is not None and args.mode == 'pretrain':
-                                        router_loss = router_loss * args.router_loss_weight
-                                        loss = loss + router_loss
-                                        router_loss_value = router_loss.item()
-                                    else:
-                                        router_loss_value = 0.0
-                                    
-                                    # Update statistics
-                                    loss_accumulator += loss.item()
-                                    router_loss_accumulator += router_loss_value
-                                    
-                                    # Calculate token count
-                                    batch_size = x.size(0) if args.use_streaming_dataset or args.mode == 'pretrain' else batch['input_ids'].size(0)
-                                    batch_tokens = batch_size * args.block_size
-                                    total_tokens += batch_tokens
-                                    
-                                    # Backward pass
-                                    micro_loss = loss / args.gradient_accumulation_steps
-                                    if scaler is not None:
-                                        scaler.scale(micro_loss).backward()
-                                    else:
-                                        micro_loss.backward()
-                            
-                            # Mise à jour des statistiques après la capture
-                            loss_value = static_inputs['loss'].item()
-                            router_loss_value = static_inputs.get('router_loss', torch.tensor(0.0)).item()
-                            loss_accumulator += loss_value
+                            # Mise à jour des statistiques
+                            loss_accumulator += loss.item()
                             router_loss_accumulator += router_loss_value
                             
                             # Comptabiliser les tokens traités
-                            batch_size = x.size(0) if args.use_streaming_dataset or args.mode == 'pretrain' else batch['input_ids'].size(0)
+                            batch_size = x.size(0)
                             batch_tokens = batch_size * args.block_size
                             total_tokens += batch_tokens
-                            
-                            print(f"Nouveau graphe CUDA capturé pour micro_step {micro_step}")
-                    else:
-                        # CAS 3: EXÉCUTION NORMALE SANS CUDA GRAPH
-                            # Forward pass normal
-                        with torch.amp.autocast(enabled=True, device_type='cuda') if ctx else nullcontext():
-                            with timing_stats.track(f"forward_{micro_step}"):
-                                if args.use_streaming_dataset or args.mode == 'pretrain':
-                                    outputs = model(x, targets=y)
-                                else:
-                                    outputs = model(**batch)
-                                
-                                # Traitement de la loss selon le format des outputs
-                                if isinstance(outputs, dict):
-                                    loss = outputs['loss']
-                                    router_loss = outputs.get('router_loss', None)
-                                elif isinstance(outputs, tuple) and len(outputs) >= 2:
-                                    # Tuple format (logits, loss, [router_loss])
-                                    _, loss = outputs[:2]
-                                    router_loss = outputs[2] if len(outputs) > 2 else None
-                                else:
-                                    # Fallback 
-                                    loss = outputs
-                                    router_loss = None
-                                
-                                # Router loss si présent
-                                if router_loss is not None and args.mode == 'pretrain':
-                                    router_loss = router_loss * args.router_loss_weight
-                                    loss = loss + router_loss
-                                    router_loss_value = router_loss.item()
-                                else:
-                                    router_loss_value = 0.0
-                                
-                                # Mise à jour des statistiques
-                                loss_accumulator += loss.item()
-                                router_loss_accumulator += router_loss_value
-                                
-                                # Comptabiliser les tokens traités
-                                batch_size = x.size(0) if args.use_streaming_dataset or args.mode == 'pretrain' else batch['input_ids'].size(0)
-                                batch_tokens = batch_size * args.block_size
-                                total_tokens += batch_tokens
-                            with timing_stats.track(f"backward_{micro_step}"):
-                                # Backward pass
-                                micro_loss = loss / args.gradient_accumulation_steps
-                                if scaler is not None:
-                                    scaler.scale(micro_loss).backward()
-                                else:
-                                    micro_loss.backward()
+                        with timing_stats.track(f"backward_{micro_step}"):
+                            # Backward pass
+                            micro_loss = loss / args.gradient_accumulation_steps
+                            if scaler is not None:
+                                scaler.scale(micro_loss).backward()
+                            else:
+                                micro_loss.backward()
                 
                 # Calculate tokens per second
                 tokens_per_sec = total_tokens / (time.time() - batch_start_time) if total_tokens > 0 else 0
@@ -1510,38 +986,51 @@ def train_llada(args):
                     tokens_window.append((time.time(), total_tokens))
                     if len(tokens_window) > window_size:
                         tokens_window.pop(0)
+                    
+                    # Periodic memory management to prevent fragmentation
+                    if iter_num % 10 == 0:
+                        # Only run empty_cache occasionally to avoid overhead
+                        # But frequently enough to reduce fragmentation
+                        torch.cuda.empty_cache()
                 
                 # timing and logging
                 t1 = time.time()
                 dt = t1 - t0
                 t0 = t1
                 
-                # Progress reporting
-                if iter_num % args.log_interval == 0 and master_process:
-                    # Convert tensor losses to scalars for reporting
-                    avg_loss = loss_accumulator / args.gradient_accumulation_steps
-                    avg_router_loss = router_loss_accumulator / args.gradient_accumulation_steps
+                # Update timing stats
+                timing_stats.step()
+                
+                
+                # Print training progress
+                if iter_num % args.log_interval == 0:
+                    # Calculate loss across this interval
+                    loss_avg = loss_accumulator / args.gradient_accumulation_steps
+                    router_loss_avg = router_loss_accumulator / args.gradient_accumulation_steps if router_loss_accumulator > 0 else 0
                     
-                    # Calculate tokens per second (moving average)
-                    if len(tokens_window) > 1:
-                        window_time = tokens_window[-1][0] - tokens_window[0][0]
-                        window_tokens = sum(tokens for _, tokens in tokens_window)
-                        current_tokens_per_sec = window_tokens / window_time if window_time > 0 else 0
+                    # Calculate tokens/s
+                    tokens_per_sec_fmt = f"{tokens_per_sec:.0f}"
+                    
+                    # Print statistics
+                    if args.mode == 'pretrain':
+                        print(f"iter {iter_num}: loss {loss_avg:.4f}, router_loss {router_loss_avg:.6f}, {tokens_per_sec_fmt} tokens/s")
                     else:
-                        current_tokens_per_sec = 0
+                        print(f"iter {iter_num}: loss {loss_avg:.4f}, {tokens_per_sec_fmt} tokens/s")
                     
-                    # Calculate overall tokens per second
-                    elapsed = time.time() - train_start_time
-                    overall_tokens_per_sec = total_tokens / elapsed if elapsed > 0 else 0
-                    
-                    print(f"Iter {iter_num}: loss {avg_loss:.4f}, router_loss {avg_router_loss:.4f}, "
-                          f"time {dt*1000:.2f}ms, lr {lr:.6f}, tokens {total_tokens:,}, "
-                          f"tok/s {current_tokens_per_sec:.2f}, avg tok/s {overall_tokens_per_sec:.2f}")
-                    
-                    timing_stats.step()
-                    
+                    # Print timing statistics if available
                     if timing_stats.should_print():
                         timing_stats.print_stats()
+                    
+                    # Reset accumulators
+                    loss_accumulator = 0.0
+                    router_loss_accumulator = 0.0
+                    
+                    # Print GPU stats every 10 iterations to monitor memory usage
+                    if iter_num % 10 == 0:
+                        print_gpu_stats()
+
+                # Set up next iteration
+                t0 = t1
                 
                 # Save checkpoint
                 if (iter_num > 0 and iter_num % args.save_interval == 0) and master_process:
@@ -1564,23 +1053,7 @@ def train_llada(args):
                 if iter_num % 100 == 0:
                     cleanup_memory()
                 
-                # Clean up tensor memory after each iteration
-                try:
-                    # Access tensor pool and clean it up to maintain stable memory
-                    from memory_utils import tensor_pool, free_memory
-                    tensor_pool.clear()
-                    
-                    # Light memory cleanup every iteration helps maintain stable patterns
-                    if iter_num % 5 == 0:
-                        free_memory()
-                except ImportError:
-                    # Fallback if memory_utils isn't properly imported
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                
-                # Clear any intermediate tensors from prefetched data
-                for data_dict in prefetched_data_all:
-                    data_dict.clear()
+
                 
                 if master_process and iter_num % 100 == 0:
                     # Synchronize and print memory stats periodically
