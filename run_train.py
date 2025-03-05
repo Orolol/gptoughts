@@ -31,7 +31,7 @@ def get_datasets(block_size, batch_size, device, tokenizer=None):
         )
         
         val_dataset = FinewebDataset(
-            split='validation',
+            split='train',
             max_length=block_size,
             buffer_size=batch_size * 2,
             shuffle=False,
