@@ -342,7 +342,7 @@ class LLaDAModel(nn.Module):
             # Reset KV cache to free memory
             self.reset_kv_cache()
             
-            return generated
+            return generated, None
             
         except Exception as e:
             print(f"Error during generation: {e}")

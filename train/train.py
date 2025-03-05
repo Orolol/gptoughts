@@ -457,7 +457,7 @@ class Trainer:
             if hasattr(self.model, 'set_gradient_checkpointing'):
                 self.model.set_gradient_checkpointing(True)
             try:
-                self.model = torch.compile(self.model)
+                self.model = torch.compile(self.model, mode="max-autotune")
             except Exception as e:
                 print(f"Compilation failed: {e}")
                 print(traceback.format_exc())

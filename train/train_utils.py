@@ -344,27 +344,16 @@ def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8, top_
     
     with torch.no_grad():
         with torch.amp.autocast(enabled=True, device_type='cuda'):
-            # Use the model's generate method
-            # Pour LLaDAModel, ne pas passer tokenizer comme argument
-            if hasattr(model, '__class__') and model.__class__.__name__ == 'LLaDAModel':
-                output_tokens = model.generate(
-                    prompt=encoder_input,
-                    steps=32,  # Number of diffusion steps
-                    gen_length=max_new_tokens,
-                    block_length=max_new_tokens,
-                    temperature=temperature
-                )
-                output_text = None
-            else:
-                # Pour les autres modèles qui pourraient accepter tokenizer
-                output_tokens, output_text = model.generate(
-                    prompt=encoder_input,
-                    steps=32,  # Number of diffusion steps
-                    gen_length=max_new_tokens,
-                    block_length=max_new_tokens,
-                    temperature=temperature,
-                    tokenizer=tokenizer
-                )
+
+            # Pour les autres modèles qui pourraient accepter tokenizer
+            output_tokens, output_text = model.generate(
+                prompt=encoder_input,
+                steps=32,  # Number of diffusion steps
+                gen_length=max_new_tokens,
+                block_length=max_new_tokens,
+                temperature=temperature,
+                tokenizer=tokenizer
+            )
     
     # If output_text is already provided by the model, use it
     if output_text is not None:
