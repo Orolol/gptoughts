@@ -700,7 +700,12 @@ class Trainer:
                         temperature=0.7,
                         tokenizer=tokenizer if hasattr(self.args, 'tokenizer') else None
                     )
-                    print(f"Generated text: {prompt} {output_text}\n")
+                    
+                    # Si output_text est None (cas de LLaDAModel), on ne l'affiche pas
+                    if output_text is not None:
+                        print(f"Generated text: {prompt} {output_text}\n")
+                    else:
+                        print(f"Text generation completed (output format depends on model type)\n")
                     return
                 
                 # Decode the generated text
