@@ -11,7 +11,7 @@ import subprocess
 from transformers import AutoTokenizer
 
 from gpu_optimization import setup_cuda_optimizations, print_gpu_stats
-from train_utils import get_gpu_count
+from train.train_utils import get_gpu_count
 
 def get_datasets(block_size, batch_size, device, tokenizer=None):
     """
