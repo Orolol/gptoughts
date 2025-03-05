@@ -544,22 +544,29 @@ def calculate_model_flops(model, batch_size, seq_length, dtype=torch.float16):
     # Facteur de multiplication pour le type de données
     # fp16 est 2x plus rapide que fp32 sur la plupart des GPUs modernes
     dtype_factor = 2.0 if dtype == torch.float16 else 1.0
-    
     # Calculer les FLOPS pour l'attention
     # Pour chaque couche: 4 * hidden_size^2 (projections QKV et O) + 2 * seq_length * hidden_size (matmul QK et matmul V)
-    attention_flops = 4 * config.get('hidden_size', 2048)**2 + 2 * seq_length * config.get('hidden_size', 2048)
+    hidden_size = getattr(config, 'n_embd', 2048)  # n_embd dans LLaDAConfig correspond à hidden_size
+    attention_flops = 4 * hidden_size**2 + 2 * seq_length * hidden_size
     
     # Calculer les FLOPS pour le MLP/FFN
     # Pour chaque couche: 2 * hidden_size * intermediate_size (deux projections linéaires)
-    mlp_flops = 2 * config.get('hidden_size', 2048) * config.get('intermediate_size', 4096)
+    # Pour LLaDAConfig, on utilise 4*n_embd comme approximation de intermediate_size
+    intermediate_size = getattr(config, 'intermediate_size', 4 * hidden_size)
+    mlp_flops = 2 * hidden_size * intermediate_size
     
     # Calculer les FLOPS pour MoE si applicable
     moe_factor = 1.0
-    if hasattr(config, 'num_experts') and hasattr(config, 'num_experts_per_token'):
-        # Pour MoE, on multiplie par le ratio d'experts utilisés par token
+    if hasattr(config, 'num_experts') and hasattr(config, 'k'):
+        # Pour LLaDA MoE, on utilise k/num_experts comme ratio
+        moe_factor = config.k / config.num_experts
+    elif hasattr(config, 'num_experts') and hasattr(config, 'num_experts_per_token'):
+        # Pour d'autres modèles MoE
         moe_factor = config.num_experts_per_token / config.num_experts
     
     # Calculer le total des FLOPS par token
+    num_layers = getattr(config, 'n_layer', 24)  # n_layer dans LLaDAConfig correspond à num_hidden_layers
+    flops_per_token = num_layers * (attention_flops + mlp_flops * moe_factor)
     flops_per_token = config.get('num_hidden_layers', 24) * (attention_flops + mlp_flops * moe_factor)
     
     # Calculer le total des FLOPS pour le batch
