@@ -296,7 +296,7 @@ def get_optimal_batch_size_for_gpu():
     
     # Déterminer la taille de batch optimale en fonction de la mémoire
     if total_memory_gb >= 40:  # A100 80GB, H100
-        return 30, 1
+        return 24, 1
     elif total_memory_gb >= 20:  # A100 40GB, A6000
         return 24, 1
     elif total_memory_gb >= 12:  # RTX 3090, RTX 4090
