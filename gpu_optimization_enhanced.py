@@ -123,7 +123,7 @@ def optimize_training_parameters(args):
     compute_capability = device_props.major + device_props.minor / 10
     
     # Calculer la mémoire disponible (en Go)
-    total_memory_gb = (total_memory / (1024**3)) * 0.9
+    total_memory_gb = (total_memory / (1024**3))
     print(f"Mémoire GPU totale: {total_memory_gb:.2f} Go")
     
     # Optimiser la taille du batch en fonction de la mémoire disponible
@@ -139,7 +139,7 @@ def optimize_training_parameters(args):
             'large': 2.0
         },
         'llada': {
-            'small': 1.0,
+            'small': 1.2,
             'medium': 1.2,
             'large': 1.5
         },
