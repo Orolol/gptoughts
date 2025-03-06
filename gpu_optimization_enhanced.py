@@ -73,7 +73,6 @@ def setup_enhanced_cuda_optimizations():
         # Optimisations pour les opérations de calcul
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
-        torch.backends.cuda.matmul.allow_tf32_reduced_precision_reduction = True
         
         # Optimisations de mémoire pour Ampere
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:256,garbage_collection_threshold:0.8"
