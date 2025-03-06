@@ -58,7 +58,7 @@ sys.path.append('.')
 try:
     from gpu_optimization_advanced import get_optimal_batch_size_for_gpu
     batch_size, grad_accum = get_optimal_batch_size_for_gpu()
-    print(f"--------- {batch_size} {grad_accum} ----------")
+    print(f"{batch_size} {grad_accum}")
 except ImportError:
     print("16 2")  # Valeurs par défaut si le module n'est pas trouvé
 EOF
