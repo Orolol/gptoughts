@@ -122,6 +122,7 @@ class Trainer:
         # Calculate tokens per iteration for logging
         self.tokens_per_iter = self.args.batch_size * self.args.block_size * self.args.gradient_accumulation_steps * self.ddp_world_size
         print(f"Tokens per iteration: {self.tokens_per_iter:,}")
+        print(f"Batch size: {self.args.batch_size}, block size: {self.args.block_size}, gradient accumulation steps: {self.args.gradient_accumulation_steps}")
         
         # Configurer les optimisations de mémoire CUDA
         if torch.cuda.is_available():
