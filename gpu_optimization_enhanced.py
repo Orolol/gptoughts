@@ -134,13 +134,13 @@ def optimize_training_parameters(args):
     # Facteurs de taille de modèle approximatifs (en paramètres)
     model_size_factors = {
         'deepseek': {
-            'small': 0.5,
-            'medium': 1.0,
+            'small': 1.0,
+            'medium': 1.5,
             'large': 2.0
         },
         'llada': {
-            'small': 0.7,
-            'medium': 1.0,
+            'small': 1.0,
+            'medium': 1.2,
             'large': 1.5
         },
         'gpt': {
