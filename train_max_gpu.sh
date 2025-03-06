@@ -17,7 +17,7 @@ MODEL_TYPE="deepseek"  # Options: deepseek, llada, gpt
 SIZE="medium"          # Options: small, medium, large
 BATCH_SIZE=0           # 0 pour auto-détection
 GRAD_ACCUM=0           # 0 pour auto-détection
-BLOCK_SIZE=2048        # Taille du contexte
+BLOCK_SIZE=1024        # Taille du contexte
 
 # Traiter les arguments
 while [[ $# -gt 0 ]]; do
