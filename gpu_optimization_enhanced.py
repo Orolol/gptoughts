@@ -139,7 +139,7 @@ def optimize_training_parameters(args):
             'large': 2.0
         },
         'llada': {
-            'small': 0.4,
+            'small': 0.7,
             'medium': 1.0,
             'large': 1.5
         },
