@@ -202,8 +202,10 @@ def main():
                        help='Utiliser des biais dans les couches linéaires')
     parser.add_argument('--attention_backend', type=str, default=None,
                        help='Backend d\'attention à utiliser')
-    
-    # Paramètres d'optimisation
+        # Paramètres d'optimisation
+    parser.add_argument('--optimizer_type', type=str, default=None,
+                       choices=['adamw', 'lion', 'apollo', 'apollo-mini'],
+                       help='Type d\'optimiseur à utiliser (par défaut: adamw pour GPT, lion pour MoE/LLaDA)')
     parser.add_argument('--learning_rate', type=float, default=5e-5,
                        help='Taux d\'apprentissage')
     parser.add_argument('--max_iters', type=int, default=100000,
