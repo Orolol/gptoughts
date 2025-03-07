@@ -538,7 +538,7 @@ class Trainer:
                     param_group['lr'] = lr
             
             # Generate text periodically
-            if self.iter_num % 100 == 0 and self.master_process:
+            if self.iter_num % 500 == 0 and self.master_process:
                 self.generate_sample_text()
             
             # Evaluate model periodically
@@ -732,7 +732,7 @@ class Trainer:
             self.local_iter_num += 1
             
             # Periodic memory cleanup
-            if self.iter_num % 100 == 0:
+            if self.iter_num % 10 == 0:
                 cleanup_memory()
             
             # Termination conditions
