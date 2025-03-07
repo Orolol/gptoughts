@@ -195,7 +195,7 @@ class Trainer:
         self.scaler = GradScaler(enabled=(self.dtype == 'bfloat16' or self.dtype == 'float16'))
         
         # Initialize training state
-        self.iter_num = 0
+        self.iter_num = 1
         self.best_val_loss = float('inf')
         
         # Print model size
