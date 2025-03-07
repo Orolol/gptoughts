@@ -720,9 +720,6 @@ class Trainer:
             if self.iter_num % self.args.log_interval == 0:
                 self.log_training_stats(total_loss, total_router_loss, dt, lr)
                 
-                # Afficher les statistiques GPU périodiquement
-                if self.iter_num % 100 == 0 and self.master_process and torch.cuda.is_available():
-                    print_gpu_stats()
                 
                 # Save checkpoint periodically
                 if self.iter_num % 1000 == 0 and self.master_process:
@@ -732,7 +729,7 @@ class Trainer:
             self.local_iter_num += 1
             
             # Periodic memory cleanup
-            if self.iter_num % 10 == 0:
+            if self.iter_num % 100 == 0:
                 cleanup_memory()
             
             # Termination conditions

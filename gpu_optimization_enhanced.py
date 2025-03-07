@@ -155,7 +155,7 @@ def optimize_training_parameters(args):
     
     # Calculer la taille de batch optimale
     # Formule heuristique basée sur la mémoire disponible et la taille du modèle
-    optimal_batch_size = max(1, int((total_memory_gb * 0.68) / size_factor))
+    optimal_batch_size = max(1, int((total_memory_gb * 0.65) / size_factor))
     print(f"Taille du batch optimale: {optimal_batch_size}")
     # Limiter la taille du batch à une valeur raisonnable
     optimal_batch_size = min(optimal_batch_size, 64)
