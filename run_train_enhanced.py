@@ -280,7 +280,7 @@ def main():
             optimize_attention_operations()
         
         # Optimiser les paramètres d'entraînement
-        args = optimize_training_parameters(args)
+        # args = optimize_training_parameters(args)
         
         # Optimiser l'allocation de mémoire
         if args.preallocate_memory:
