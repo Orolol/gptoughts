@@ -729,8 +729,8 @@ class Trainer:
             self.local_iter_num += 1
             
             # # Periodic memory cleanup
-            # if self.iter_num % 100 == 0:
-            #     cleanup_memory()
+            if self.iter_num % 100 == 0:
+                cleanup_memory()
             
             # Termination conditions
             if self.iter_num > self.args.max_iters:
