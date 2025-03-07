@@ -9,6 +9,12 @@ try:
 except ImportError:
     TORCH_OPTIMIZER_AVAILABLE = False
 
+try:
+    from apollo_torch import APOLLOAdamW
+    APOLLO_AVAILABLE = True
+except ImportError:
+    APOLLO_AVAILABLE = False
+
 def get_grouped_params(
     model: torch.nn.Module,
     weight_decay: float,
@@ -105,7 +111,9 @@ def configure_optimizer_for_gpt(
     weight_decay: float,
     learning_rate: float,
     betas: Tuple[float, float],
-    device_type: str
+    device_type: str,
+    optimizer_type: str = "adamw",
+    apollo_config: Optional[Dict[str, Any]] = None
 ) -> torch.optim.Optimizer:
     """
     Configure optimizer for GPT-style models.
@@ -116,10 +124,37 @@ def configure_optimizer_for_gpt(
         learning_rate: Learning rate
         betas: Adam beta parameters
         device_type: Device type ('cuda' or 'cpu')
+        optimizer_type: Type of optimizer to use ('adamw', 'apollo', 'apollo-mini')
+        apollo_config: Configuration for APOLLO optimizer if used
         
     Returns:
         Configured optimizer
     """
+    # Check if APOLLO is requested but not available
+    if optimizer_type in ["apollo", "apollo-mini"] and not APOLLO_AVAILABLE:
+        print(f"Warning: {optimizer_type} requested but not available. Falling back to AdamW.")
+        optimizer_type = "adamw"
+    
+    # Use APOLLO if requested and available
+    if optimizer_type in ["apollo", "apollo-mini"] and APOLLO_AVAILABLE:
+        # Set default APOLLO configuration based on requested type
+        default_config = {"mode": optimizer_type}
+        
+        # Merge with user-provided config
+        config = default_config.copy()
+        if apollo_config:
+            config.update(apollo_config)
+            
+        return configure_optimizer_with_apollo(
+            model=model,
+            weight_decay=weight_decay,
+            learning_rate=learning_rate,
+            betas=betas,
+            device_type=device_type,
+            apollo_config=config
+        )
+    
+    # Otherwise, use standard AdamW
     # Group parameters - standard categorization for GPT
     optimizer_groups = get_grouped_params(
         model=model,
@@ -149,7 +184,9 @@ def configure_optimizer_for_moe(
     weight_decay: float,
     learning_rate: float,
     betas: Tuple[float, float],
-    device_type: str
+    device_type: str,
+    optimizer_type: str = "lion",
+    apollo_config: Optional[Dict[str, Any]] = None
 ) -> torch.optim.Optimizer:
     """
     Configure optimizer for MoE models with specialized parameter groups.
@@ -160,6 +197,8 @@ def configure_optimizer_for_moe(
         learning_rate: Learning rate
         betas: Adam beta parameters
         device_type: Device type ('cuda' or 'cpu')
+        optimizer_type: Type of optimizer to use ('lion', 'adamw', 'apollo', 'apollo-mini')
+        apollo_config: Configuration for APOLLO optimizer if used
         
     Returns:
         Configured optimizer
@@ -186,9 +225,33 @@ def configure_optimizer_for_moe(
         custom_param_groups=custom_param_groups
     )
     
+    # Check if APOLLO is requested but not available
+    if optimizer_type in ["apollo", "apollo-mini"] and not APOLLO_AVAILABLE:
+        print(f"Warning: {optimizer_type} requested but not available. Falling back to Lion/AdamW.")
+        optimizer_type = "lion" if TORCH_OPTIMIZER_AVAILABLE else "adamw"
+    
+    # Use APOLLO if requested and available
+    if optimizer_type in ["apollo", "apollo-mini"] and APOLLO_AVAILABLE:
+        # Set default APOLLO configuration based on requested type
+        default_config = {"mode": optimizer_type}
+        
+        # Merge with user-provided config
+        config = default_config.copy()
+        if apollo_config:
+            config.update(apollo_config)
+            
+        return configure_optimizer_with_apollo(
+            model=model,
+            weight_decay=weight_decay,
+            learning_rate=learning_rate,
+            betas=betas,
+            device_type=device_type,
+            apollo_config=config
+        )
+    
     # Choose optimizer based on device type and availability
     if device_type == 'cuda':
-        if TORCH_OPTIMIZER_AVAILABLE:
+        if optimizer_type == "lion" and TORCH_OPTIMIZER_AVAILABLE:
             # Lion optimizer often works better for MoE
             optimizer = extra_optim.Lion(
                 optimizer_groups,
@@ -220,7 +283,9 @@ def configure_optimizer_for_llada(
     weight_decay: float,
     learning_rate: float,
     betas: Tuple[float, float],
-    device_type: str
+    device_type: str,
+    optimizer_type: str = "lion",
+    apollo_config: Optional[Dict[str, Any]] = None
 ) -> torch.optim.Optimizer:
     """
     Configure optimizer for LLaDA model.
@@ -261,9 +326,33 @@ def configure_optimizer_for_llada(
                       'embeddings', 'temperature', 'pos_emb', 'tok_emb']
     )
     
+    # Check if APOLLO is requested but not available
+    if optimizer_type in ["apollo", "apollo-mini"] and not APOLLO_AVAILABLE:
+        print(f"Warning: {optimizer_type} requested but not available. Falling back to Lion/AdamW.")
+        optimizer_type = "lion" if TORCH_OPTIMIZER_AVAILABLE else "adamw"
+    
+    # Use APOLLO if requested and available
+    if optimizer_type in ["apollo", "apollo-mini"] and APOLLO_AVAILABLE:
+        # Set default APOLLO configuration based on requested type
+        default_config = {"mode": optimizer_type}
+        
+        # Merge with user-provided config
+        config = default_config.copy()
+        if apollo_config:
+            config.update(apollo_config)
+            
+        return configure_optimizer_with_apollo(
+            model=model,
+            weight_decay=weight_decay,
+            learning_rate=learning_rate,
+            betas=betas,
+            device_type=device_type,
+            apollo_config=config
+        )
+    
     # Choose optimizer based on device type and availability
     if device_type == 'cuda':
-        if TORCH_OPTIMIZER_AVAILABLE:
+        if optimizer_type == "lion" and TORCH_OPTIMIZER_AVAILABLE:
             # Lion optimizer often works better for diffusion models
             optimizer = extra_optim.Lion(
                 optimizer_groups,
@@ -299,4 +388,190 @@ def configure_optimizer_for_llada(
         )
         print("Using Adam optimizer for LLaDA model (CPU)")
     
-    return optimizer 
+    return optimizer
+
+def configure_optimizer_with_apollo(
+    model: torch.nn.Module,
+    weight_decay: float,
+    learning_rate: float,
+    betas: Tuple[float, float],
+    device_type: str,
+    apollo_config: Dict[str, Any] = None
+) -> torch.optim.Optimizer:
+    """
+    Configure optimizer using APOLLO, a memory-efficient optimizer for LLM training.
+    
+    Args:
+        model: The model to optimize
+        weight_decay: Weight decay coefficient
+        learning_rate: Learning rate
+        betas: Adam beta parameters
+        device_type: Device type ('cuda' or 'cpu')
+        apollo_config: Configuration for APOLLO optimizer
+            - mode: 'apollo' or 'apollo-mini'
+            - rank: Rank of auxiliary subspace (default: 256 for apollo, 1 for apollo-mini)
+            - scale: Scaling factor (default: 1 for apollo, 128 for apollo-mini)
+            - update_proj_gap: Interval for projection updates (default: 200)
+            
+    Returns:
+        Configured APOLLO optimizer
+    """
+    if not APOLLO_AVAILABLE:
+        raise ImportError(
+            "APOLLO optimizer is not available. Install it with: pip install apollo-torch"
+        )
+    
+    # Set default APOLLO configuration
+    default_config = {
+        "mode": "apollo",  # 'apollo' or 'apollo-mini'
+        "rank": None,      # Will be set based on mode
+        "scale": None,     # Will be set based on mode
+        "update_proj_gap": 200,
+        "proj": "random",
+        "proj_type": "std"
+    }
+    
+    # Update with user-provided config
+    config = default_config.copy()
+    if apollo_config:
+        config.update(apollo_config)
+    
+    # Set defaults based on mode
+    if config["rank"] is None:
+        config["rank"] = 256 if config["mode"] == "apollo" else 1
+    
+    if config["scale"] is None:
+        config["scale"] = 1 if config["mode"] == "apollo" else 128
+    
+    # Set scale_type based on mode
+    config["scale_type"] = "channel" if config["mode"] == "apollo" else "tensor"
+    
+    # Group parameters - standard categorization
+    optimizer_groups = get_grouped_params(
+        model=model,
+        weight_decay=weight_decay,
+        learning_rate=learning_rate
+    )
+    
+    # Separate parameters based on their dimensionality
+    apollo_param_groups = []
+    standard_param_groups = []
+    
+    for group in optimizer_groups:
+        # Create new parameter lists
+        apollo_params = []
+        standard_params = []
+        
+        # Check each parameter's dimensionality
+        for param in group['params']:
+            if len(param.shape) >= 2:  # Parameter has at least 2 dimensions
+                apollo_params.append(param)
+            else:  # Parameter has only 1 dimension (vector) or 0 dimensions (scalar)
+                standard_params.append(param)
+        
+        # Create APOLLO group if there are eligible parameters
+        if apollo_params:
+            apollo_group = {
+                'params': apollo_params,
+                'weight_decay': group.get('weight_decay', 0.0),
+                'lr': group.get('lr', learning_rate),
+                'rank': config["rank"],
+                'proj': config["proj"],
+                'scale_type': config["scale_type"],
+                'scale': config["scale"],
+                'update_proj_gap': config["update_proj_gap"],
+                'proj_type': config["proj_type"]
+            }
+            apollo_param_groups.append(apollo_group)
+        
+        # Create standard group if there are 1D parameters
+        if standard_params:
+            standard_group = {
+                'params': standard_params,
+                'weight_decay': group.get('weight_decay', 0.0),
+                'lr': group.get('lr', learning_rate)
+            }
+            standard_param_groups.append(standard_group)
+    
+    # Create optimizers
+    optimizers = []
+    
+    # Create APOLLO optimizer if there are eligible parameters
+    if apollo_param_groups:
+        apollo_opt = APOLLOAdamW(
+            apollo_param_groups,
+            lr=learning_rate,
+            betas=betas
+        )
+        optimizers.append(apollo_opt)
+        print(f"Using APOLLO optimizer ({config['mode']} mode) with rank={config['rank']}, scale={config['scale']} for {sum(len(g['params']) for g in apollo_param_groups)} parameters")
+    
+    # Create standard optimizer for 1D parameters
+    if standard_param_groups:
+        if device_type == 'cuda':
+            standard_opt = torch.optim.AdamW(
+                standard_param_groups,
+                lr=learning_rate,
+                betas=betas,
+                fused=True
+            )
+        else:
+            standard_opt = torch.optim.AdamW(
+                standard_param_groups,
+                lr=learning_rate,
+                betas=betas
+            )
+        optimizers.append(standard_opt)
+        print(f"Using standard AdamW for {sum(len(g['params']) for g in standard_param_groups)} 1D parameters")
+    
+    # Create a combined optimizer if needed
+    if len(optimizers) == 1:
+        optimizer = optimizers[0]
+    else:
+        # Use a simple wrapper class that delegates to multiple optimizers
+        class MultiOptimizer:
+            def __init__(self, optimizers):
+                self.optimizers = optimizers
+                # Store combined param_groups for compatibility
+                self._param_groups = []
+                for opt in optimizers:
+                    self._param_groups.extend(opt.param_groups)
+            
+            def zero_grad(self, set_to_none=False):
+                for optimizer in self.optimizers:
+                    optimizer.zero_grad(set_to_none=set_to_none)
+            
+            def step(self, closure=None):
+                loss = None
+                if closure is not None:
+                    loss = closure()
+                
+                for optimizer in self.optimizers:
+                    optimizer.step()
+                
+                return loss
+            
+            @property
+            def param_groups(self):
+                # Refresh combined param_groups
+                self._param_groups = []
+                for opt in self.optimizers:
+                    self._param_groups.extend(opt.param_groups)
+                return self._param_groups
+            
+            def state_dict(self):
+                # Combine state dicts from all optimizers
+                return {f"opt_{i}": opt.state_dict() for i, opt in enumerate(self.optimizers)}
+            
+            def load_state_dict(self, state_dict):
+                # Load state for each optimizer
+                for i, opt in enumerate(self.optimizers):
+                    if f"opt_{i}" in state_dict:
+                        opt.load_state_dict(state_dict[f"opt_{i}"])
+        
+        optimizer = MultiOptimizer(optimizers)
+        print(f"Using MultiOptimizer with {len(optimizers)} sub-optimizers")
+    
+    print(f"Using APOLLO optimizer ({config['mode']} mode) with rank={config['rank']}, scale={config['scale']}")
+    
+    return optimizer

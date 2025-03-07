@@ -21,3 +21,5 @@ pytorch_optimizer
 xformers
 deepspeed
 flash-attn
+torch_optimizer
+apollo_torch

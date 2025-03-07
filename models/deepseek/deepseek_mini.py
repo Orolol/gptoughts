@@ -798,74 +798,34 @@ class DeepSeekMini(nn.Module):
         
         return input_ids 
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, optimizer_type=None):
         """
-        Configure the AdamW optimizer with weight decay.
-        Handles parameter groups for experts and non-expert parameters separately.
+        Configure optimizer with weight decay, specialized for DeepSeek Mini model.
+        
+        Args:
+            weight_decay: Weight decay coefficient
+            learning_rate: Learning rate
+            betas: Adam beta parameters
+            device_type: Device type ('cuda' or 'cpu')
+            optimizer_type: Type of optimizer to use (default: 'lion')
+            
+        Returns:
+            Configured optimizer
         """
-        # Collect all parameters
-        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        from models.optimizers import configure_optimizer_for_moe
         
-        # Create parameter groups
-        expert_params = []
-        router_params = []
-        other_params = []
-        
-        for name, param in param_dict.items():
-            if any(expert_type in name.lower() for expert_type in ['expert_group', 'shared_mlp', 'expert_proj', 'expert_adapters']):
-                expert_params.append(param)
-            elif 'router' in name.lower():
-                router_params.append(param)
-            else:
-                other_params.append(param)
-        
-        # Create optimizer groups with different hyperparameters
-        optim_groups = [
-            # Expert parameters
-            {
-                'params': expert_params,
-                'weight_decay': weight_decay,
-                'lr': learning_rate
-            },
-            # Router parameters (no weight decay)
-            {
-                'params': router_params,
-                'weight_decay': 0.0,
-                'lr': learning_rate * 0.1  # Lower learning rate for stability
-            },
-            # Other parameters
-            {
-                'params': other_params,
-                'weight_decay': weight_decay,
-                'lr': learning_rate
-            }
-        ]
-        
-        # Print parameter counts
-        num_expert_params = sum(p.numel() for p in expert_params)
-        num_router_params = sum(p.numel() for p in router_params)
-        num_other_params = sum(p.numel() for p in other_params)
-        
-        print(f"\nParameter counts:")
-        print(f"Expert parameters: {num_expert_params:,}")
-        print(f"Router parameters: {num_router_params:,}")
-        print(f"Other parameters: {num_other_params:,}")
-        
-        # Create AdamW optimizer with fused implementation if available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        
-        optimizer = torch.optim.AdamW(
-            optim_groups,
-            lr=learning_rate,
+        # Utiliser l'optimiseur spécifié ou le défaut pour MoE
+        if optimizer_type is None:
+            optimizer_type = 'lion'
+            
+        return configure_optimizer_for_moe(
+            model=self,
+            weight_decay=weight_decay,
+            learning_rate=learning_rate,
             betas=betas,
-            **extra_args
+            device_type=device_type,
+            optimizer_type=optimizer_type
         )
-        
-        print(f"Using fused AdamW: {use_fused}")
-        
-        return optimizer 
 
     def set_timing_stats(self, timing_stats):
         """Set the timing stats object for detailed profiling"""

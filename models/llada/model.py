@@ -392,7 +392,7 @@ class LLaDAModel(nn.Module):
             dtype=torch.float16  # Utiliser fp16 comme demandé
         )
         
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, optimizer_type=None):
         """
         Configure optimizer with weight decay, specialized for LLaDA.
         
@@ -401,15 +401,22 @@ class LLaDAModel(nn.Module):
             learning_rate: Learning rate
             betas: Adam beta parameters
             device_type: Device type ('cuda' or 'cpu')
+            optimizer_type: Type of optimizer to use (default: 'apollo-mini')
             
         Returns:
             Configured optimizer
         """
         from ..optimizers import configure_optimizer_for_llada
+        
+        # Utiliser l'optimiseur spécifié ou le défaut pour LLaDA
+        if optimizer_type is None:
+            optimizer_type = 'apollo-mini'
+            
         return configure_optimizer_for_llada(
             model=self,
             weight_decay=weight_decay,
             learning_rate=learning_rate,
             betas=betas,
-            device_type=device_type
-        ) 
+            device_type=device_type,
+            optimizer_type=optimizer_type
+        )

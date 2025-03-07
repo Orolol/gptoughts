@@ -162,19 +162,34 @@ def save_checkpoint(model, optimizer, model_args, iter_num, best_val_loss, confi
     # Save to CPU to avoid GPU memory duplication
     raw_model = model.module if hasattr(model, 'module') else model
     
+    # Préparer le dictionnaire de checkpoint
     checkpoint = {
         'model': {k: v.cpu() for k, v in raw_model.state_dict().items()},
-        'optimizer': {
-            'state': {k: {sk: sv.cpu() if isinstance(sv, torch.Tensor) else sv 
-                         for sk, sv in v.items()}
-                         for k, v in optimizer.state_dict()['state'].items()},
-            'param_groups': optimizer.state_dict()['param_groups']
-        },
         'model_args': model_args,
         'iter_num': iter_num,
         'best_val_loss': best_val_loss,
         'config': config,
     }
+    
+    # Gérer différents types d'optimiseurs
+    optimizer_state = optimizer.state_dict()
+    
+    # Vérifier si c'est un MultiOptimizer (qui a une structure différente)
+    if 'opt_0' in optimizer_state:
+        # C'est un MultiOptimizer, conserver sa structure spéciale
+        checkpoint['optimizer'] = optimizer_state
+    else:
+        # C'est un optimiseur standard, traiter comme avant
+        if 'state' in optimizer_state and 'param_groups' in optimizer_state:
+            checkpoint['optimizer'] = {
+                'state': {k: {sk: sv.cpu() if isinstance(sv, torch.Tensor) else sv
+                            for sk, sv in v.items()}
+                            for k, v in optimizer_state['state'].items()},
+                'param_groups': optimizer_state['param_groups']
+            }
+        else:
+            # Fallback pour d'autres structures d'optimiseurs
+            checkpoint['optimizer'] = optimizer_state
     
     checkpoint_name = f'ckpt_iter_{iter_num}'
     if val_loss is not None:
@@ -219,12 +234,24 @@ def load_checkpoint(ckpt_path, model, optimizer=None, map_location='cpu'):
     # Load optimizer state if provided
     if optimizer is not None and 'optimizer' in checkpoint:
         optimizer_state = checkpoint['optimizer']
-        # Clean optimizer states that might be in float32
-        for state in optimizer_state['state'].values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(dtype=torch.get_default_dtype())
-        optimizer.load_state_dict(optimizer_state)
+        
+        # Vérifier si c'est un format MultiOptimizer
+        if 'opt_0' in optimizer_state:
+            # Format MultiOptimizer - vérifier si l'optimiseur actuel est aussi un MultiOptimizer
+            if hasattr(optimizer, 'load_state_dict'):
+                optimizer.load_state_dict(optimizer_state)
+        else:
+            # Format standard avec 'state' et 'param_groups'
+            if 'state' in optimizer_state:
+                # Clean optimizer states that might be in float32
+                for state in optimizer_state['state'].values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(dtype=torch.get_default_dtype())
+            
+            # Charger l'état de l'optimiseur
+            optimizer.load_state_dict(optimizer_state)
+        
         del optimizer_state
         torch.cuda.empty_cache()
     

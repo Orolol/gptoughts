@@ -176,13 +176,20 @@ class Trainer:
         # Move model to device
         self.model = self.model.to(self.device)
         
-        # Initialize optimizer
-        self.optimizer = self.model.configure_optimizers(
-            weight_decay=self.args.weight_decay,
-            learning_rate=self.args.learning_rate,
-            betas=(self.args.beta1, self.args.beta2),
-            device_type=self.device_type
-        )
+        # Initialize optimizer with specified type if provided
+        optimizer_args = {
+            'weight_decay': self.args.weight_decay,
+            'learning_rate': self.args.learning_rate,
+            'betas': (self.args.beta1, self.args.beta2),
+            'device_type': self.device_type
+        }
+        
+        # Ajouter le type d'optimiseur s'il est spécifié
+        if hasattr(self.args, 'optimizer_type') and self.args.optimizer_type is not None:
+            optimizer_args['optimizer_type'] = self.args.optimizer_type
+            print(f"Using specified optimizer: {self.args.optimizer_type}")
+        
+        self.optimizer = self.model.configure_optimizers(**optimizer_args)
         
         # Initialize gradient scaler for mixed precision
         self.scaler = GradScaler(enabled=(self.dtype == 'bfloat16' or self.dtype == 'float16'))
@@ -393,12 +400,20 @@ class Trainer:
         )
         
         if self.optimizer is None:
-            self.optimizer = self.model.configure_optimizers(
-                weight_decay=self.args.weight_decay,
-                learning_rate=self.args.learning_rate,
-                betas=(self.args.beta1, self.args.beta2),
-                device_type=self.device_type
-            )
+            # Initialize optimizer with specified type if provided
+            optimizer_args = {
+                'weight_decay': self.args.weight_decay,
+                'learning_rate': self.args.learning_rate,
+                'betas': (self.args.beta1, self.args.beta2),
+                'device_type': self.device_type
+            }
+            
+            # Ajouter le type d'optimiseur s'il est spécifié
+            if hasattr(self.args, 'optimizer_type') and self.args.optimizer_type is not None:
+                optimizer_args['optimizer_type'] = self.args.optimizer_type
+                print(f"Using specified optimizer: {self.args.optimizer_type}")
+            
+            self.optimizer = self.model.configure_optimizers(**optimizer_args)
         
         # Move model to device and ensure correct dtype
         self.model = self.model.to(self.device)
@@ -748,7 +763,27 @@ class Trainer:
         if hasattr(self.args, 'prompt_templates') and self.args.prompt_templates:
             prompt = random.choice(self.args.prompt_templates)
         else:
-            prompt = "Once upon a time"
+            # Liste de prompts variés couvrant différents thèmes
+            diverse_prompts = [
+                # Narration
+                "Once upon a time",
+                "In a distant world",
+                "The story begins with",
+                # Questions
+                "How can one solve",
+                "Why are humans",
+                "What is the best way to",
+                # Instructions
+                "Explain to me how",
+                "Write a guide for",
+                # Creativity
+                "Imagine a scenario where",
+                "Describe a futuristic technology that",
+                # Analysis
+                "Analyze the advantages and disadvantages of",
+                "Compare and contrast the following approaches:"
+            ]
+            prompt = random.choice(diverse_prompts)
         
         # Tokenize the prompt
         if hasattr(self.args, 'tokenizer'):
@@ -788,7 +823,7 @@ class Trainer:
                     
                     # Si output_text est None (cas de LLaDAModel), on ne l'affiche pas
                     if output_text is not None:
-                        print(f"Generated text: {prompt} {output_text}\n")
+                        print(f"Generated text: {output_text}\n")
                     else:
                         print(f"Text generation completed (output format depends on model type)\n")
                     return

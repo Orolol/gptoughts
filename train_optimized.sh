@@ -72,7 +72,7 @@ CMD="python run_train_enhanced.py --model_type $MODEL_TYPE --size $SIZE --block_
 
 # Ajouter les options conditionnelles
 if [ "$BATCH_SIZE" -ne 0 ]; then
-    CMD="$CMD --batch_size $BATCH_SIZE --batch_size_auto_optimize False"
+    CMD="$CMD --batch_size $BATCH_SIZE"
 fi
 
 if [ "$GRAD_ACCUM" -ne 0 ]; then

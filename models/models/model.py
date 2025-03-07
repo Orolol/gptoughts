@@ -247,7 +247,7 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             block.use_checkpoint = value
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, optimizer_type=None):
         """
         Configure optimizer with weight decay.
         
@@ -256,6 +256,7 @@ class GPT(nn.Module):
             learning_rate: Learning rate
             betas: Adam beta parameters
             device_type: Device type ('cuda' or 'cpu')
+            optimizer_type: Type of optimizer to use (default: 'adamw')
             
         Returns:
             Configured optimizer
@@ -266,7 +267,8 @@ class GPT(nn.Module):
             weight_decay=weight_decay,
             learning_rate=learning_rate,
             betas=betas,
-            device_type=device_type
+            device_type=device_type,
+            optimizer_type=optimizer_type
         )
 
 class EncoderDecoderGPT(nn.Module):
@@ -437,7 +439,7 @@ class EncoderDecoderGPT(nn.Module):
             loss = None
         return logits, loss
     
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, optimizer_type=None):
         """
         Configure optimizer with weight decay.
         
@@ -446,6 +448,7 @@ class EncoderDecoderGPT(nn.Module):
             learning_rate: Learning rate
             betas: Adam beta parameters
             device_type: Device type ('cuda' or 'cpu')
+            optimizer_type: Type of optimizer to use (default: 'adamw')
             
         Returns:
             Configured optimizer
@@ -456,7 +459,8 @@ class EncoderDecoderGPT(nn.Module):
             weight_decay=weight_decay,
             learning_rate=learning_rate,
             betas=betas,
-            device_type=device_type
+            device_type=device_type,
+            optimizer_type=optimizer_type
         )
 
     @torch.no_grad()
