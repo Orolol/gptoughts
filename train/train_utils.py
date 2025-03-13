@@ -201,16 +201,33 @@ def save_checkpoint(model, optimizer, model_args, iter_num, best_val_loss, confi
 
 def load_checkpoint(ckpt_path, model, optimizer=None, map_location='cpu'):
     """
-    Load checkpoint with memory optimization
+    Load checkpoint for model and optimizer.
+    
     Args:
-        ckpt_path: Path to checkpoint file
-        model: Model to load weights into
-        optimizer: Optimizer to load state into (optional)
-        map_location: Device to load tensors onto
+        ckpt_path (str): Path to checkpoint
+        model (torch.nn.Module): Model to load checkpoint into
+        optimizer (torch.optim.Optimizer, optional): Optimizer to load state into
+        map_location (str, optional): Device to map tensors to. Defaults to 'cpu'.
+        
     Returns:
         tuple: (model, optimizer, iter_num, best_val_loss)
     """
-    checkpoint = torch.load(ckpt_path, map_location=map_location, weights_only=True)
+    # Add PreTrainedTokenizerFast to safe globals for loading with weights_only=True
+    try:
+        from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
+        import torch.serialization
+        torch.serialization.add_safe_globals([PreTrainedTokenizerFast])
+    except (ImportError, AttributeError):
+        print("Warning: Could not add PreTrainedTokenizerFast to safe globals. Will attempt loading with weights_only=False.")
+        checkpoint = torch.load(ckpt_path, map_location=map_location, weights_only=False)
+    else:
+        try:
+            # Try loading with weights_only=True
+            checkpoint = torch.load(ckpt_path, map_location=map_location, weights_only=True)
+        except Exception as e:
+            print(f"Warning: Failed to load with weights_only=True: {e}")
+            print("Falling back to weights_only=False for backward compatibility")
+            checkpoint = torch.load(ckpt_path, map_location=map_location, weights_only=False)
     
     # Clean state dict before loading
     state_dict = checkpoint['model']

@@ -97,6 +97,16 @@ import argparse
 # Ajouter le répertoire courant au path
 sys.path.append('.')
 
+# Fix for PyTorch serialization security with transformers
+try:
+    from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
+    import torch.serialization
+    # Ajouter PreTrainedTokenizerFast aux globals sécurisés
+    torch.serialization.add_safe_globals([PreTrainedTokenizerFast])
+    print("Successfully registered PreTrainedTokenizerFast with PyTorch's safe globals")
+except (ImportError, AttributeError) as e:
+    print(f"Note: Could not register tokenizer with safe globals: {e}")
+
 # Importer les optimisations avancées
 try:
     from gpu_optimization_advanced import optimize_for_maximum_gpu_utilization
