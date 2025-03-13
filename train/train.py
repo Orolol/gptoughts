@@ -151,12 +151,12 @@ class Trainer:
         
         # Initialize from scratch
         print(f"Initializing a new {model_type} model from scratch")
-        
         if model_type == 'deepseek':
-            from models.deepseek import DeepSeekMini, DeepSeekMiniConfig
+            from models.deepseek.deepseek_adapter import DeepSeekMini, DeepSeekMiniConfig
             # Create config based on model size
             config = self.create_deepseek_config()
             self.model = DeepSeekMini(config)
+            
             
         elif model_type == 'llada':
             from models.llada.model import LLaDAModel, LLaDAConfig
@@ -192,7 +192,8 @@ class Trainer:
         self.optimizer = self.model.configure_optimizers(**optimizer_args)
         
         # Initialize gradient scaler for mixed precision
-        self.scaler = GradScaler(enabled=(self.dtype == 'bfloat16' or self.dtype == 'float16'))
+        # Note: BFloat16 has sufficient dynamic range and doesn't need gradient scaling
+        self.scaler = GradScaler(enabled=(self.dtype == 'float16'))
         
         # Initialize training state
         self.iter_num = 1
@@ -212,11 +213,11 @@ class Trainer:
                 hidden_size=1024,
                 num_hidden_layers=8,
                 num_attention_heads=8,
-                head_dim=128,  # Modifié de 64 à 128 pour assurer que num_attention_heads * head_dim == hidden_size
+                head_dim=128,  # Corrigé pour assurer que num_attention_heads * head_dim == hidden_size
                 intermediate_size=2816,
-                num_experts=8,
-                num_experts_per_token=2,
-                max_position_embeddings=self.args.block_size,
+                num_experts=4,  # Réduit de 8 à 4 pour diminuer la consommation de mémoire
+                num_experts_per_token=1,  # Réduit de 2 à 1 pour diminuer la consommation de mémoire
+                max_position_embeddings=max(16, self.args.block_size),  # Assure un minimum de 16 pour la stabilité
                 kv_compression_dim=64,
                 query_compression_dim=192,
                 rope_head_dim=32,
@@ -359,7 +360,7 @@ class Trainer:
         model_type = self.args.model_type.lower()
         
         if model_type == 'deepseek':
-            from models.deepseek import DeepSeekMini, DeepSeekMiniConfig
+            from models.deepseek.deepseek_adapter import DeepSeekMini, DeepSeekMiniConfig
             # Create new model with saved config
             saved_config = DeepSeekMiniConfig(**checkpoint['model_args'])
             self.model = DeepSeekMini(saved_config)
@@ -420,7 +421,8 @@ class Trainer:
         self.model = ensure_model_dtype(self.model, self.ptdtype)
         
         # Reset scaler
-        self.scaler = GradScaler(enabled=(self.dtype == 'bfloat16' or self.dtype == 'float16'))
+        # Note: BFloat16 has sufficient dynamic range and doesn't need gradient scaling
+        self.scaler = GradScaler(enabled=(self.dtype == 'float16'))
         
         cleanup_memory()
     
@@ -492,14 +494,6 @@ class Trainer:
         # Print training info
         model_type = self.args.model_type.lower()
         print(f"Starting training {model_type} model")
-        if model_type == 'deepseek':
-            print(f"Model size: {self.config.hidden_size}d, {self.config.num_hidden_layers}l, {self.config.num_attention_heads}h")
-            print(f"Using {self.config.num_experts} experts with top-{self.config.num_experts_per_token} routing")
-        elif model_type == 'llada':
-            print(f"Model size: {self.config.n_embd}d, {self.config.n_layer}l, {self.config.n_head}h")
-        else:
-            print(f"Model size: {self.config.n_embd}d, {self.config.n_layer}l, {self.config.n_head}h")
-            
         print(f"Batch size: {self.args.batch_size}, Block size: {self.args.block_size}")
         print(f"Gradient accumulation steps: {self.args.gradient_accumulation_steps}")
         print_memory_stats("Initial")
@@ -605,46 +599,23 @@ class Trainer:
                             
                             # Handle different model types
                             if model_type == 'deepseek':
-                                # DeepSeek model returns a dict
-                                outputs = self.model(
-                                    input_ids=input_ids,
-                                    attention_mask=None,  # Will be created automatically if needed
-                                )
-                                
-                                # Unpack outputs
-                                hidden_states = outputs["last_hidden_state"]
-                                balance_loss = outputs.get("balance_loss", 0)
-                                
-                                # Calculate loss
-                                raw_model = self.model.module if self.ddp else self.model
-                                logits = hidden_states @ raw_model.embed_tokens.weight.t()
-                                shift_logits = logits[..., :-1, :].contiguous()
-                                shift_labels = targets[..., 1:].contiguous()
-                                
-                                loss = F.cross_entropy(
-                                    shift_logits.view(-1, shift_logits.size(-1)),
-                                    shift_labels.view(-1),
-                                    ignore_index=-1
-                                )
-                                
-                                # Track tokens
-                                batch_tokens = input_ids.ne(0).sum().item()  # Assuming 0 is pad token
+                                # DeepSeek model via l'adaptateur
+                                # L'adaptateur s'occupe de gérer le modèle original
+                                logits, loss = self.model(input_ids, targets=targets)
+                                balance_loss = 0
                                 
                             elif model_type == 'llada':
                                 # LLaDA model
                                 logits, loss, router_loss = self.model(input_ids, targets=targets)
                                 balance_loss = router_loss if router_loss is not None else 0
-                                
-                                # Track tokens
-                                batch_tokens = input_ids.numel()
-                                
+
                             else:
                                 # Standard GPT model
                                 logits, loss = self.model(input_ids, targets=targets)
                                 balance_loss = 0
+
                                 
-                                # Track tokens
-                                batch_tokens = input_ids.numel()
+                            batch_tokens = input_ids.numel()
                             
                             # Update token counts
                             self.total_tokens += batch_tokens
@@ -672,21 +643,27 @@ class Trainer:
                                 else:
                                     combined_loss = loss
                                 
-                                # Backward pass with scaler
-                                scaled_loss = self.scaler.scale(combined_loss)
-                                scaled_loss.backward()
-                                
-                                # Track losses
-                                total_loss += loss.item()
-                                if balance_loss != 0:
-                                    total_router_loss += balance_loss.item()
-                                
-                                # Clean up
-                                del loss
-                                if balance_loss != 0:
-                                    del balance_loss
-                                del combined_loss
-                                del scaled_loss
+                                # Backward pass with or without scaler
+                                if self.scaler.is_enabled():
+                                    scaled_loss = self.scaler.scale(combined_loss)
+                                    scaled_loss.backward(retain_graph=True)
+                                else:
+                                    # Direct backward for bfloat16 which has sufficient dynamic range
+                                    combined_loss.backward(retain_graph=True)
+                                    
+                                    # Track losses
+                                    total_loss += loss.item()
+                                    if balance_loss != 0:
+                                        total_router_loss += balance_loss.item()
+                                    
+                                    # Clean up
+                                    del loss
+                                    if balance_loss != 0:
+                                        del balance_loss
+                                    del combined_loss
+                                    # Supprimer scaled_loss uniquement s'il existe (branche avec scaler)
+                                    if self.scaler.is_enabled():
+                                        del scaled_loss
                 
                 except Exception as e:
                     print(f"Training iteration failed: {e}")
@@ -698,16 +675,28 @@ class Trainer:
                 
                 # Optimizer step avec optimisations
                 with self.timing_stats.track("optimizer_step"):
-                    if self.args.grad_clip != 0.0:
-                        self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters() if not self.ddp else self.model.module.parameters(),
-                            self.args.grad_clip
-                        )
-                    
-                    # Étape d'optimisation avec synchronisation
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                    if self.scaler.is_enabled():
+                        # Avec GradScaler (pour float16)
+                        if self.args.grad_clip != 0.0:
+                            self.scaler.unscale_(self.optimizer)
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters() if not self.ddp else self.model.module.parameters(),
+                                self.args.grad_clip
+                            )
+                        
+                        # Étape d'optimisation avec synchronisation
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        # Sans GradScaler (pour bfloat16)
+                        if self.args.grad_clip != 0.0:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters() if not self.ddp else self.model.module.parameters(),
+                                self.args.grad_clip
+                            )
+                        
+                        # Étape d'optimisation standard
+                        self.optimizer.step()
                     
                     # Synchroniser après l'étape d'optimisation pour maximiser l'utilisation du GPU
                     if torch.cuda.is_available():
@@ -803,12 +792,72 @@ class Trainer:
                 raw_model = self.model.module if self.ddp else self.model
                 
                 if model_type == 'deepseek':
-                    output_ids = raw_model.generate(
-                        input_tokens,
-                        max_new_tokens=min(100, self.args.block_size - 10),
-                        temperature=0.7,
-                        top_k=40
-                    )
+                    try:
+                        # Vérifier si le modèle a une méthode generate
+                        if hasattr(raw_model, 'generate'):
+                            # Utiliser la méthode generate de l'adaptateur
+                            output_ids = raw_model.generate(
+                                input_tokens,
+                                max_new_tokens=min(100, self.args.block_size - 10),
+                                temperature=0.7,
+                                top_k=40
+                            )
+                        else:
+                            # Pour le modèle DeepSeek original, implémenter la génération manuellement
+                            print("Utilisation de la génération manuelle pour DeepSeek original")
+                            
+                            # Initialiser les ids de sortie avec les tokens d'entrée
+                            output_ids = input_tokens.clone()
+                            max_new_tokens = min(100, self.args.block_size - 10)
+                            
+                            # Générer de nouveaux tokens un par un
+                            for _ in range(max_new_tokens):
+                                # Forward pass pour obtenir les logits du dernier token
+                                with torch.no_grad():
+                                    logits = raw_model(output_ids, start_pos=0)
+                                
+                                # Reshape logits si nécessaire
+                                if logits.dim() == 2:
+                                    # Si logits est [batch*seq, vocab], le reshaper en [batch, seq, vocab]
+                                    logits = logits.view(output_ids.size(0), output_ids.size(1), -1)
+                                
+                                # Obtenir les logits du dernier token
+                                next_token_logits = logits[:, -1, :]
+                                
+                                # Appliquer la température
+                                next_token_logits = next_token_logits / 0.7
+                                
+                                # Appliquer top-k
+                                top_k = 40
+                                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                                next_token_logits[indices_to_remove] = float('-inf')
+                                
+                                # Échantillonner le prochain token
+                                probs = F.softmax(next_token_logits, dim=-1)
+                                next_token = torch.multinomial(probs, num_samples=1)
+                                
+                                # Ajouter le nouveau token aux ids de sortie
+                                output_ids = torch.cat([output_ids, next_token], dim=1)
+                                
+                                # Arrêter si on génère un token de fin (à adapter selon le tokenizer)
+                                if hasattr(self.args, 'tokenizer') and next_token[0, 0].item() == self.args.tokenizer.eos_token_id:
+                                    break
+                    except Exception as e:
+                        print(f"Erreur lors de la génération avec DeepSeek: {e}")
+                        print(traceback.format_exc())
+                        # Fallback: utiliser la méthode générique
+                        output_text = generate_text(
+                            raw_model,
+                            input_tokens,
+                            max_new_tokens=min(100, self.args.block_size - 10),
+                            temperature=0.7,
+                            tokenizer=tokenizer if hasattr(self.args, 'tokenizer') else None
+                        )
+                        if output_text is not None:
+                            print(f"Generated text: {output_text}\n")
+                        else:
+                            print(f"Text generation completed (output format depends on model type)\n")
+                        return
                 else:
                     # Use the generic generate_text function
                     output_text = generate_text(

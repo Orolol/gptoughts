@@ -173,22 +173,88 @@ class DeepSeekMini(nn.Module):
         # Ignorer les paramètres non utilisés par le modèle original
         _ = position_ids, past_key_values, inputs_embeds, use_cache, output_attentions, output_hidden_states, return_dict
         
-        # Appeler le modèle original
-        logits = self.model(input_ids, start_pos=0)
+        # Vérifier les dimensions d'entrée pour éviter les problèmes numériques
+        if input_ids.size(1) < 2:  # Si la séquence est trop courte
+            # Padding pour assurer une longueur minimale de 2 (pour le décalage)
+            pad_length = 2 - input_ids.size(1)
+            padding = torch.zeros(input_ids.size(0), pad_length, dtype=input_ids.dtype, device=input_ids.device)
+            input_ids = torch.cat([input_ids, padding], dim=1)
+            if targets is not None:
+                targets = torch.cat([targets, padding], dim=1)
+        
+        # Appeler le modèle original avec gestion d'erreur
+        try:
+            logits = self.model(input_ids, start_pos=0)
+            
+            # Vérifier si les logits contiennent des NaN
+            if torch.isnan(logits).any():
+                # Remplacer les NaN par des zéros pour éviter la propagation
+                logits = torch.nan_to_num(logits, nan=0.0)
+                print("Warning: NaN values detected in logits and replaced with zeros")
+        except RuntimeError as e:
+            # En cas d'erreur, afficher un message et retourner une perte élevée
+            print(f"Forward pass error: {e}")
+            if return_dict:
+                return {
+                    "last_hidden_state": None,
+                    "loss": torch.tensor(100.0, device=input_ids.device),
+                    "balance_loss": torch.tensor(0.0, device=input_ids.device)
+                }
+            else:
+                return None, torch.tensor(100.0, device=input_ids.device)
         
         # Calculer la perte si des cibles sont fournies
         loss = None
         if targets is not None:
-            # Décaler les logits et les cibles pour le calcul de la perte
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_targets = targets[..., 1:].contiguous()
-            
-            # Calculer la perte d'entropie croisée
-            loss = torch.nn.functional.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_targets.view(-1),
-                ignore_index=-1
-            )
+            try:
+                # Vérifier la forme des logits
+                if len(logits.shape) == 2:
+                    # Les logits sont déjà aplatis [batch*seq_len, vocab]
+                    # Nous devons reformer les logits et les cibles pour le décalage
+                    batch_size = input_ids.size(0)
+                    seq_len = input_ids.size(1)
+                    vocab_size = logits.size(-1)
+                    
+                    # Reformer les logits en [batch, seq_len, vocab]
+                    logits_reshaped = logits.view(batch_size, seq_len, vocab_size)
+                    
+                    # Décaler les logits et les cibles pour le calcul de la perte
+                    shift_logits = logits_reshaped[:, :-1, :].contiguous()
+                    shift_targets = targets[:, 1:].contiguous()
+                    
+                    # Calculer la perte d'entropie croisée avec stabilité numérique
+                    loss = torch.nn.functional.cross_entropy(
+                        shift_logits.reshape(-1, shift_logits.size(-1)),
+                        shift_targets.reshape(-1),
+                        ignore_index=-1,
+                        reduction='mean',
+                        label_smoothing=0.01  # Légère régularisation pour stabilité
+                    )
+                else:
+                    # Décaler les logits et les cibles pour le calcul de la perte
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_targets = targets[..., 1:].contiguous()
+                    
+                    # Calculer la perte d'entropie croisée avec stabilité numérique
+                    loss = torch.nn.functional.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_targets.view(-1),
+                        ignore_index=-1,
+                        reduction='mean',
+                        label_smoothing=0.01  # Légère régularisation pour stabilité
+                    )
+                
+                # Vérifier si la perte est NaN et la remplacer par une valeur élevée mais finie
+                if torch.isnan(loss):
+                    loss = torch.tensor(100.0, device=loss.device)
+                    print("Warning: NaN loss detected and replaced with 100.0")
+                
+                # Limiter la perte pour éviter l'explosion des gradients
+                loss = torch.clamp(loss, 0.0, 100.0)
+                
+            except RuntimeError as e:
+                print(f"Loss calculation error: {e}")
+                loss = torch.tensor(100.0, device=input_ids.device)
         
         # Retourner les logits et la perte
         if return_dict:

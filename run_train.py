@@ -179,7 +179,7 @@ def main():
                        help='Beta1 pour Adam')
     parser.add_argument('--beta2', type=float, default=0.95,
                        help='Beta2 pour Adam')
-    parser.add_argument('--grad_clip', type=float, default=1.0,
+    parser.add_argument('--grad_clip', type=float, default=0.5,
                        help='Clip de gradient')
     parser.add_argument('--decay_lr', action='store_true',
                        help='Décroissance du taux d\'apprentissage')
