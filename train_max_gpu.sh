@@ -38,6 +38,10 @@ while [[ $# -gt 0 ]]; do
             GRAD_ACCUM="$2"
             shift 2
             ;;
+        --init_from)
+            INIT_FROM="$2"
+            shift 2
+            ;;
         --block_size)
             BLOCK_SIZE="$2"
             shift 2
