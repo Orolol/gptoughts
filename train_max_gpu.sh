@@ -175,7 +175,7 @@ if __name__ == "__main__":
 EOF
 
 # Construire la commande
-CMD="python $TRAIN_SCRIPT --model_type $MODEL_TYPE --size $SIZE --block_size $BLOCK_SIZE --batch_size $BATCH_SIZE --gradient_accumulation_steps $GRAD_ACCUM"
+CMD="python $TRAIN_SCRIPT --model_type $MODEL_TYPE --size $SIZE --block_size $BLOCK_SIZE --batch_size $BATCH_SIZE --gradient_accumulation_steps $GRAD_ACCUM --init_from $INIT_FROM"
 
 # Ajouter des options supplémentaires pour maximiser l'utilisation du GPU
 CMD="$CMD --compile --preallocate_memory --async_data_loading --optimize_attention --decay_lr"
