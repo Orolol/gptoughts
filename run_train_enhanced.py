@@ -254,7 +254,7 @@ def main():
                        help='Utiliser le chargement de données asynchrone')
     parser.add_argument('--optimize_attention', action='store_true', default=True,
                        help='Optimiser les opérations d\'attention')
-    parser.add_argument('--dtype', type=str, choices=['float32', 'float16', 'bfloat16'], default=None,
+    parser.add_argument('--dtype', type=str, choices=['float32', 'float16', 'bfloat16'], default='bfloat16',
                        help='Type de données à utiliser pour l\'entraînement')
     
     args = parser.parse_args()
