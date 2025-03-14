@@ -12,12 +12,36 @@ else
     exit 1
 fi
 
+# Vérification de la compatibilité FP8 (H100, H200)
+FP8_AVAILABLE=0
+if python -c "
+import torch
+import sys
+try:
+    if torch.cuda.is_available():
+        if torch.cuda.get_device_properties(0).major >= 9 or (torch.cuda.get_device_properties(0).major == 8 and torch.cuda.get_device_properties(0).minor >= 6):
+            # Vérifier si transformer-engine est disponible
+            try:
+                import transformer_engine
+                print('FP8-compatible')
+                sys.exit(0)
+            except ImportError:
+                pass
+    sys.exit(1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null | grep -q "FP8-compatible"; then
+    echo "GPU compatible FP8 détecté (H100/H200), FP8 sera activé pour une performance maximale"
+    FP8_AVAILABLE=1
+fi
+
 # Paramètres par défaut
 MODEL_TYPE="deepseek"  # Options: deepseek, llada, gpt
 SIZE="medium"          # Options: small, medium, large
 BATCH_SIZE=0           # 0 pour auto-détection
 GRAD_ACCUM=0           # 0 pour auto-détection
 BLOCK_SIZE=1024        # Taille du contexte
+USE_FP8=0              # Désactivé par défaut, activé uniquement si compatible
 
 # Traiter les arguments
 while [[ $# -gt 0 ]]; do
@@ -46,12 +70,28 @@ while [[ $# -gt 0 ]]; do
             BLOCK_SIZE="$2"
             shift 2
             ;;
+        --use_fp8)
+            USE_FP8=1
+            shift
+            ;;
+        --no_fp8)
+            USE_FP8=0
+            shift
+            ;;
         *)
             echo "Option inconnue: $1"
             exit 1
             ;;
     esac
 done
+
+# Activer automatiquement FP8 si disponible et non explicitement désactivé
+if [ "$FP8_AVAILABLE" -eq 1 ] && [ "$USE_FP8" -ne 0 ]; then
+    USE_FP8=1
+    echo "Activation automatique de FP8 pour une performance maximale"
+else
+    USE_FP8=0
+fi
 
 # Créer un script Python temporaire pour déterminer les paramètres optimaux
 TMP_SCRIPT=$(mktemp)
@@ -193,15 +233,25 @@ CMD="$CMD --compile --preallocate_memory --async_data_loading --optimize_attenti
 # Ajouter des options pour prévenir les NaN
 CMD="$CMD --grad_clip 1.0 --weight_decay 0.05 --learning_rate 3e-5 --min_lr 1e-6"
 
+# Si FP8 est disponible et activé, ajouter l'option
+if [ "$USE_FP8" -eq 1 ]; then
+    CMD="$CMD --use_fp8"
+    echo "Mode FP8 activé pour une performance maximale"
+    
+    # Vérifier si transformer-engine est installé, sinon suggérer l'installation
+    if ! python -c "import transformer_engine" &>/dev/null; then
+        echo "ATTENTION: Package transformer-engine non trouvé, nécessaire pour FP8"
+        echo "Installer avec: pip install -r requirements-fp8.txt"
+    fi
+# Sinon, utiliser bfloat16 si disponible pour une meilleure stabilité numérique
+elif python -c "import torch; print(torch.cuda.is_bf16_supported())" | grep -q "True"; then
+    CMD="$CMD --dtype bfloat16"
+    echo "BFloat16 détecté, utilisation pour une meilleure stabilité numérique"
+fi
+
 # Si le modèle est LLaDA, ajouter un coefficient de perte de routeur plus faible
 if [ "$MODEL_TYPE" == "llada" ]; then
     CMD="$CMD --router_z_loss_coef 0.0001"
-    
-    # Utiliser bfloat16 si disponible pour une meilleure stabilité numérique
-    if python -c "import torch; print(torch.cuda.is_bf16_supported())" | grep -q "True"; then
-        CMD="$CMD --dtype bfloat16"
-        echo "BFloat16 détecté, utilisation pour une meilleure stabilité numérique"
-    fi
 fi
 
 # Afficher la commande
