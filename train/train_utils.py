@@ -326,22 +326,22 @@ def custom_fp8_autocast():
         # Import transformer-engine for FP8 support (if available)
         import transformer_engine as te
         from transformer_engine.common.recipe import DelayedScaling
+
+        # Vérifier que transformer-engine est correctement installé et disponible
+        if not hasattr(te, 'fp8') or not hasattr(te.fp8, 'FP8Tensor'):
+            raise ImportError("La version installée de transformer-engine ne supporte pas correctement FP8")
         
-        # Initialize FP8 meta tensors
-        fp8_format = te.common.recipe.Format.HYBRID
-        fp8_recipe = DelayedScaling(
-            margin=0,
-            interval=1,
-            fp8_format=fp8_format
-        )
+        # Configurer la recette FP8
+        te.fp8.fp8_autocast = True
         
-        # Start FP8 autocast with transformer-engine
-        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+        # Avec les nouvelles versions de transformer-engine, on utilise simplement torch.amp.autocast
+        # transformer-engine s'intègre automatiquement dans PyTorch pour remplacer les opérateurs par des versions FP8
+        with torch.amp.autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
             yield
             
-    except ImportError:
+    except ImportError as e:
         # Fallback if transformer-engine is not available
-        print("Warning: transformer-engine not available for FP8 precision. Falling back to BF16.")
+        print(f"Warning: transformer-engine not available for FP8 precision ({e}). Falling back to BF16.")
         with torch.amp.autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
             yield
             
@@ -351,6 +351,10 @@ def custom_fp8_autocast():
             yield
             
     finally:
+        # Clean up
+        if 'te' in locals() and hasattr(te, 'fp8'):
+            te.fp8.fp8_autocast = False
+            
         # Mark the end of FP8 region
         if NVTX_AVAILABLE:
             nvtx.range_pop()

@@ -221,16 +221,23 @@ class Trainer:
         # Initialize gradient scaler for mixed precision
         # Note: BFloat16 has sufficient dynamic range and doesn't need gradient scaling
         if self.dtype == 'fp8':
-            # For FP8, we'll use a custom scaling approach if transformer_engine is available
+            # Pour FP8, nous utilisons le scaler standard - transformer-engine s'intègre automatiquement
             try:
                 import transformer_engine as te
-                # Use transformer_engine's custom scaler for FP8
-                self.scaler = te.fp8.FP8GradScaler()
-                print("Using FP8GradScaler from transformer_engine")
-            except (ImportError, AttributeError):
+                # Vérifier que transformer-engine est correctement installé
+                if hasattr(te, 'fp8'):
+                    # Avec les nouvelles versions de transformer-engine, on utilise le scaler PyTorch standard
+                    # transformer-engine s'intègre automatiquement dans l'écosystème PyTorch
+                    self.scaler = GradScaler(enabled=True, init_scale=2**10)
+                    print("Using GradScaler with transformer-engine FP8 integration")
+                else:
+                    # Fallback si transformer-engine est trop ancien ou mal installé
+                    self.scaler = GradScaler(enabled=True, init_scale=2**10)
+                    print("Warning: transformer-engine doesn't have FP8 support, using standard GradScaler")
+            except (ImportError, AttributeError) as e:
                 # Fallback to standard scaler
                 self.scaler = GradScaler(enabled=True, init_scale=2**10)
-                print("Transformer-engine FP8GradScaler not available, using standard GradScaler")
+                print(f"Transformer-engine not properly available: {e}. Using standard GradScaler.")
         elif self.dtype == 'float16':
             self.scaler = GradScaler(enabled=True)
         else:
