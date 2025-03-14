@@ -544,7 +544,7 @@ class Trainer:
                     param_group['lr'] = lr
             
             # Generate text periodically
-            if self.iter_num % 100 == 0 and self.master_process:
+            if self.iter_num % 500 == 0 and self.master_process:
             # if self.iter_num 100:
                 self.generate_sample_text()
             
