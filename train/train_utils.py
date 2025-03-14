@@ -324,19 +324,19 @@ def custom_fp8_autocast():
             nvtx.range_push("FP8_region")
         
         # Import transformer-engine for FP8 support (if available)
-        import transformer_engine as te
-        from transformer_engine.common.recipe import DelayedScaling
-
-        # Vérifier que transformer-engine est correctement installé et disponible
-        if not hasattr(te, 'fp8') or not hasattr(te.fp8, 'FP8Tensor'):
-            raise ImportError("La version installée de transformer-engine ne supporte pas correctement FP8")
+        import transformer_engine.pytorch as te
+        from transformer_engine.common import recipe
         
-        # Configurer la recette FP8
-        te.fp8.fp8_autocast = True
+        # Initialize FP8 meta tensors with proper recipe configuration
+        # Format.HYBRID uses E4M3 for forward and E5M2 for backward
+        fp8_recipe = recipe.DelayedScaling(
+            margin=0,
+            interval=1,
+            fp8_format=recipe.Format.HYBRID
+        )
         
-        # Avec les nouvelles versions de transformer-engine, on utilise simplement torch.amp.autocast
-        # transformer-engine s'intègre automatiquement dans PyTorch pour remplacer les opérateurs par des versions FP8
-        with torch.amp.autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
+        # Use the correct te.fp8_autocast with the recipe
+        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
             yield
             
     except ImportError as e:
@@ -351,10 +351,6 @@ def custom_fp8_autocast():
             yield
             
     finally:
-        # Clean up
-        if 'te' in locals() and hasattr(te, 'fp8'):
-            te.fp8.fp8_autocast = False
-            
         # Mark the end of FP8 region
         if NVTX_AVAILABLE:
             nvtx.range_pop()

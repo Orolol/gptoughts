@@ -221,23 +221,17 @@ class Trainer:
         # Initialize gradient scaler for mixed precision
         # Note: BFloat16 has sufficient dynamic range and doesn't need gradient scaling
         if self.dtype == 'fp8':
-            # Pour FP8, nous utilisons le scaler standard - transformer-engine s'intègre automatiquement
+            # Pour FP8, on utilise aussi transformer_engine.pytorch
             try:
-                import transformer_engine as te
-                # Vérifier que transformer-engine est correctement installé
-                if hasattr(te, 'fp8'):
-                    # Avec les nouvelles versions de transformer-engine, on utilise le scaler PyTorch standard
-                    # transformer-engine s'intègre automatiquement dans l'écosystème PyTorch
-                    self.scaler = GradScaler(enabled=True, init_scale=2**10)
-                    print("Using GradScaler with transformer-engine FP8 integration")
-                else:
-                    # Fallback si transformer-engine est trop ancien ou mal installé
-                    self.scaler = GradScaler(enabled=True, init_scale=2**10)
-                    print("Warning: transformer-engine doesn't have FP8 support, using standard GradScaler")
-            except (ImportError, AttributeError) as e:
+                import transformer_engine.pytorch as te
+                # Pour FP8, utiliser un GradScaler standard est suffisant
+                # transformer_engine gère l'échelle en interne avec fp8_autocast
+                self.scaler = torch.cuda.amp.GradScaler(enabled=True, init_scale=2**10)
+                print("Using standard GradScaler with transformer-engine FP8 integration")
+            except ImportError as e:
                 # Fallback to standard scaler
                 self.scaler = GradScaler(enabled=True, init_scale=2**10)
-                print(f"Transformer-engine not properly available: {e}. Using standard GradScaler.")
+                print(f"Transformer-engine not available: {e}. Using standard GradScaler.")
         elif self.dtype == 'float16':
             self.scaler = GradScaler(enabled=True)
         else:

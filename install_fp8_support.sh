@@ -79,23 +79,36 @@ echo "Installation des dépendances à partir de requirements-fp8.txt..."
 pip install -r requirements-fp8.txt
 
 # Vérifier l'installation de transformer-engine
-if ! python -c "import transformer_engine" &>/dev/null; then
-    echo "ERREUR: L'installation de transformer-engine a échoué."
+if ! python -c "
+try:
+    import transformer_engine.pytorch
+    print('ok')
+except ImportError:
+    print('error')
+" 2>/dev/null | grep -q "ok"; then
+    echo "ERREUR: L'installation de transformer-engine.pytorch a échoué."
     echo "Veuillez vérifier les erreurs ci-dessus et réessayer."
     exit 1
 fi
 
-# Vérifier si transformer-engine a le support FP8
+# Vérifier si transformer-engine a le support FP8 correct
 if ! python -c "
-import transformer_engine
-import sys
-if hasattr(transformer_engine, 'fp8'):
-    print('FP8 support OK')
-    sys.exit(0)
-sys.exit(1)
+try:
+    import transformer_engine.pytorch as te
+    from transformer_engine.common import recipe
+    if hasattr(te, 'fp8_autocast') and hasattr(recipe, 'Format'):
+        print('FP8 support OK')
+    else:
+        print('FP8 support MISSING')
+        exit(1)
+except (ImportError, AttributeError) as e:
+    print(f'FP8 support ERROR: {e}')
+    exit(1)
 " 2>/dev/null | grep -q "FP8 support OK"; then
-    echo "ATTENTION: La version de transformer-engine installée ne semble pas avoir le support FP8."
+    echo "ATTENTION: La version de transformer-engine installée ne supporte pas correctement FP8."
+    echo "L'API fp8_autocast manque ou n'est pas correctement configurée."
     echo "Cela peut être dû à une installation incorrecte ou à une version incompatible."
+    echo "Essayez: pip install -U transformer-engine>=1.3.0"
 else
     echo "Vérification réussie: transformer-engine avec support FP8 est correctement installé!"
 fi

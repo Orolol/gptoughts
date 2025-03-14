@@ -239,14 +239,30 @@ if [ "$USE_FP8" -eq 1 ]; then
     echo "Mode FP8 activé pour une performance maximale"
     
     # Vérifier si transformer-engine est installé, sinon suggérer l'installation
-    if ! python -c "import transformer_engine" &>/dev/null; then
-        echo "ATTENTION: Package transformer-engine non trouvé, nécessaire pour FP8"
+    if ! python -c "
+try:
+    import transformer_engine.pytorch
+    print('ok')
+except ImportError:
+    print('error')
+" 2>/dev/null | grep -q "ok"; then
+        echo "ATTENTION: Package transformer-engine non trouvé ou mal installé, nécessaire pour FP8"
         echo "Installer avec: pip install -r requirements-fp8.txt"
         echo "Installation automatique impossible - il faut d'abord installer un driver CUDA compatible"
     else
-        # Vérifier si transformer-engine a le support FP8
-        if ! python -c "import transformer_engine; print('ok') if hasattr(transformer_engine, 'fp8') else print('error')" 2>/dev/null | grep -q "ok"; then
-            echo "ATTENTION: La version de transformer-engine installée ne supporte pas FP8"
+        # Vérifier si transformer-engine.pytorch a le bon support FP8
+        if ! python -c "
+try:
+    import transformer_engine.pytorch as te
+    from transformer_engine.common import recipe
+    if hasattr(te, 'fp8_autocast') and hasattr(recipe, 'Format'):
+        print('ok')
+    else:
+        print('error')
+except (ImportError, AttributeError):
+    print('error')
+" 2>/dev/null | grep -q "ok"; then
+            echo "ATTENTION: La version de transformer-engine installée ne supporte pas correctement FP8"
             echo "Mettre à jour transformer-engine avec: pip install -r requirements-fp8.txt"
             echo "Version requise: transformer-engine>=1.3.0"
         fi

@@ -1,13 +1,13 @@
 # Requirements for FP8 training (requires NVIDIA H100/H200 GPU)
 -r requirements.txt
 
-# Transformer Engine - Provides FP8 support
-# Utiliser la dernière version stable de transformer-engine (>= 1.3.0)
-transformer-engine>=1.3.0
-
 # PyTorch avec support CUDA 12.x (nécessaire pour transformer-engine)
 --extra-index-url https://download.pytorch.org/whl/cu121
 torch>=2.1.0
+
+# Transformer Engine - Provides FP8 support
+# La version 1.3+ inclut l'API correcte pour fp8_autocast dans transformer_engine.pytorch
+transformer-engine>=1.3.0
 
 # Additional dependencies for FP8 support
 nvidia-cuda-nvrtc-cu12==12.1.105
