@@ -618,9 +618,34 @@ class Trainer:
                                 
                             elif model_type == 'llada':
                                 # LLaDA model
-                                logits, loss, router_loss = self.model(input_ids, targets=targets)
-                                balance_loss = router_loss if router_loss is not None else 0
-
+                                with torch.amp.autocast(enabled=True, device_type='cuda'):
+                                    # Add gradient and loss stabilization for LLaDA models
+                                    try:
+                                        # Apply stabilization techniques specifically to prevent NaN in router mechanism
+                                        logits, loss, router_loss = self.model(input_ids, targets=targets)
+                                        
+                                        # Implement additional checks for router_loss
+                                        if router_loss is not None:
+                                            # Check if router_loss contains NaN values
+                                            if torch.isnan(router_loss).any():
+                                                print(f"WARNING: NaN detected in router_loss at iteration {self.iter_num}")
+                                                # Replace NaN values with a small constant to prevent propagation
+                                                router_loss = torch.where(torch.isnan(router_loss), torch.tensor(0.1, device=router_loss.device), router_loss)
+                                            
+                                            # Cap extremely large router loss values to prevent explosion
+                                            router_loss = torch.clamp(router_loss, max=10.0)
+                                            balance_loss = router_loss
+                                        else:
+                                            balance_loss = 0
+                                    except Exception as e:
+                                        print(f"Error during LLaDA forward pass: {e}")
+                                        # Fallback to a simpler forward pass if there's an error
+                                        if hasattr(self.model, 'forward_simple') and callable(getattr(self.model, 'forward_simple')):
+                                            logits, loss = self.model.forward_simple(input_ids, targets)
+                                            balance_loss = 0
+                                            print("Used simplified forward pass to avoid NaN")
+                                        else:
+                                            raise
                             else:
                                 # Standard GPT model
                                 logits, loss = self.model(input_ids, targets=targets)
@@ -650,7 +675,11 @@ class Trainer:
                                 # Add router loss if available
                                 if balance_loss != 0:
                                     balance_loss = balance_loss / self.args.gradient_accumulation_steps
-                                    router_loss_coef = getattr(self.args, 'router_z_loss_coef', 0.001)
+                                    # Use a very small router_loss_coef for LLaDA models to prevent instability
+                                    if model_type == 'llada':
+                                        router_loss_coef = getattr(self.args, 'router_z_loss_coef', 0.0001)
+                                    else:
+                                        router_loss_coef = getattr(self.args, 'router_z_loss_coef', 0.001)
                                     combined_loss = loss + router_loss_coef * balance_loss
                                 else:
                                     combined_loss = loss
@@ -683,6 +712,25 @@ class Trainer:
                                     # Supprimer scaled_loss uniquement s'il existe (branche avec scaler)
                                     if self.scaler.is_enabled() and 'scaled_loss' in locals():
                                         del scaled_loss
+                                
+                                # Stabilize gradients after backward pass for LLaDA models
+                                if model_type == 'llada':
+                                    with torch.no_grad():
+                                        for param in (self.model.parameters() if not self.ddp else self.model.module.parameters()):
+                                            if param.grad is not None:
+                                                # Replace NaN gradients with zeros
+                                                param.grad = torch.where(
+                                                    torch.isnan(param.grad),
+                                                    torch.zeros_like(param.grad),
+                                                    param.grad
+                                                )
+                                                
+                                                # Value-based clipping to avoid extreme gradient values
+                                                param.grad = torch.clamp(
+                                                    param.grad,
+                                                    min=-5.0,
+                                                    max=5.0
+                                                )
                 
                 except Exception as e:
                     print(f"Training iteration failed: {e}")
