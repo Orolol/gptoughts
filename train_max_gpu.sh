@@ -190,6 +190,20 @@ CMD="python $TRAIN_SCRIPT --model_type $MODEL_TYPE --size $SIZE --block_size $BL
 # Ajouter des options supplémentaires pour maximiser l'utilisation du GPU
 CMD="$CMD --compile --preallocate_memory --async_data_loading --optimize_attention --decay_lr"
 
+# Ajouter des options pour prévenir les NaN
+CMD="$CMD --grad_clip 1.0 --weight_decay 0.05 --learning_rate 3e-5 --min_lr 1e-6"
+
+# Si le modèle est LLaDA, ajouter un coefficient de perte de routeur plus faible
+if [ "$MODEL_TYPE" == "llada" ]; then
+    CMD="$CMD --router_z_loss_coef 0.0001"
+    
+    # Utiliser bfloat16 si disponible pour une meilleure stabilité numérique
+    if python -c "import torch; print(torch.cuda.is_bf16_supported())" | grep -q "True"; then
+        CMD="$CMD --dtype bfloat16"
+        echo "BFloat16 détecté, utilisation pour une meilleure stabilité numérique"
+    fi
+fi
+
 # Afficher la commande
 echo "Exécution de la commande: $CMD"
 

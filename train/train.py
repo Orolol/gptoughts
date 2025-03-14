@@ -124,6 +124,10 @@ class Trainer:
         print(f"Tokens per iteration: {self.tokens_per_iter:,}")
         print(f"Batch size: {self.args.batch_size}, block size: {self.args.block_size}, gradient accumulation steps: {self.args.gradient_accumulation_steps}")
         
+        # Disable deterministic algorithms for better performance and to prevent NaN issues
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        
         # Configurer les optimisations de mémoire CUDA
         if torch.cuda.is_available():
             # Réserver un pourcentage plus élevé de la mémoire pour PyTorch
@@ -469,6 +473,14 @@ class Trainer:
             if hasattr(self.model.module, 'set_timing_stats'):
                 self.model.module.set_timing_stats(self.timing_stats)
         
+        # Ensure model is in correct precision for stability
+        self.model = ensure_model_dtype(self.model, self.ptdtype)
+        
+        # Use a more conservative gradient clipping value if not specified
+        if not hasattr(self.args, 'grad_clip') or self.args.grad_clip == 0.0:
+            self.args.grad_clip = 1.0
+            print(f"Setting default gradient clipping to {self.args.grad_clip}")
+            
         # Compile model if requested
         if hasattr(self.args, 'compile') and self.args.compile:
             print("Compiling model...")
@@ -643,13 +655,20 @@ class Trainer:
                                 else:
                                     combined_loss = loss
                                 
+                                # Check for NaN values before backward pass
+                                if torch.isnan(combined_loss).any():
+                                    print(f"WARNING: NaN detected in loss at iteration {self.iter_num}")
+                                    skip_optimizer_step = True
+                                    # Skip backward to avoid corrupting the model
+                                    continue
+                                
                                 # Backward pass with or without scaler
                                 if self.scaler.is_enabled():
                                     scaled_loss = self.scaler.scale(combined_loss)
-                                    scaled_loss.backward(retain_graph=True)
+                                    scaled_loss.backward(retain_graph=False)  # Changed to False to reduce memory usage
                                 else:
                                     # Direct backward for bfloat16 which has sufficient dynamic range
-                                    combined_loss.backward(retain_graph=True)
+                                    combined_loss.backward(retain_graph=False)  # Changed to False
                                     
                                     # Track losses
                                     total_loss += loss.item()
@@ -662,7 +681,7 @@ class Trainer:
                                         del balance_loss
                                     del combined_loss
                                     # Supprimer scaled_loss uniquement s'il existe (branche avec scaler)
-                                    if self.scaler.is_enabled():
+                                    if self.scaler.is_enabled() and 'scaled_loss' in locals():
                                         del scaled_loss
                 
                 except Exception as e:
@@ -675,10 +694,16 @@ class Trainer:
                 
                 # Optimizer step avec optimisations
                 with self.timing_stats.track("optimizer_step"):
+                    # Skip optimizer step if NaN was detected
+                    if skip_optimizer_step:
+                        print("Skipping optimizer step due to NaN detected in loss")
+                        continue
+                        
                     if self.scaler.is_enabled():
                         # Avec GradScaler (pour float16)
                         if self.args.grad_clip != 0.0:
                             self.scaler.unscale_(self.optimizer)
+                            # Apply more aggressive gradient clipping to prevent NaN
                             torch.nn.utils.clip_grad_norm_(
                                 self.model.parameters() if not self.ddp else self.model.module.parameters(),
                                 self.args.grad_clip
@@ -690,10 +715,22 @@ class Trainer:
                     else:
                         # Sans GradScaler (pour bfloat16)
                         if self.args.grad_clip != 0.0:
+                            # Apply more aggressive gradient clipping to prevent NaN
                             torch.nn.utils.clip_grad_norm_(
                                 self.model.parameters() if not self.ddp else self.model.module.parameters(),
                                 self.args.grad_clip
                             )
+                        
+                        # Check for NaN in gradients before optimizer step
+                        has_nan_grad = False
+                        for param in (self.model.parameters() if not self.ddp else self.model.module.parameters()):
+                            if param.grad is not None and torch.isnan(param.grad).any():
+                                has_nan_grad = True
+                                break
+                        
+                        if has_nan_grad:
+                            print(f"WARNING: NaN detected in gradients at iteration {self.iter_num}, skipping optimizer step")
+                            continue
                         
                         # Étape d'optimisation standard
                         self.optimizer.step()
