@@ -804,7 +804,7 @@ class Trainer:
             self.local_iter_num += 1
             
             # # Periodic memory cleanup
-            if self.iter_num % 100 == 0:
+            if self.iter_num % 20 == 0:
                 cleanup_memory()
             
             # Termination conditions
