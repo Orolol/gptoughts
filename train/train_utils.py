@@ -318,40 +318,69 @@ def custom_fp8_autocast():
     Custom context manager for FP8 precision on compatible hardware.
     This is required since PyTorch doesn't natively support FP8 through autocast yet.
     """
+    # Mark the start of FP8 region for profiling
     try:
-        # Mark the start of FP8 region for profiling
         if NVTX_AVAILABLE:
             nvtx.range_push("FP8_region")
         
+        # Check if we can use ada_fp8_utils for better Ada Lovelace support
+        try:
+            from ada_fp8_utils import ada_fp8_autocast
+            # Utiliser la version adaptée aux GPU Ada
+            with ada_fp8_autocast():
+                yield
+            return
+        except ImportError:
+            # ada_fp8_utils non disponible, continuons avec la méthode standard
+            pass
+        
         # Import transformer-engine for FP8 support (if available)
         import transformer_engine.pytorch as te
-        from transformer_engine.common import recipe
         
-        # Initialize FP8 meta tensors with proper recipe configuration
-        # Format.HYBRID uses E4M3 for forward and E5M2 for backward
-        fp8_recipe = recipe.DelayedScaling(
-            margin=0,
-            interval=1,
-            fp8_format=recipe.Format.HYBRID
-        )
+        # Vérifier que fp8_autocast est disponible
+        if not hasattr(te, "fp8_autocast"):
+            print("WARNING: transformer_engine.pytorch n'a pas l'attribut fp8_autocast. Fallback vers bfloat16.")
+            # Fallback vers bfloat16
+            with torch.amp.autocast(enabled=True, device_type='cuda'):
+                yield
+            return
         
-        # Use the correct te.fp8_autocast with the recipe
-        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
-            yield
+        # Check if we're using the newer version with recipe API
+        if hasattr(te, "common") and hasattr(te.common, "recipe"):
+            # Initialize FP8 meta tensors with proper recipe configuration
+            # Format.HYBRID uses E4M3 for forward and E5M2 for backward
+            from transformer_engine.common import recipe
+            fp8_recipe = recipe.DelayedScaling(
+                margin=0,
+                interval=1,
+                fp8_format=recipe.Format.HYBRID
+            )
             
+            # Use the correct te.fp8_autocast with the recipe
+            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                yield
+        else:
+            # Ancienne version de transformer-engine, fp8_autocast sans recipe
+            # Cette version fonctionne mieux avec Ada Lovelace
+            with te.fp8_autocast():
+                yield
     except ImportError as e:
-        # Fallback if transformer-engine is not available
-        print(f"Warning: transformer-engine not available for FP8 precision ({e}). Falling back to BF16.")
-        with torch.amp.autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
+        print(f"WARNING: transformer_engine.pytorch n'est pas disponible: {e}. Fallback vers bfloat16.")
+        # Fallback vers bfloat16
+        with torch.amp.autocast(enabled=True, device_type='cuda'):
             yield
-            
+    except AttributeError as e:
+        print(f"WARNING: erreur dans transformer_engine.pytorch: {e}. Fallback vers bfloat16.")
+        # Fallback vers bfloat16
+        with torch.amp.autocast(enabled=True, device_type='cuda'):
+            yield
     except Exception as e:
-        print(f"FP8 autocast error: {e}. Falling back to BF16.")
-        with torch.amp.autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
+        print(f"WARNING: erreur inattendue avec transformer_engine: {e}. Fallback vers bfloat16.")
+        # Fallback vers bfloat16
+        with torch.amp.autocast(enabled=True, device_type='cuda'):
             yield
-            
     finally:
-        # Mark the end of FP8 region
+        # Mark the end of FP8 region for profiling
         if NVTX_AVAILABLE:
             nvtx.range_pop()
 
