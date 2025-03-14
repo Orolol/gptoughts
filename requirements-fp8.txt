@@ -9,14 +9,8 @@ torch>=2.1.0
 # La version 1.3+ inclut l'API correcte pour fp8_autocast dans transformer_engine.pytorch
 transformer-engine>=1.3.0
 
-# Additional dependencies for FP8 support
-nvidia-cuda-nvrtc-cu12==12.1.105
-nvidia-cuda-runtime-cu12==12.1.105
-nvidia-cuda-cupti-cu12==12.1.105
-nvidia-cudnn-cu12==8.9.2.26
-nvidia-cublas-cu12==12.1.3.1
-nvidia-cufft-cu12==11.0.2.54
-nvidia-nccl-cu12==2.19.3
+# Laisser PyTorch gérer les versions des bibliothèques CUDA
+# Ne pas spécifier de versions précises pour éviter les conflits
 
 # NVTX for profiling FP8 operations
 torch-tensorrt>=1.4.0
