@@ -17,6 +17,13 @@ from gpu_optimization import (
     cleanup_memory, print_memory_stats, setup_cuda_optimizations
 )
 
+# Add torch.cuda.nvtx import for profiling FP8 operations (if available)
+try:
+    import torch.cuda.nvtx as nvtx
+    NVTX_AVAILABLE = True
+except ImportError:
+    NVTX_AVAILABLE = False
+
 # Constantes pour le calcul des FLOPS
 GPU_FLOPS = {
     (7, 0): 312e12,      # A100-40GB (312 TFLOPS en FP16)
@@ -305,18 +312,65 @@ def find_latest_checkpoint(out_dir):
     checkpoints.sort(key=extract_iter_num)
     return checkpoints[-1]
 
+@contextmanager
+def custom_fp8_autocast():
+    """
+    Custom context manager for FP8 precision on compatible hardware.
+    This is required since PyTorch doesn't natively support FP8 through autocast yet.
+    """
+    try:
+        # Mark the start of FP8 region for profiling
+        if NVTX_AVAILABLE:
+            nvtx.range_push("FP8_region")
+        
+        # Import transformer-engine for FP8 support (if available)
+        import transformer_engine as te
+        from transformer_engine.common.recipe import DelayedScaling
+        
+        # Initialize FP8 meta tensors
+        fp8_format = te.common.recipe.Format.HYBRID
+        fp8_recipe = DelayedScaling(
+            margin=0,
+            interval=1,
+            fp8_format=fp8_format
+        )
+        
+        # Start FP8 autocast with transformer-engine
+        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            yield
+            
+    except ImportError:
+        # Fallback if transformer-engine is not available
+        print("Warning: transformer-engine not available for FP8 precision. Falling back to BF16.")
+        with torch.amp.autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
+            yield
+            
+    except Exception as e:
+        print(f"FP8 autocast error: {e}. Falling back to BF16.")
+        with torch.amp.autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
+            yield
+            
+    finally:
+        # Mark the end of FP8 region
+        if NVTX_AVAILABLE:
+            nvtx.range_pop()
+
 def get_context_manager(device_type, dtype):
     """
     Get appropriate context manager for mixed precision training
     Args:
         device_type: 'cuda' or 'cpu'
-        dtype: Desired dtype string ('float16', 'bfloat16', or 'float32')
+        dtype: Desired dtype string ('float16', 'bfloat16', 'float32', or 'fp8')
     Returns:
         Context manager for mixed precision
     """
     if device_type == 'cpu':
         return nullcontext()
-        
+    
+    if dtype == 'fp8':
+        # Use custom FP8 implementation
+        return custom_fp8_autocast()
+    
     ptdtype = {
         'float32': torch.float32, 
         'bfloat16': torch.bfloat16, 

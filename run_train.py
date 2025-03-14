@@ -190,6 +190,13 @@ def main():
     parser.add_argument('--min_lr', type=float, default=3e-6,
                        help='Taux d\'apprentissage minimal')
     
+    # Paramètres de précision
+    parser.add_argument('--dtype', type=str, default=None,
+                       choices=['float32', 'float16', 'bfloat16', 'fp8'],
+                       help='Type de données à utiliser pour l\'entraînement')
+    parser.add_argument('--use_fp8', action='store_true',
+                       help='Utiliser la précision FP8 pour l\'entraînement (nécessite un GPU compatible comme H100)')
+    
     # Paramètres DDP
     parser.add_argument('--backend', type=str, default='nccl',
                        help='Backend pour DDP')

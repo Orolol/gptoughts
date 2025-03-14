@@ -92,7 +92,22 @@ class Trainer:
         else:
             # Choisir le meilleur dtype en fonction du GPU
             if torch.cuda.is_available():
-                if torch.cuda.is_bf16_supported():
+                # Check if FP8 is supported
+                fp8_supported = False
+                try:
+                    import transformer_engine
+                    # Check if we're running on H100 or later GPU that supports FP8
+                    if torch.cuda.get_device_properties(0).major >= 9 or (
+                        torch.cuda.get_device_properties(0).major == 8 and 
+                        torch.cuda.get_device_properties(0).minor >= 6
+                    ):
+                        fp8_supported = True
+                except ImportError:
+                    pass
+                
+                if fp8_supported and hasattr(self.args, 'use_fp8') and self.args.use_fp8:
+                    self.dtype = 'fp8'        # H100 et plus récent
+                elif torch.cuda.is_bf16_supported():
                     self.dtype = 'bfloat16'  # Meilleur pour les GPUs récents (Ampere+)
                 else:
                     self.dtype = 'float16'   # Pour les GPUs plus anciens
@@ -100,7 +115,15 @@ class Trainer:
                 self.dtype = 'float32'       # CPU
             
         print(f"Using dtype: {self.dtype}")
-        self.ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[self.dtype]
+        
+        # Setup pytorch dtype equivalent - FP8 doesn't have a direct PyTorch equivalent
+        if self.dtype == 'fp8':
+            # For model parameters we'll use BF16, but computation will be in FP8
+            self.ptdtype = torch.bfloat16
+            print("Using FP8 for computation with BF16 for parameters")
+        else:
+            self.ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[self.dtype]
+        
         self.ctx = get_context_manager(self.device_type, self.dtype)
         
         # Apply CUDA optimizations if available
@@ -197,7 +220,22 @@ class Trainer:
         
         # Initialize gradient scaler for mixed precision
         # Note: BFloat16 has sufficient dynamic range and doesn't need gradient scaling
-        self.scaler = GradScaler(enabled=(self.dtype == 'float16'))
+        if self.dtype == 'fp8':
+            # For FP8, we'll use a custom scaling approach if transformer_engine is available
+            try:
+                import transformer_engine as te
+                # Use transformer_engine's custom scaler for FP8
+                self.scaler = te.fp8.FP8GradScaler()
+                print("Using FP8GradScaler from transformer_engine")
+            except (ImportError, AttributeError):
+                # Fallback to standard scaler
+                self.scaler = GradScaler(enabled=True, init_scale=2**10)
+                print("Transformer-engine FP8GradScaler not available, using standard GradScaler")
+        elif self.dtype == 'float16':
+            self.scaler = GradScaler(enabled=True)
+        else:
+            # BF16 and FP32 don't need scaling
+            self.scaler = GradScaler(enabled=False)
         
         # Initialize training state
         self.iter_num = 1
@@ -618,7 +656,7 @@ class Trainer:
                                 
                             elif model_type == 'llada':
                                 # LLaDA model
-                                with torch.amp.autocast(enabled=True, device_type='cuda'):
+                                with self.ctx:  # Use the appropriate context manager for the selected precision
                                     # Add gradient and loss stabilization for LLaDA models
                                     try:
                                         # Apply stabilization techniques specifically to prevent NaN in router mechanism
@@ -824,13 +862,8 @@ class Trainer:
         
         if self.master_process:
             print("Training finished!")
-    
-    def generate_sample_text(self):
-        """Génère un exemple de texte avec le modèle actuel"""
-        model_type = self.args.model_type.lower()
-        
-        print("\nText Generation:")
-        
+            
+    def get_prompt(self):
         # Get a prompt
         if hasattr(self.args, 'prompt_templates') and self.args.prompt_templates:
             prompt = random.choice(self.args.prompt_templates)
@@ -856,8 +889,8 @@ class Trainer:
                 "Compare and contrast the following approaches:"
             ]
             prompt = random.choice(diverse_prompts)
-        
-        # Tokenize the prompt
+            
+           # Tokenize the prompt
         if hasattr(self.args, 'tokenizer'):
             tokenizer = self.args.tokenizer
             input_tokens = tokenizer.encode(
@@ -870,9 +903,20 @@ class Trainer:
         else:
             # Simple fallback if no tokenizer
             input_tokens = torch.tensor([[1, 2, 3]]).to(self.device)  # Dummy tokens
+        return prompt, input_tokens
+    
+    def generate_sample_text(self):
+        """Génère un exemple de texte avec le modèle actuel"""
+        model_type = self.args.model_type.lower()
+        
+        tokenizer = self.args.tokenizer
+        
+        print("\nText Generation:")
+        
+      
         
         try:
-            with torch.no_grad(), torch.amp.autocast(enabled=True, device_type=self.device_type):
+            with torch.no_grad(), self.ctx:
                 # Generate text
                 raw_model = self.model.module if self.ddp else self.model
                 
@@ -945,31 +989,33 @@ class Trainer:
                         return
                 else:
                     # Use the generic generate_text function
-                    output_text = generate_text(
-                        raw_model,
-                        input_tokens,
-                        max_new_tokens=min(100, self.args.block_size - 10),
-                        temperature=0.7,
-                        tokenizer=tokenizer if hasattr(self.args, 'tokenizer') else None
-                    )
+                    for _ in range(5):
+                        prompt, input_tokens = self.get_prompt()
+                        output_text = generate_text(
+                            raw_model,
+                            input_tokens,
+                            max_new_tokens=min(100, self.args.block_size - 10),
+                            temperature=0.7,
+                            tokenizer=tokenizer if hasattr(self.args, 'tokenizer') else None
+                        )
                     
-                    # Si output_text est None (cas de LLaDAModel), on ne l'affiche pas
-                    if output_text is not None:
-                        print(f"Generated text: {output_text}\n")
-                    else:
-                        print(f"Text generation completed (output format depends on model type)\n")
-                    return
-                
-                # Decode the generated text
-                if hasattr(self.args, 'tokenizer'):
-                    generated_text = tokenizer.decode(
-                        output_ids[0],
-                        skip_special_tokens=True,
-                        clean_up_tokenization_spaces=True
-                    )
-                    print(f"Generated text: {prompt} {generated_text}\n")
-                else:
-                    print(f"Generated tokens: {output_ids[0].tolist()}\n")
+                        # Si output_text est None (cas de LLaDAModel), on ne l'affiche pas
+                        if output_text is not None:
+                            print(f"Generated text: {output_text}\n")
+                        else:
+                            print(f"Text generation completed (output format depends on model type)\n")
+                        return
+                    
+                        # Decode the generated text
+                        if hasattr(self.args, 'tokenizer'):
+                            generated_text = tokenizer.decode(
+                                output_ids[0],
+                                skip_special_tokens=True,
+                                clean_up_tokenization_spaces=True
+                            )
+                            print(f"Generated text: {prompt} {generated_text}\n")
+                        else:
+                            print(f"Generated tokens: {output_ids[0].tolist()}\n")
                     
         except Exception as e:
             print(f"Generation error: {str(e)}")

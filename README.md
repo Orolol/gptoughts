@@ -73,6 +73,17 @@ python run_train.py --model_name huggyllama/llama-7b \
                    --learning_rate 1e-5
 ```
 
+### Entraînement avec précision FP8 (requiert GPU H100/H200)
+
+```bash
+python run_train.py --model_type llada \
+                   --size medium \
+                   --use_fp8 \
+                   --batch_size 32 \
+                   --block_size 4096 \
+                   --learning_rate 1e-5
+```
+
 ### Entraînement optimisé
 
 ```bash
@@ -94,6 +105,7 @@ Ce projet met l'accent sur l'optimisation maximale de l'utilisation GPU. Les pri
 - **Ajustement automatique des paramètres d'entraînement** en fonction du matériel
 - **Optimisations spécifiques aux opérations d'attention** (Flash Attention, etc.)
 - **Gestion fine de la mémoire** pour réduire la fragmentation et maximiser l'espace disponible
+- **Support de la précision FP8** pour les GPUs compatibles (Hopper H100/H200) augmentant significativement la vitesse d'entraînement
 
 Pour plus de détails, consultez les documents `GPU_OPTIMIZATION_README.md` et `ADVANCED_GPU_OPTIMIZATION.md`.
 
