@@ -1,21 +1,21 @@
 # Core dependencies
-torch
-numpy
-transformers
+torch>=2.5.1
+numpy>=1.24.0
+transformers>=4.30.0
 
 # Training utilities
-wandb
-tqdm
-datasets
+wandb>=0.15.0  # Optional: for experiment tracking
+tqdm>=4.65.0
+datasets>=2.12.0
 
 # Optional: for faster attention
 # flash-attn>=2.0.0; platform_system != "Windows"
 
 # Development
-pytest
-black
-isort
-tiktoken
+pytest>=7.3.1
+black>=23.3.0
+isort>=5.12.0
+tiktoken>=0.8.0
 rich
 pytorch_optimizer
 # xformers

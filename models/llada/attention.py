@@ -35,14 +35,15 @@ class LLaDAAttention(nn.Module):
         self.head_size = config.n_embd // config.n_head
         
         # Add RoPE positional embeddings - reuse from blocks
-        self.rope = RoPE(self.head_size, config.block_size)
+        # Ensure max_seq_len accommodates BD3 training (2 * block_size)
+        self.rope = RoPE(self.head_size, max_seq_len=2 * config.block_size)
         
         # For KV caching during generation
         self.kv_cache_enabled = False
         self._cached_k = None
         self._cached_v = None
 
-    def forward(self, x, use_kv_cache=False):
+    def forward(self, x, attn_mask=None, past_key_value=None, use_kv_cache=False): # Added past_key_value
         batch_size, seq_len, n_embd = x.shape
         
         # Ensure inputs are contiguous for better performance
@@ -68,23 +69,31 @@ class LLaDAAttention(nn.Module):
             del qkv
             
             # Handle KV caching for faster generation
+            # Handle KV caching for faster generation
+            # Logic priority: 1. explicit past_key_value, 2. internal cache, 3. no cache
+            if past_key_value is not None:
+                # Use explicit past K/V passed for this block (e.g., during BD3 generation)
+                past_k, past_v = past_key_value
+                k = torch.cat([past_k, k], dim=2)
+                v = torch.cat([past_v, v], dim=2)
+            elif use_kv_cache and self.kv_cache_enabled and self._cached_k is not None:
+                # Use internal cache (for original LLaDA generation)
+                k = torch.cat([self._cached_k, k], dim=2)
+                v = torch.cat([self._cached_v, v], dim=2)
+                 
+            # Update internal cache if enabled (for original LLaDA generation)
             if use_kv_cache and self.kv_cache_enabled:
-                if self._cached_k is not None and self._cached_v is not None:
-                    # Concatenate current k,v with cached k,v
-                    k = torch.cat([self._cached_k, k], dim=2)
-                    v = torch.cat([self._cached_v, v], dim=2)
-                
-                # Update the cache
-                self._cached_k = k
-                self._cached_v = v
+                 self._cached_k = k
+                 self._cached_v = v
             
             # Use PyTorch's SDPA with no causal mask (KEY DIFFERENCE FROM GPT)
+            # Modified to accept an optional attention mask for BD3-LM
             y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,  # No causal mask here (bidirectional attention)
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=False  # Not causal - this is LLaDA's main difference
-            )
+                 q, k, v,
+                 attn_mask=attn_mask, # Pass the provided mask
+                 dropout_p=self.dropout if self.training else 0.0,
+                 is_causal=False # Still explicitly not causal by default, mask handles structure
+             )
             
             # Reshape back to original
             y = y.transpose(1, 2).contiguous().view(batch_size, seq_len, n_embd)
@@ -96,4 +105,7 @@ class LLaDAAttention(nn.Module):
             if self.dropout > 0 and self.training:
                 y = self.resid_dropout(y)
         
-        return y 
+        # Return output and the K/V state for this input (needed for BD3 cache update)
+        # Note: k, v here might include past_key_value if it was provided.
+        present_key_value = (k, v)
+        return y, present_key_value

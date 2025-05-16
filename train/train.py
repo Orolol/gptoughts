@@ -23,18 +23,30 @@ from torch.amp import GradScaler
 
 # Essayer d'importer les fonctions d'optimisation GPU avancées
 try:
-    from gpu_optimization_enhanced import (
-        setup_enhanced_cuda_optimizations as setup_cuda_optimizations,
-        cleanup_memory, print_memory_stats, print_enhanced_gpu_stats as print_gpu_stats,
-        preallocate_cuda_memory, optimize_attention_operations
+    from optimization.cuda_optim import (
+        setup_cuda_optimizations,
+        print_gpu_stats,
+        optimize_attention_operations
+    )
+    from optimization.memory_optim import (
+        cleanup_memory, 
+        print_memory_stats,
+        preallocate_cuda_memory
     )
     ENHANCED_OPTIMIZATIONS = True
 except ImportError:
     # Fallback sur les optimisations standard
-    from gpu_optimization import (
-        setup_cuda_optimizations, cleanup_memory, print_memory_stats,
-        print_gpu_stats, preallocate_cuda_memory
+    from optimization.cuda_optim import (
+        setup_cuda_optimizations,
+        print_gpu_stats
     )
+    from optimization.memory_optim import (
+        cleanup_memory, 
+        print_memory_stats
+    )
+    # Ces fonctions peuvent ne pas être disponibles dans la version standard
+    preallocate_cuda_memory = lambda: print("preallocate_cuda_memory not available")
+    optimize_attention_operations = lambda: print("optimize_attention_operations not available")
     ENHANCED_OPTIMIZATIONS = False
 
 # Import des fonctions utilitaires
@@ -87,22 +99,29 @@ class Trainer:
         self.device_type = 'cuda' if 'cuda' in self.device else 'cpu'
         
         # Determine dtype based on model type and available hardware
-        if hasattr(self.args, 'dtype'):
+        if hasattr(self.args, 'dtype') and self.args.dtype is not None:
             self.dtype = self.args.dtype
+            print(f"Using dtype: {self.dtype}")
         else:
             # Choisir le meilleur dtype en fonction du GPU
             if torch.cuda.is_available():
                 # Check if FP8 is supported
                 fp8_supported = False
                 try:
-                    import transformer_engine
-                    # Check if we're running on H100 or later GPU that supports FP8
-                    if torch.cuda.get_device_properties(0).major >= 9 or (
-                        torch.cuda.get_device_properties(0).major == 8 and 
-                        torch.cuda.get_device_properties(0).minor >= 6
-                    ):
-                        fp8_supported = True
-                except ImportError:
+                    # First check if transformer_engine is properly installed and can be loaded
+                    try:
+                        import transformer_engine
+                        # Check if we're running on H100 or later GPU that supports FP8
+                        if torch.cuda.get_device_properties(0).major >= 9 or (
+                            torch.cuda.get_device_properties(0).major == 8 and 
+                            torch.cuda.get_device_properties(0).minor >= 6
+                        ):
+                            fp8_supported = True
+                    except (ImportError, ModuleNotFoundError, RuntimeError) as e:
+                        print(f"transformer_engine not available or couldn't be loaded: {e}")
+                        print("FP8 support will be disabled")
+                except Exception as e:
+                    print(f"Error checking for FP8 support: {e}")
                     pass
                 
                 if fp8_supported and hasattr(self.args, 'use_fp8') and self.args.use_fp8:
@@ -123,8 +142,6 @@ class Trainer:
             print("Using FP8 for computation with BF16 for parameters")
         else:
             self.ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[self.dtype]
-        
-        self.ctx = get_context_manager(self.device_type, self.dtype)
         
         # Apply CUDA optimizations if available
         if torch.cuda.is_available():
@@ -221,22 +238,31 @@ class Trainer:
         # Initialize gradient scaler for mixed precision
         # Note: BFloat16 has sufficient dynamic range and doesn't need gradient scaling
         if self.dtype == 'fp8':
-            # Pour FP8, on utilise aussi transformer_engine.pytorch
             try:
                 import transformer_engine.pytorch as te
-                # Pour FP8, utiliser un GradScaler standard est suffisant
-                # transformer_engine gère l'échelle en interne avec fp8_autocast
-                self.scaler = torch.cuda.amp.GradScaler(enabled=True, init_scale=2**10)
-                print("Using standard GradScaler with transformer-engine FP8 integration")
-            except ImportError as e:
-                # Fallback to standard scaler
-                self.scaler = GradScaler(enabled=True, init_scale=2**10)
-                print(f"Transformer-engine not available: {e}. Using standard GradScaler.")
+                # Pour FP8, désactiver GradScaler complètement
+                # transformer_engine gère déjà l'échelle en interne avec fp8_autocast
+                self.scaler = GradScaler(enabled=False)
+                self.use_unscale = False
+                print("Using transformer-engine FP8 integration without GradScaler")
+            except (ImportError, ModuleNotFoundError, RuntimeError, Exception) as e:
+                # Fallback to BFloat16 which has better stability
+                self.scaler = GradScaler(enabled=False)
+                self.use_unscale = False
+                print(f"Transformer-engine not available or couldn't be loaded: {e}")
+                print("Falling back to BFloat16 precision")
+                self.dtype = 'bfloat16'
+                self.ptdtype = torch.bfloat16
         elif self.dtype == 'float16':
             self.scaler = GradScaler(enabled=True)
+            print("Using Float16 with GradScaler")
         else:
             # BF16 and FP32 don't need scaling
             self.scaler = GradScaler(enabled=False)
+            if self.dtype == 'bfloat16':
+                print("Using BFloat16 without GradScaler (sufficient dynamic range)")
+            else:
+                print("Using FP32 without GradScaler")
         
         # Initialize training state
         self.iter_num = 1
@@ -466,6 +492,7 @@ class Trainer:
         # Reset scaler
         # Note: BFloat16 has sufficient dynamic range and doesn't need gradient scaling
         self.scaler = GradScaler(enabled=(self.dtype == 'float16'))
+        self.scaler.is_enabled = False
         
         cleanup_memory()
     
@@ -583,7 +610,7 @@ class Trainer:
                     param_group['lr'] = lr
             
             # Generate text periodically
-            if self.iter_num % 500 == 0 and self.master_process:
+            if self.iter_num % 500 == 0 and self.master_process or self.iter_num == 50:
             # if self.iter_num 100:
                 self.generate_sample_text()
             
@@ -657,34 +684,39 @@ class Trainer:
                                 
                             elif model_type == 'llada':
                                 # LLaDA model
-                                with self.ctx:  # Use the appropriate context manager for the selected precision
-                                    # Add gradient and loss stabilization for LLaDA models
-                                    try:
-                                        # Apply stabilization techniques specifically to prevent NaN in router mechanism
-                                        logits, loss, router_loss = self.model(input_ids, targets=targets)
+                                # Add gradient and loss stabilization for LLaDA models
+                                try:
+                                    # Apply stabilization techniques specifically to prevent NaN in router mechanism
+                                    forward_args = {'input_ids': input_ids, 'targets': targets}
+                                    # Add BD3 flag if applicable
+                                    # Assumes args object has 'use_bd3_training' attribute (added in run_train.py)
+                                    if getattr(self.args, 'use_bd3_training', False):
+                                        forward_args['use_bd3_training'] = True
+                                    
+                                    logits, loss, router_loss = self.model(**forward_args)
+                                    
+                                    # Implement additional checks for router_loss
+                                    if router_loss is not None:
+                                        # Check if router_loss contains NaN values
+                                        if torch.isnan(router_loss).any():
+                                            print(f"WARNING: NaN detected in router_loss at iteration {self.iter_num}")
+                                            # Replace NaN values with a small constant to prevent propagation
+                                            router_loss = torch.where(torch.isnan(router_loss), torch.tensor(0.1, device=router_loss.device), router_loss)
                                         
-                                        # Implement additional checks for router_loss
-                                        if router_loss is not None:
-                                            # Check if router_loss contains NaN values
-                                            if torch.isnan(router_loss).any():
-                                                print(f"WARNING: NaN detected in router_loss at iteration {self.iter_num}")
-                                                # Replace NaN values with a small constant to prevent propagation
-                                                router_loss = torch.where(torch.isnan(router_loss), torch.tensor(0.1, device=router_loss.device), router_loss)
-                                            
-                                            # Cap extremely large router loss values to prevent explosion
-                                            router_loss = torch.clamp(router_loss, max=10.0)
-                                            balance_loss = router_loss
-                                        else:
-                                            balance_loss = 0
-                                    except Exception as e:
-                                        print(f"Error during LLaDA forward pass: {e}")
-                                        # Fallback to a simpler forward pass if there's an error
-                                        if hasattr(self.model, 'forward_simple') and callable(getattr(self.model, 'forward_simple')):
-                                            logits, loss = self.model.forward_simple(input_ids, targets)
-                                            balance_loss = 0
-                                            print("Used simplified forward pass to avoid NaN")
-                                        else:
-                                            raise
+                                        # Cap extremely large router loss values to prevent explosion
+                                        router_loss = torch.clamp(router_loss, max=10.0)
+                                        balance_loss = router_loss
+                                    else:
+                                        balance_loss = 0
+                                except Exception as e:
+                                    print(f"Error during LLaDA forward pass: {e}")
+                                    # Fallback to a simpler forward pass if there's an error
+                                    if hasattr(self.model, 'forward_simple') and callable(getattr(self.model, 'forward_simple')):
+                                        logits, loss = self.model.forward_simple(input_ids, targets)
+                                        balance_loss = 0
+                                        print("Used simplified forward pass to avoid NaN")
+                                    else:
+                                        raise
                             else:
                                 # Standard GPT model
                                 logits, loss = self.model(input_ids, targets=targets)
@@ -738,38 +770,19 @@ class Trainer:
                                     # Direct backward for bfloat16 which has sufficient dynamic range
                                     combined_loss.backward(retain_graph=False)  # Changed to False
                                     
-                                    # Track losses
-                                    total_loss += loss.item()
-                                    if balance_loss != 0:
-                                        total_router_loss += balance_loss.item()
-                                    
-                                    # Clean up
-                                    del loss
-                                    if balance_loss != 0:
-                                        del balance_loss
-                                    del combined_loss
-                                    # Supprimer scaled_loss uniquement s'il existe (branche avec scaler)
-                                    if self.scaler.is_enabled() and 'scaled_loss' in locals():
-                                        del scaled_loss
+                                # Track losses
+                                total_loss += loss.item()
+                                if balance_loss != 0:
+                                    total_router_loss += balance_loss.item()
                                 
-                                # Stabilize gradients after backward pass for LLaDA models
-                                if model_type == 'llada':
-                                    with torch.no_grad():
-                                        for param in (self.model.parameters() if not self.ddp else self.model.module.parameters()):
-                                            if param.grad is not None:
-                                                # Replace NaN gradients with zeros
-                                                param.grad = torch.where(
-                                                    torch.isnan(param.grad),
-                                                    torch.zeros_like(param.grad),
-                                                    param.grad
-                                                )
-                                                
-                                                # Value-based clipping to avoid extreme gradient values
-                                                param.grad = torch.clamp(
-                                                    param.grad,
-                                                    min=-5.0,
-                                                    max=5.0
-                                                )
+                                # Clean up
+                                del loss
+                                if balance_loss != 0:
+                                    del balance_loss
+                                del combined_loss
+                                # Supprimer scaled_loss uniquement s'il existe (branche avec scaler)
+                                if self.scaler.is_enabled() and 'scaled_loss' in locals():
+                                    del scaled_loss
                 
                 except Exception as e:
                     print(f"Training iteration failed: {e}")
@@ -787,7 +800,7 @@ class Trainer:
                         continue
                         
                     if self.scaler.is_enabled():
-                        # Avec GradScaler (pour float16)
+                        # Avec GradScaler (pour float16 ou FP8)
                         if self.args.grad_clip != 0.0:
                             self.scaler.unscale_(self.optimizer)
                             # Apply more aggressive gradient clipping to prevent NaN
@@ -800,9 +813,9 @@ class Trainer:
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                     else:
-                        # Sans GradScaler (pour bfloat16)
+                        # Sans GradScaler (pour bfloat16 ou float32)
                         if self.args.grad_clip != 0.0:
-                            # Apply more aggressive gradient clipping to prevent NaN
+                            # Apply gradient clipping to prevent NaN
                             torch.nn.utils.clip_grad_norm_(
                                 self.model.parameters() if not self.ddp else self.model.module.parameters(),
                                 self.args.grad_clip
@@ -917,7 +930,7 @@ class Trainer:
       
         
         try:
-            with torch.no_grad(), self.ctx:
+            with torch.no_grad(), torch.amp.autocast(enabled=True, device_type=self.device_type):
                 # Generate text
                 raw_model = self.model.module if self.ddp else self.model
                 
@@ -1034,7 +1047,6 @@ class Trainer:
             self.val_dataset, 
             self.args.eval_iters, 
             self.device, 
-            self.ctx, 
             self.ddp, 
             self.ddp_world_size
         )
