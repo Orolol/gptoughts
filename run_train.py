@@ -1,6 +1,16 @@
 """
 Point d'entrée pour l'entraînement des modèles LLM.
 Ce script permet de configurer et lancer l'entraînement de différents types de modèles.
+
+Caractéristiques principales:
+- Support pour différents types de modèles: DeepSeek, LLaDA, GPT
+- Entraînement distribué sur plusieurs GPUs
+- Optimisations mémoire avancées
+- Support pour Multi-Token Prediction (MTP) dans DeepSeek
+- Différentes précisions d'entraînement (FP32, FP16, BF16, FP8)
+
+Exemple d'utilisation pour DeepSeek avec MTP:
+    python run_train.py --model_type deepseek --size medium --use_mtp --num_mtp_modules 2 --use_gradient_checkpointing
 """
 
 import os
@@ -133,6 +143,16 @@ def main():
     parser.add_argument('--size', type=str, choices=['small', 'medium', 'large'], default='small',
                        help='Taille du modèle')
     
+    # Paramètres DeepSeek MTP (Multi-Token Prediction)
+    parser.add_argument('--use_mtp', action='store_true', default=True,
+                       help='Utiliser le Multi-Token Prediction pour DeepSeek (activé par défaut)')
+    parser.add_argument('--num_mtp_modules', type=int, default=1,
+                       help='Nombre de modules MTP dans le modèle DeepSeek')
+    parser.add_argument('--layers_per_mtp', type=int, default=1,
+                       help='Nombre de couches par module MTP')
+    parser.add_argument('--mtp_loss_factor', type=float, default=0.1,
+                       help='Facteur de pondération pour la perte MTP')
+    
     # Paramètres d'E/S
     parser.add_argument('--output_dir', type=str, default='out',
                        help='Répertoire de sortie pour les checkpoints')
@@ -205,6 +225,16 @@ def main():
     parser.add_argument('--distributed', action='store_true',
                        help='Utiliser l\'entraînement distribué')
     
+    # Paramètres d'optimisation de mémoire
+    parser.add_argument('--use_gradient_checkpointing', action='store_true',
+                       help='Activer le gradient checkpointing pour économiser la mémoire')
+    parser.add_argument('--stabilize_gradients', action='store_true',
+                       help='Stabiliser les gradients pour éviter les NaNs')
+    parser.add_argument('--preallocate_memory', action='store_true',
+                       help='Préallouer la mémoire CUDA pour éviter la fragmentation')
+    parser.add_argument('--optimize_attention', action='store_true',
+                       help='Optimiser les mécanismes d\'attention pour une meilleure performance')
+    
     # Paramètres MoE
     parser.add_argument('--router_z_loss_coef', type=float, default=0.001,
                        help='Coefficient pour la perte du routeur')
@@ -232,6 +262,24 @@ def main():
     if torch.cuda.is_available():
         setup_cuda_optimizations()
         print_gpu_stats()
+        
+    # Print MTP status if DeepSeek is selected
+    if args.model_type.lower() == 'deepseek':
+        if args.use_mtp:
+            print(f"DeepSeek will use Multi-Token Prediction (MTP) with {args.num_mtp_modules} modules, "
+                  f"{args.layers_per_mtp} layers per module, and loss factor {args.mtp_loss_factor}")
+        else:
+            print("DeepSeek will run without Multi-Token Prediction (MTP)")
+            
+    # Print memory optimization status
+    if args.use_gradient_checkpointing:
+        print("Gradient checkpointing enabled for memory optimization")
+    if args.stabilize_gradients:
+        print("Gradient stabilization enabled to prevent NaN issues")
+    if args.preallocate_memory:
+        print("CUDA memory preallocation enabled to reduce fragmentation")
+    if hasattr(args, 'optimize_attention') and args.optimize_attention:
+        print("Attention mechanism optimizations enabled")
     
     # Obtenir le nombre de GPUs disponibles
     world_size = get_gpu_count()

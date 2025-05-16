@@ -7,7 +7,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from models.deepseek.kernel import act_quant, weight_dequant, fp8_gemm
+from kernel import act_quant, weight_dequant, fp8_gemm
 
 
 world_size = 1
@@ -87,7 +87,6 @@ class ModelArgs:
 class ParallelEmbedding(nn.Module):
     """
     Embedding layer with parallelism support across distributed processes.
-    Includes numerical stability improvements.
 
     Args:
         vocab_size (int): Vocabulary size.
@@ -97,90 +96,34 @@ class ParallelEmbedding(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
-        
-        # Assurer que vocab_size est divisible par world_size
-        if vocab_size % world_size != 0:
-            # Arrondir au multiple supérieur
-            adjusted_vocab_size = ((vocab_size // world_size) + 1) * world_size
-            print(f"Warning: Adjusted vocab_size from {vocab_size} to {adjusted_vocab_size} to be divisible by world_size={world_size}")
-            self.vocab_size = adjusted_vocab_size
-        else:
-            print(f"Vocab size {vocab_size} is divisible by world_size={world_size}")
-            
-        self.part_vocab_size = (self.vocab_size // world_size)
+        assert vocab_size % world_size == 0, f"Vocabulary size must be divisible by world size (world_size={world_size})"
+        self.part_vocab_size = (vocab_size // world_size)
         self.vocab_start_idx = rank * self.part_vocab_size
         self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
-        
-        # Initialiser les poids avec une distribution normale tronquée pour éviter les valeurs extrêmes
-        self.weight = nn.Parameter(torch.zeros(self.part_vocab_size, self.dim))
-        self.reset_parameters()
-        
-        # Ajouter un dropout pour la régularisation
-        self.dropout = nn.Dropout(0.1)
-    
-    def reset_parameters(self):
-        """Initialise les poids avec une distribution normale tronquée pour plus de stabilité"""
-        nn.init.normal_(self.weight, mean=0.0, std=0.02)
-        with torch.no_grad():
-            # Tronquer les valeurs extrêmes
-            self.weight.data = torch.clamp(self.weight.data, -0.1, 0.1)
+        self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass for parallel embedding layer with improved numerical stability.
+        Forward pass for parallel embedding layer.
 
         Args:
             x (torch.Tensor): Input tensor containing token indices.
 
         Returns:
             torch.Tensor: Embedded representations.
+
+        Raises:
+            ValueError: If `world_size` is not defined.
         """
-        try:
-            # Vérifier les valeurs d'entrée
-            if torch.max(x) >= self.vocab_size:
-                print(f"Warning: Input contains token IDs >= vocab_size ({torch.max(x).item()} >= {self.vocab_size})")
-                # Limiter les indices au vocabulaire valide
-                x = torch.clamp(x, 0, self.vocab_size - 1)
-            
-            if world_size > 1:
-                # Créer un masque pour les tokens hors de la partition locale
-                mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
-                # Ajuster les indices pour l'embedding local
-                x_adjusted = x.clone()
-                x_adjusted = x_adjusted - self.vocab_start_idx
-                x_adjusted[mask] = 0  # Utiliser l'indice 0 pour les tokens masqués
-            else:
-                # En mode non-distribué, pas besoin d'ajustement
-                x_adjusted = x
-                mask = None
-            
-            # Appliquer l'embedding
-            y = F.embedding(x_adjusted, self.weight)
-            
-            # Appliquer le dropout pour la régularisation
-            y = self.dropout(y)
-            
-            # En mode distribué, masquer les embeddings non pertinents et réduire
-            if world_size > 1 and mask is not None:
-                y[mask] = 0
-                dist.all_reduce(y)
-            
-            # Vérifier les NaN et les valeurs extrêmes
-            if torch.isnan(y).any():
-                print("NaN detected in embedding output")
-                y = torch.nan_to_num(y, nan=0.0)
-            
-            # Limiter les valeurs extrêmes pour éviter les problèmes numériques
-            if torch.max(torch.abs(y)) > 100:
-                print(f"Warning: Extreme values in embedding output: {torch.max(torch.abs(y)).item()}")
-                y = torch.clamp(y, -100, 100)
-            
-            return y
-            
-        except Exception as e:
-            print(f"Error in embedding forward pass: {e}")
-            # En cas d'erreur, retourner un tensor de zéros
-            return torch.zeros(x.size(0), x.size(1), self.dim, device=x.device)
+        if world_size > 1:
+            mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
+            x = x - self.vocab_start_idx
+            x[mask] = 0
+        y = F.embedding(x, self.weight)
+        if world_size > 1:
+            y[mask] = 0
+            dist.all_reduce(y)
+        return y
 
 
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -323,25 +266,21 @@ class RowParallelLinear(Linear):
 
 class RMSNorm(nn.Module):
     """
-    Root Mean Square Layer Normalization (RMSNorm) with improved numerical stability.
+    Root Mean Square Layer Normalization (RMSNorm).
 
     Args:
         dim (int): Dimension of the input tensor.
-        eps (float): Epsilon value for numerical stability. Defaults to 1e-5.
+        eps (float): Epsilon value for numerical stability. Defaults to 1e-6.
     """
-    def __init__(self, dim: int, eps: float = 1e-5):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.dim = dim
-        self.eps = eps  # Augmenté pour plus de stabilité
+        self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-        
-        # Initialiser les poids avec une légère perturbation autour de 1
-        with torch.no_grad():
-            self.weight.data = torch.clamp(torch.normal(1.0, 0.02, size=(dim,)), 0.9, 1.1)
 
     def forward(self, x: torch.Tensor):
         """
-        Forward pass for RMSNorm with improved numerical stability.
+        Forward pass for RMSNorm.
 
         Args:
             x (torch.Tensor): Input tensor.
@@ -349,29 +288,7 @@ class RMSNorm(nn.Module):
         Returns:
             torch.Tensor: Normalized tensor with the same shape as input.
         """
-        try:
-            # Vérifier les NaN dans l'entrée
-            if torch.isnan(x).any():
-                print("NaN detected in RMSNorm input")
-                x = torch.nan_to_num(x, nan=0.0)
-            
-            # Vérifier les valeurs extrêmes
-            if torch.max(torch.abs(x)) > 1e6:
-                print(f"Extreme values in RMSNorm input: {torch.max(torch.abs(x)).item()}")
-                x = torch.clamp(x, -1e6, 1e6)
-            
-            # Implémentation manuelle de RMSNorm pour plus de contrôle
-            # Calculer la variance
-            variance = x.pow(2).mean(dim=-1, keepdim=True)
-            # Ajouter epsilon pour la stabilité numérique
-            x_normed = x * torch.rsqrt(variance + self.eps)
-            # Appliquer le scaling
-            return self.weight * x_normed
-            
-        except RuntimeError as e:
-            print(f"Error in RMSNorm: {e}")
-            # En cas d'erreur, retourner l'entrée inchangée
-            return x
+        return F.rms_norm(x, (self.dim,), self.weight, self.eps)
 
 
 def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
@@ -457,7 +374,7 @@ def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """
-    Applies rotary positional embeddings to the input tensor with improved numerical stability.
+    Applies rotary positional embeddings to the input tensor.
 
     Args:
         x (torch.Tensor): Input tensor with positional embeddings to be applied.
@@ -466,111 +383,16 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     Returns:
         torch.Tensor: Tensor with rotary embeddings applied.
     """
-    try:
-        # Vérifier les dimensions
-        if x.size(-1) % 2 != 0:
-            print(f"Warning: Last dimension of input tensor must be even, got {x.size(-1)}")
-            # Padding pour rendre la dimension paire
-            if x.size(-1) % 2 == 1:
-                padding = torch.zeros(*x.shape[:-1], 1, device=x.device, dtype=x.dtype)
-                x = torch.cat([x, padding], dim=-1)
-        
-        # Vérifier les NaN dans l'entrée
-        if torch.isnan(x).any():
-            print("NaN detected in apply_rotary_emb input")
-            x = torch.nan_to_num(x, nan=0.0)
-        
-        # Sauvegarder le dtype original
-        dtype = x.dtype
-        
-        # Convertir en float32 pour plus de stabilité numérique
-        x_float = x.float()
-        
-        # Vérifier les valeurs extrêmes
-        if torch.isinf(x_float).any() or torch.abs(x_float).max() > 1e6:
-            print("Warning: Extreme values detected in apply_rotary_emb input")
-            x_float = torch.clamp(x_float, -1e6, 1e6)
-        
-        # Reshape pour la conversion en complexe
-        try:
-            x_complex = torch.view_as_complex(x_float.view(*x.shape[:-1], -1, 2))
-        except RuntimeError as e:
-            print(f"Error in view_as_complex: {e}")
-            # Fallback: implémentation manuelle de la rotation
-            x_reshape = x_float.view(*x.shape[:-1], -1, 2)
-            cos = freqs_cis.real.view(1, freqs_cis.size(0), 1, x_reshape.size(-2))
-            sin = freqs_cis.imag.view(1, freqs_cis.size(0), 1, x_reshape.size(-2))
-            
-            x_real, x_imag = x_reshape[..., 0], x_reshape[..., 1]
-            y_real = x_real * cos - x_imag * sin
-            y_imag = x_real * sin + x_imag * cos
-            
-            y = torch.stack([y_real, y_imag], dim=-1)
-            return y.flatten(3).to(dtype)
-        
-        # Reshape freqs_cis pour le broadcast
-        try:
-            freqs_cis = freqs_cis.view(1, x_complex.size(1), 1, x_complex.size(-1))
-        except RuntimeError as e:
-            print(f"Error in freqs_cis reshape: {e}")
-            # Ajuster les dimensions si nécessaire
-            if freqs_cis.size(0) < x_complex.size(1):
-                # Padding pour freqs_cis
-                padding_size = x_complex.size(1) - freqs_cis.size(0)
-                padding = freqs_cis[-1:].expand(padding_size, -1)
-                freqs_cis = torch.cat([freqs_cis, padding], dim=0)
-            elif freqs_cis.size(0) > x_complex.size(1):
-                # Tronquer freqs_cis
-                freqs_cis = freqs_cis[:x_complex.size(1)]
-            
-            if freqs_cis.size(-1) < x_complex.size(-1):
-                # Padding pour freqs_cis
-                padding_size = x_complex.size(-1) - freqs_cis.size(-1)
-                padding = torch.ones(freqs_cis.size(0), padding_size, device=freqs_cis.device, dtype=freqs_cis.dtype)
-                freqs_cis = torch.cat([freqs_cis, padding], dim=-1)
-            elif freqs_cis.size(-1) > x_complex.size(-1):
-                # Tronquer freqs_cis
-                freqs_cis = freqs_cis[..., :x_complex.size(-1)]
-            
-            freqs_cis = freqs_cis.view(1, x_complex.size(1), 1, x_complex.size(-1))
-        
-        # Appliquer la rotation
-        y_complex = x_complex * freqs_cis
-        
-        # Vérifier les NaN après la multiplication
-        if torch.isnan(y_complex).any():
-            print("NaN detected after complex multiplication")
-            # Fallback: utiliser une implémentation plus stable
-            x_real, x_imag = x_float.view(*x.shape[:-1], -1, 2)[..., 0], x_float.view(*x.shape[:-1], -1, 2)[..., 1]
-            cos = freqs_cis.real
-            sin = freqs_cis.imag
-            
-            y_real = x_real * cos - x_imag * sin
-            y_imag = x_real * sin + x_imag * cos
-            
-            y = torch.stack([y_real, y_imag], dim=-1)
-            return y.flatten(3).to(dtype)
-        
-        # Convertir en réel et aplatir
-        y = torch.view_as_real(y_complex).flatten(3)
-        
-        # Vérifier les NaN dans la sortie
-        if torch.isnan(y).any():
-            print("NaN detected in apply_rotary_emb output")
-            y = torch.nan_to_num(y, nan=0.0)
-        
-        # Retourner au dtype original
-        return y.to(dtype)
-        
-    except Exception as e:
-        print(f"Critical error in apply_rotary_emb: {e}")
-        # En cas d'erreur critique, retourner l'entrée inchangée
-        return x
+    dtype = x.dtype
+    x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
+    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
+    y = torch.view_as_real(x * freqs_cis).flatten(3)
+    return y.to(dtype)
 
 
 class MLA(nn.Module):
     """
-    Multi-Headed Attention Layer (MLA).
+    Multi-Head Latent Attention (MLA) Layer.
 
     Attributes:
         dim (int): Dimensionality of the input features.
@@ -620,7 +442,7 @@ class MLA(nn.Module):
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
         """
-        Forward pass for the Multi-Headed Attention Layer (MLA).
+        Forward pass for the Multi-Head Latent Attention (MLA) Layer.
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
@@ -631,270 +453,45 @@ class MLA(nn.Module):
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
-        try:
-            # Ensure x has the right shape (batch_size, seq_len, dim)
-            if len(x.shape) != 3:
-                raise ValueError(f"Expected x to have 3 dimensions (batch_size, seq_len, dim), got {x.shape}")
-                
-            bsz, seqlen, _ = x.size()
-            end_pos = start_pos + seqlen
-            
-            # Vérifier les NaN dans l'entrée
-            if torch.isnan(x).any():
-                print("NaN detected in MLA input")
-                x = torch.nan_to_num(x, nan=0.0)
-            
-            # Projection Q
-            if self.q_lora_rank == 0:
-                q = self.wq(x)
-            else:
-                q_a = self.wq_a(x)
-                # Vérifier NaN après wq_a
-                if torch.isnan(q_a).any():
-                    q_a = torch.nan_to_num(q_a, nan=0.0)
-                q_norm = self.q_norm(q_a)
-                # Vérifier NaN après q_norm
-                if torch.isnan(q_norm).any():
-                    q_norm = torch.nan_to_num(q_norm, nan=0.0)
-                q = self.wq_b(q_norm)
-            
-            # Vérifier NaN dans q
-            if torch.isnan(q).any():
-                print("NaN detected in query projection")
-                q = torch.nan_to_num(q, nan=0.0)
-            
-            q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
-            q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-            
-            # Vérifier les dimensions avant apply_rotary_emb
-            if q_pe.size(-1) != self.qk_rope_head_dim:
-                print(f"Warning: q_pe dimension mismatch: expected {self.qk_rope_head_dim}, got {q_pe.size(-1)}")
-                # Ajuster la dimension si nécessaire
-                if q_pe.size(-1) < self.qk_rope_head_dim:
-                    padding = torch.zeros(bsz, seqlen, self.n_local_heads,
-                                         self.qk_rope_head_dim - q_pe.size(-1),
-                                         device=q_pe.device, dtype=q_pe.dtype)
-                    q_pe = torch.cat([q_pe, padding], dim=-1)
-                else:
-                    q_pe = q_pe[..., :self.qk_rope_head_dim]
-            
-            # Appliquer rotary embedding avec gestion d'erreur
-            try:
-                q_pe = apply_rotary_emb(q_pe, freqs_cis)
-            except Exception as e:
-                print(f"Error in apply_rotary_emb for q_pe: {e}")
-                # Fallback: ne pas appliquer rotary embedding
-                pass
-            
-            # Projection KV
-            kv = self.wkv_a(x)
-            # Vérifier NaN dans kv
-            if torch.isnan(kv).any():
-                print("NaN detected in key-value projection")
-                kv = torch.nan_to_num(kv, nan=0.0)
-            
-            # Split KV
-            kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-            
-            # Vérifier les dimensions avant apply_rotary_emb pour k_pe
-            if k_pe.size(-1) != self.qk_rope_head_dim:
-                print(f"Warning: k_pe dimension mismatch: expected {self.qk_rope_head_dim}, got {k_pe.size(-1)}")
-                # Ajuster la dimension si nécessaire
-                if k_pe.size(-1) < self.qk_rope_head_dim:
-                    padding = torch.zeros(bsz, seqlen, self.qk_rope_head_dim - k_pe.size(-1),
-                                         device=k_pe.device, dtype=k_pe.dtype)
-                    k_pe = torch.cat([k_pe, padding], dim=-1)
-                else:
-                    k_pe = k_pe[..., :self.qk_rope_head_dim]
-            
-            # Appliquer rotary embedding avec gestion d'erreur
-            try:
-                k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
-            except Exception as e:
-                print(f"Error in apply_rotary_emb for k_pe: {e}")
-                # Fallback: ne pas appliquer rotary embedding
-                k_pe = k_pe.unsqueeze(2)
-            
-            # Implémentation naive ou optimisée
-            if attn_impl == "naive":
-                q = torch.cat([q_nope, q_pe], dim=-1)
-                
-                # Normalisation KV avec gestion d'erreur
-                kv_norm = self.kv_norm(kv)
-                # Vérifier NaN dans kv_norm
-                if torch.isnan(kv_norm).any():
-                    print("NaN detected in kv_norm")
-                    kv_norm = torch.nan_to_num(kv_norm, nan=0.0)
-                
-                kv = self.wkv_b(kv_norm)
-                # Vérifier NaN dans kv après projection
-                if torch.isnan(kv).any():
-                    print("NaN detected in kv after wkv_b")
-                    kv = torch.nan_to_num(kv, nan=0.0)
-                
-                kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-                k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-                k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
-                
-                # Ensure k_cache is large enough for this batch
-                if bsz > self.k_cache.size(0):
-                    device = self.k_cache.device
-                    new_k_cache = torch.zeros(bsz, self.k_cache.size(1), self.n_local_heads, self.qk_head_dim,
-                                             device=device, dtype=self.k_cache.dtype)
-                    new_v_cache = torch.zeros(bsz, self.v_cache.size(1), self.n_local_heads, self.v_head_dim,
-                                             device=device, dtype=self.v_cache.dtype)
-                    new_k_cache[:self.k_cache.size(0)] = self.k_cache
-                    new_v_cache[:self.v_cache.size(0)] = self.v_cache
-                    self.k_cache = new_k_cache
-                    self.v_cache = new_v_cache
-                
-                # Mettre à jour les caches
-                self.k_cache[:bsz, start_pos:end_pos] = k
-                self.v_cache[:bsz, start_pos:end_pos] = v
-                
-                # Calcul des scores d'attention avec gestion d'erreur
-                try:
-                    scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
-                except RuntimeError as e:
-                    print(f"Error in attention score calculation: {e}")
-                    # Fallback: utiliser matmul standard
-                    q_flat = q.reshape(bsz * seqlen, self.n_local_heads, self.qk_head_dim)
-                    k_flat = self.k_cache[:bsz, :end_pos].reshape(bsz * end_pos, self.n_local_heads, self.qk_head_dim)
-                    scores = torch.matmul(q_flat, k_flat.transpose(-1, -2)).view(bsz, seqlen, self.n_local_heads, end_pos)
-                    scores = scores * self.softmax_scale
-            else:
-                # Implémentation optimisée
-                wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size)
-                wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
-                
-                # Calcul de q_nope avec gestion d'erreur
-                try:
-                    q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
-                except RuntimeError as e:
-                    print(f"Error in q_nope calculation: {e}")
-                    # Fallback: utiliser matmul standard
-                    q_nope_flat = q_nope.reshape(bsz * seqlen * self.n_local_heads, -1)
-                    wkv_b_flat = wkv_b[:, :self.qk_nope_head_dim].reshape(-1, self.kv_lora_rank)
-                    q_nope = torch.matmul(q_nope_flat, wkv_b_flat).view(bsz, seqlen, self.n_local_heads, -1)
-                
-                # Vérifier NaN dans q_nope
-                if torch.isnan(q_nope).any():
-                    print("NaN detected in q_nope")
-                    q_nope = torch.nan_to_num(q_nope, nan=0.0)
-                
-                # Ensure kv_cache is large enough for this batch
-                if bsz > self.kv_cache.size(0):
-                    device = self.kv_cache.device
-                    new_kv_cache = torch.zeros(bsz, self.kv_cache.size(1), self.kv_lora_rank,
-                                             device=device, dtype=self.kv_cache.dtype)
-                    new_pe_cache = torch.zeros(bsz, self.pe_cache.size(1), self.qk_rope_head_dim,
-                                             device=device, dtype=self.pe_cache.dtype)
-                    new_kv_cache[:self.kv_cache.size(0)] = self.kv_cache
-                    new_pe_cache[:self.pe_cache.size(0)] = self.pe_cache
-                    self.kv_cache = new_kv_cache
-                    self.pe_cache = new_pe_cache
-                
-                # Normalisation KV avec gestion d'erreur
-                kv_norm = self.kv_norm(kv)
-                # Vérifier NaN dans kv_norm
-                if torch.isnan(kv_norm).any():
-                    print("NaN detected in kv_norm")
-                    kv_norm = torch.nan_to_num(kv_norm, nan=0.0)
-                
-                # Mettre à jour les caches
-                self.kv_cache[:bsz, start_pos:end_pos] = kv_norm
-                self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
-                
-                # Calcul des scores d'attention avec gestion d'erreur
-                try:
-                    scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
-                             torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
-                except RuntimeError as e:
-                    print(f"Error in attention score calculation: {e}")
-                    # Fallback: utiliser matmul standard
-                    q_nope_flat = q_nope.reshape(bsz * seqlen * self.n_local_heads, -1)
-                    kv_cache_flat = self.kv_cache[:bsz, :end_pos].reshape(bsz * end_pos, -1)
-                    scores_1 = torch.matmul(q_nope_flat, kv_cache_flat.transpose(-1, -2)).view(bsz, seqlen, self.n_local_heads, end_pos)
-                    
-                    q_pe_flat = q_pe.reshape(bsz * seqlen * self.n_local_heads, -1)
-                    pe_cache_flat = self.pe_cache[:bsz, :end_pos].reshape(bsz * end_pos, -1)
-                    scores_2 = torch.matmul(q_pe_flat, pe_cache_flat.transpose(-1, -2)).view(bsz, seqlen, self.n_local_heads, end_pos)
-                    
-                    scores = (scores_1 + scores_2) * self.softmax_scale
-            
-            # Vérifier NaN dans scores
-            if torch.isnan(scores).any():
-                print("NaN detected in attention scores")
-                scores = torch.nan_to_num(scores, nan=0.0)
-            
-            # Appliquer le masque d'attention
-            if mask is not None:
-                scores += mask.unsqueeze(1)
-            
-            # Softmax avec gestion d'erreur
-            try:
-                # Appliquer un clipping pour éviter les valeurs extrêmes
-                scores = torch.clamp(scores, -1e4, 1e4)
-                scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
-            except RuntimeError as e:
-                print(f"Error in softmax calculation: {e}")
-                # Fallback: softmax manuel avec stabilité numérique
-                scores_max = torch.max(scores, dim=-1, keepdim=True)[0]
-                scores_exp = torch.exp(scores - scores_max)
-                scores_sum = torch.sum(scores_exp, dim=-1, keepdim=True)
-                scores = scores_exp / (scores_sum + 1e-6)
-                scores = scores.type_as(x)
-            
-            # Vérifier NaN dans scores après softmax
-            if torch.isnan(scores).any():
-                print("NaN detected in attention weights after softmax")
-                scores = torch.nan_to_num(scores, nan=1.0/end_pos)  # Utiliser une distribution uniforme comme fallback
-            
-            # Calcul de la sortie d'attention
-            if attn_impl == "naive":
-                try:
-                    x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
-                except RuntimeError as e:
-                    print(f"Error in attention output calculation: {e}")
-                    # Fallback: utiliser matmul standard
-                    scores_flat = scores.reshape(bsz * seqlen * self.n_local_heads, -1)
-                    v_flat = self.v_cache[:bsz, :end_pos].reshape(bsz * end_pos, self.n_local_heads, self.v_head_dim).transpose(0, 1)
-                    v_flat = v_flat.reshape(self.n_local_heads, -1, self.v_head_dim)
-                    x = torch.matmul(scores_flat, v_flat).view(bsz, seqlen, self.n_local_heads, self.v_head_dim)
-            else:
-                try:
-                    x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
-                    x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
-                except RuntimeError as e:
-                    print(f"Error in attention output calculation: {e}")
-                    # Fallback: utiliser matmul standard
-                    scores_flat = scores.reshape(bsz * seqlen * self.n_local_heads, -1)
-                    kv_flat = self.kv_cache[:bsz, :end_pos].reshape(bsz * end_pos, -1)
-                    x = torch.matmul(scores_flat, kv_flat).view(bsz, seqlen, self.n_local_heads, -1)
-                    
-                    x_flat = x.reshape(bsz * seqlen * self.n_local_heads, -1)
-                    wkv_b_flat = wkv_b[:, -self.v_head_dim:].reshape(-1, self.v_head_dim)
-                    x = torch.matmul(x_flat, wkv_b_flat).view(bsz, seqlen, self.n_local_heads, self.v_head_dim)
-            
-            # Vérifier NaN dans la sortie d'attention
-            if torch.isnan(x).any():
-                print("NaN detected in attention output")
-                x = torch.nan_to_num(x, nan=0.0)
-            
-            # Projection finale
-            x = self.wo(x.flatten(2))
-            
-            # Vérifier NaN dans la sortie finale
-            if torch.isnan(x).any():
-                print("NaN detected in MLA output")
-                x = torch.nan_to_num(x, nan=0.0)
-            
-            return x
-            
-        except Exception as e:
-            print(f"Critical error in MLA forward pass: {e}")
-            # Retourner l'entrée inchangée en cas d'erreur critique
-            return x
+        bsz, seqlen, _ = x.size()
+        end_pos = start_pos + seqlen
+        if self.q_lora_rank == 0:
+            q = self.wq(x)
+        else:
+            q = self.wq_b(self.q_norm(self.wq_a(x)))
+        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_pe = apply_rotary_emb(q_pe, freqs_cis)
+        kv = self.wkv_a(x)
+        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
+        if attn_impl == "naive":
+            q = torch.cat([q_nope, q_pe], dim=-1)
+            kv = self.wkv_b(self.kv_norm(kv))
+            kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+            self.k_cache[:bsz, start_pos:end_pos] = k
+            self.v_cache[:bsz, start_pos:end_pos] = v
+            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
+        else:
+            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
+            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
+            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
+            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
+            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+            scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
+                      torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
+        if mask is not None:
+            scores += mask.unsqueeze(1)
+        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
+        if attn_impl == "naive":
+            x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
+        else:
+            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
+            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
+        x = self.wo(x.flatten(2))
+        return x
 
 
 class MLP(nn.Module):
@@ -1035,7 +632,7 @@ class Expert(nn.Module):
 
 class MoE(nn.Module):
     """
-    Mixture-of-Experts (MoE) module with improved numerical stability.
+    Mixture-of-Experts (MoE) module.
 
     Attributes:
         dim (int): Dimensionality of input features.
@@ -1055,48 +652,20 @@ class MoE(nn.Module):
         """
         super().__init__()
         self.dim = args.dim
-        
-        # Assurer que n_routed_experts est divisible par world_size
-        if args.n_routed_experts % world_size != 0:
-            adjusted_experts = ((args.n_routed_experts // world_size) + 1) * world_size
-            print(f"Warning: Adjusted n_routed_experts from {args.n_routed_experts} to {adjusted_experts} to be divisible by world_size={world_size}")
-            self.n_routed_experts = adjusted_experts
-        else:
-            self.n_routed_experts = args.n_routed_experts
-            
-        self.n_local_experts = self.n_routed_experts // world_size
-        
-        # Limiter n_activated_experts pour éviter les problèmes avec de petits batches
-        if args.n_activated_experts > 2:
-            print(f"Warning: Reducing n_activated_experts from {args.n_activated_experts} to 2 for stability with small batches")
-            self.n_activated_experts = 2
-        else:
-            self.n_activated_experts = args.n_activated_experts
-            
+        assert args.n_routed_experts % world_size == 0, f"Number of experts must be divisible by world size (world_size={world_size})"
+        self.n_routed_experts = args.n_routed_experts
+        self.n_local_experts = args.n_routed_experts // world_size
+        self.n_activated_experts = args.n_activated_experts
         self.experts_start_idx = rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        
-        # Créer la gate avec les paramètres ajustés
-        modified_args = ModelArgs(
-            **{k: v for k, v in args.__dict__.items() if k != 'n_activated_experts' and k != 'n_routed_experts'}
-        )
-        modified_args.n_activated_experts = self.n_activated_experts
-        modified_args.n_routed_experts = self.n_routed_experts
-        self.gate = Gate(modified_args)
-        
-        # Créer les experts
+        self.gate = Gate(args)
         self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim) if self.experts_start_idx <= i < self.experts_end_idx else None
                                       for i in range(self.n_routed_experts)])
-        
-        # Créer l'expert partagé (toujours utilisé)
         self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
-        
-        # Ajouter un dropout pour la régularisation
-        self.dropout = nn.Dropout(0.1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass for the MoE module with improved numerical stability.
+        Forward pass for the MoE module.
 
         Args:
             x (torch.Tensor): Input tensor.
@@ -1104,119 +673,21 @@ class MoE(nn.Module):
         Returns:
             torch.Tensor: Output tensor after expert routing and computation.
         """
-        try:
-            # Vérifier les NaN dans l'entrée
-            if torch.isnan(x).any():
-                print("NaN detected in MoE input")
-                x = torch.nan_to_num(x, nan=0.0)
-            
-            # Sauvegarder la forme originale
-            shape = x.size()
-            
-            # Aplatir pour le traitement
-            x = x.view(-1, self.dim)
-            
-            # Appliquer le dropout pour la régularisation
-            x_dropped = self.dropout(x)
-            
-            # Obtenir les poids et indices de routage
-            try:
-                weights, indices = self.gate(x_dropped)
-                
-                # Vérifier les NaN dans les poids
-                if torch.isnan(weights).any():
-                    print("NaN detected in routing weights")
-                    weights = torch.nan_to_num(weights, nan=1.0/self.n_activated_experts)
-            except RuntimeError as e:
-                print(f"Error in gate: {e}")
-                # Fallback: utiliser l'expert partagé uniquement
-                z = self.shared_experts(x)
-                return z.view(shape)
-            
-            # Initialiser le tenseur de sortie
-            y = torch.zeros_like(x)
-            
-            # Compter les tokens par expert
-            try:
-                counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
-            except RuntimeError as e:
-                print(f"Error in bincount: {e}")
-                # Fallback: utiliser l'expert partagé uniquement
-                z = self.shared_experts(x)
-                return z.view(shape)
-            
-            # Appliquer les experts
-            for i in range(self.experts_start_idx, self.experts_end_idx):
-                if counts[i] == 0:
-                    continue
-                    
-                expert = self.experts[i]
-                try:
-                    idx, top = torch.where(indices == i)
-                    
-                    # Vérifier si idx est vide
-                    if len(idx) == 0:
-                        continue
-                    
-                    # Appliquer l'expert
-                    expert_output = expert(x[idx])
-                    
-                    # Vérifier les NaN dans la sortie de l'expert
-                    if torch.isnan(expert_output).any():
-                        print(f"NaN detected in expert {i} output")
-                        expert_output = torch.nan_to_num(expert_output, nan=0.0)
-                    
-                    # Appliquer les poids de routage
-                    weighted_output = expert_output * weights[idx, top, None]
-                    
-                    # Vérifier les NaN après la pondération
-                    if torch.isnan(weighted_output).any():
-                        print(f"NaN detected after weighting expert {i} output")
-                        weighted_output = torch.nan_to_num(weighted_output, nan=0.0)
-                    
-                    # Ajouter à la sortie
-                    y[idx] += weighted_output
-                    
-                except RuntimeError as e:
-                    print(f"Error in expert {i}: {e}")
-                    # Continuer avec les autres experts
-                    continue
-            
-            # Appliquer l'expert partagé
-            z = self.shared_experts(x)
-            
-            # Vérifier les NaN dans la sortie de l'expert partagé
-            if torch.isnan(z).any():
-                print("NaN detected in shared expert output")
-                z = torch.nan_to_num(z, nan=0.0)
-            
-            # Réduire à travers les processus si nécessaire
-            if world_size > 1:
-                try:
-                    dist.all_reduce(y)
-                except RuntimeError as e:
-                    print(f"Error in all_reduce: {e}")
-            
-            # Combiner les sorties
-            combined = y + z
-            
-            # Vérifier les NaN dans la sortie combinée
-            if torch.isnan(combined).any():
-                print("NaN detected in MoE output")
-                combined = torch.nan_to_num(combined, nan=0.0)
-            
-            # Limiter les valeurs extrêmes
-            if torch.max(torch.abs(combined)) > 1e6:
-                print(f"Extreme values in MoE output: {torch.max(torch.abs(combined)).item()}")
-                combined = torch.clamp(combined, -1e6, 1e6)
-            
-            # Retourner à la forme originale
-            return combined.view(shape)
-            
-        except Exception as e:
-            print(f"Critical error in MoE forward: {e}")
-            # En cas d'erreur critique, retourner l'entrée inchangée
-            return x
+        shape = x.size()
+        x = x.view(-1, self.dim)
+        weights, indices = self.gate(x)
+        y = torch.zeros_like(x)
+        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
+        for i in range(self.experts_start_idx, self.experts_end_idx):
+            if counts[i] == 0:
+                continue
+            expert = self.experts[i]
+            idx, top = torch.where(indices == i)
+            y[idx] += expert(x[idx]) * weights[idx, top, None]
+        z = self.shared_experts(x)
+        if world_size > 1:
+            dist.all_reduce(y)
+        return (y + z).view(shape)
 
 
 class Block(nn.Module):
@@ -1294,6 +765,7 @@ class Transformer(nn.Module):
         self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
 
+    @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
         """
         Forward pass for the Transformer model.
@@ -1303,91 +775,23 @@ class Transformer(nn.Module):
             start_pos (int, optional): Starting position in the sequence for rotary embeddings. Defaults to 0.
 
         Returns:
-            torch.Tensor: Logits tensor of shape (batch_size, seq_len, vocab_size).
+            torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
         """
-        # Vérifier les entrées pour éviter les problèmes
-        if tokens.size(1) < 2:
-            # Ajouter un padding pour éviter les problèmes avec les séquences trop courtes
-            padding = torch.zeros((tokens.size(0), 2 - tokens.size(1)),
-                                 dtype=tokens.dtype,
-                                 device=tokens.device)
-            tokens = torch.cat([tokens, padding], dim=1)
-            print(f"Warning: Input sequence length {tokens.size(1)} is too short, padded to length 2")
-        
-        # Handle input from FinewebDataset with shape [batch_size, buffer_size, seq_len]
-        if len(tokens.shape) == 3:
-            batch_size, buffer_size, seq_len = tokens.shape
-            # Reshape to [batch_size*buffer_size, seq_len]
-            tokens = tokens.reshape(-1, seq_len)
-        
-        try:
-            seqlen = tokens.size(1)
-            h = self.embed(tokens)
-            
-            # Vérifier les NaN après l'embedding
-            if torch.isnan(h).any():
-                print("NaN detected after embedding layer")
-                h = torch.nan_to_num(h, nan=0.0)
-            
-            freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
-            mask = None
-            if seqlen > 1:
-                mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
-            
-            # Passer à travers les couches avec vérification des NaN
-            for i, layer in enumerate(self.layers):
-                h_prev = h
-                h = layer(h, start_pos, freqs_cis, mask)
-                
-                # Vérifier les NaN après chaque couche
-                if torch.isnan(h).any():
-                    print(f"NaN detected after layer {i}")
-                    # Utiliser la sortie de la couche précédente si possible
-                    h = torch.nan_to_num(h, nan=0.0)
-                    # Si trop de NaN, revenir à la sortie précédente
-                    if torch.isnan(h).sum() > 0.5 * h.numel():
-                        h = h_prev
-                        print(f"Too many NaNs in layer {i}, using previous layer output")
-            
-            # Apply normalization to the entire sequence, not just the last token
-            h = self.norm(h)
-            
-            # Vérifier les NaN après la normalisation
-            if torch.isnan(h).any():
-                print("NaN detected after final normalization")
-                h = torch.nan_to_num(h, nan=0.0)
-            
-            # Get predictions for all tokens, not just the last one
-            logits = self.head(h.reshape(-1, h.size(-1)))  # Reshape to [batch*seq_len, dim]
-            
-            # Vérifier les NaN dans les logits
-            if torch.isnan(logits).any():
-                print("NaN detected in logits")
-                logits = torch.nan_to_num(logits, nan=0.0)
-            
-            logits = logits.view(h.size(0), h.size(1), -1)  # Reshape back to [batch, seq_len, vocab]
-            
-            if world_size > 1:
-                # For distributed training with 3D tensors, we'd need more complex handling
-                # For simplicity, we're just returning the local logits
-                # In a real implementation, you might want to gather from all processes
-                pass
-                
-            # For the loss calculation in training, flatten to [batch*seq_len, vocab]
-            logits = logits.reshape(-1, logits.size(-1))
-            
-            # Vérification finale des NaN
-            if torch.isnan(logits).any():
-                print("NaN detected in final logits")
-                logits = torch.nan_to_num(logits, nan=0.0)
-                
-            return logits
-            
-        except RuntimeError as e:
-            print(f"Forward pass error: {e}")
-            # Retourner un tensor de zéros en cas d'erreur
-            return torch.zeros((tokens.size(0) * tokens.size(1), self.head.weight.size(0)),
-                              device=tokens.device)
+        seqlen = tokens.size(1)
+        h = self.embed(tokens)
+        freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+        for layer in self.layers:
+            h = layer(h, start_pos, freqs_cis, mask)
+        h = self.norm(h)[:, -1]
+        logits = self.head(h)
+        if world_size > 1:
+            all_logits = [torch.empty_like(logits) for _ in range(world_size)]
+            dist.all_gather(all_logits, logits)
+            logits = torch.cat(all_logits, dim=-1)
+        return logits
 
 
 if __name__ == "__main__":

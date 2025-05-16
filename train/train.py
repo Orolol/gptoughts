@@ -179,11 +179,23 @@ class Trainer:
         # Initialize from scratch
         print(f"Initializing a new {model_type} model from scratch")
         if model_type == 'deepseek':
-            from models.deepseek.deepseek_adapter import DeepSeekMini, DeepSeekMiniConfig
-            # Create config based on model size
-            config = self.create_deepseek_config()
-            self.model = DeepSeekMini(config)
+            # Check if we should use MTP variant
+            use_mtp = getattr(self.args, 'use_mtp', True)
             
+            if use_mtp:
+                # Use DeepSeek with Multi-Token Prediction support
+                from models.deepseek import DeepSeekMiniMTP, DeepSeekMiniConfigMTP
+                # Create config based on model size with MTP parameters
+                config = self.create_deepseek_mtp_config()
+                self.model = DeepSeekMiniMTP(config)
+                print(f"Initialized DeepSeek model with Multi-Token Prediction (MTP) support")
+            else:
+                # Use standard DeepSeek
+                from models.deepseek import DeepSeekMiniTrainable, DeepSeekMiniConfig
+                # Create config based on model size
+                config = self.create_deepseek_config()
+                self.model = DeepSeekMiniTrainable(config)
+                print(f"Initialized DeepSeek model without MTP")
             
         elif model_type == 'llada':
             from models.llada.model import LLaDAModel, LLaDAConfig
@@ -310,6 +322,91 @@ class Trainer:
         
         return config
     
+    def create_deepseek_mtp_config(self):
+        """Crée une configuration pour le modèle DeepSeek Mini avec MTP"""
+        from models.deepseek import DeepSeekMiniConfigMTP
+        
+        # Get MTP related arguments or use defaults
+        num_mtp_modules = getattr(self.args, 'num_mtp_modules', 1)
+        layers_per_mtp = getattr(self.args, 'layers_per_mtp', 1)
+        mtp_loss_factor = getattr(self.args, 'mtp_loss_factor', 0.1)
+        
+        # Determine model size parameters
+        if self.args.size == 'small':
+            config = DeepSeekMiniConfigMTP(
+                vocab_size=self.args.vocab_size,
+                hidden_size=1024,
+                num_hidden_layers=8,
+                num_attention_heads=8,
+                head_dim=128,
+                intermediate_size=2816,
+                num_experts=4,
+                num_experts_per_token=1,
+                max_position_embeddings=max(16, self.args.block_size),
+                kv_compression_dim=64,
+                query_compression_dim=192,
+                rope_head_dim=32,
+                dropout=self.args.dropout,
+                attention_dropout=self.args.dropout,
+                hidden_dropout=self.args.dropout,
+                bias=self.args.bias,
+                # MTP specific parameters
+                num_mtp_modules=num_mtp_modules,
+                layers_per_mtp=layers_per_mtp,
+                mtp_loss_factor=mtp_loss_factor,
+                use_mtp=True
+            )
+        elif self.args.size == 'medium':
+            config = DeepSeekMiniConfigMTP(
+                vocab_size=self.args.vocab_size,
+                hidden_size=2048,
+                num_hidden_layers=24,
+                num_attention_heads=16,
+                head_dim=128,
+                intermediate_size=4096,
+                num_experts=32,
+                num_experts_per_token=4,
+                max_position_embeddings=self.args.block_size,
+                kv_compression_dim=128,
+                query_compression_dim=384,
+                rope_head_dim=32,
+                dropout=self.args.dropout,
+                attention_dropout=self.args.dropout,
+                hidden_dropout=self.args.dropout,
+                bias=self.args.bias,
+                # MTP specific parameters
+                num_mtp_modules=num_mtp_modules,
+                layers_per_mtp=layers_per_mtp,
+                mtp_loss_factor=mtp_loss_factor,
+                use_mtp=True
+            )
+        else:  # large
+            config = DeepSeekMiniConfigMTP(
+                vocab_size=self.args.vocab_size,
+                hidden_size=3072,
+                num_hidden_layers=32,
+                num_attention_heads=24,
+                head_dim=128,
+                intermediate_size=8192,
+                num_experts=64,
+                num_experts_per_token=4,
+                max_position_embeddings=self.args.block_size,
+                kv_compression_dim=256,
+                query_compression_dim=768,
+                rope_head_dim=32,
+                dropout=self.args.dropout,
+                attention_dropout=self.args.dropout,
+                hidden_dropout=self.args.dropout,
+                bias=self.args.bias,
+                # MTP specific parameters
+                num_mtp_modules=num_mtp_modules,
+                layers_per_mtp=layers_per_mtp,
+                mtp_loss_factor=mtp_loss_factor,
+                use_mtp=True
+            )
+        
+        return config
+    
     def create_llada_config(self):
         """Crée une configuration pour le modèle LLaDA"""
         from models.llada.model import LLaDAConfig
@@ -403,11 +500,35 @@ class Trainer:
         model_type = self.args.model_type.lower()
         
         if model_type == 'deepseek':
-            from models.deepseek.deepseek_adapter import DeepSeekMini, DeepSeekMiniConfig
-            # Create new model with saved config
-            saved_config = DeepSeekMiniConfig(**checkpoint['model_args'])
-            self.model = DeepSeekMini(saved_config)
-            self.config = saved_config
+            # Check if we should use MTP variant
+            use_mtp = getattr(self.args, 'use_mtp', True)
+            
+            if use_mtp:
+                # Use DeepSeek with Multi-Token Prediction support
+                from models.deepseek import DeepSeekMiniMTP, DeepSeekMiniConfigMTP
+                
+                # Detect if the checkpoint is from an MTP model or not
+                if 'num_mtp_modules' in checkpoint.get('model_args', {}):
+                    # Create new model with saved MTP config
+                    saved_config = DeepSeekMiniConfigMTP(**checkpoint['model_args'])
+                else:
+                    # Convert non-MTP config to MTP config
+                    saved_config = DeepSeekMiniConfigMTP(**checkpoint['model_args'])
+                    saved_config.num_mtp_modules = getattr(self.args, 'num_mtp_modules', 1)
+                    saved_config.layers_per_mtp = getattr(self.args, 'layers_per_mtp', 1)
+                    saved_config.mtp_loss_factor = getattr(self.args, 'mtp_loss_factor', 0.1)
+                    saved_config.use_mtp = True
+                    print("Converting non-MTP checkpoint to MTP-compatible model")
+                
+                self.model = DeepSeekMiniMTP(saved_config)
+                self.config = saved_config
+            else:
+                # Use standard DeepSeek
+                from models.deepseek import DeepSeekMiniTrainable, DeepSeekMiniConfig
+                # Create new model with saved config
+                saved_config = DeepSeekMiniConfig(**checkpoint['model_args'])
+                self.model = DeepSeekMiniTrainable(saved_config)
+                self.config = saved_config
             
         elif model_type == 'llada':
             from models.llada.model import LLaDAModel, LLaDAConfig
@@ -520,11 +641,22 @@ class Trainer:
             self.args.grad_clip = 1.0
             print(f"Setting default gradient clipping to {self.args.grad_clip}")
             
+        # Enable gradient checkpointing if requested or for large models
+        if hasattr(self.args, 'use_gradient_checkpointing') and self.args.use_gradient_checkpointing:
+            if hasattr(self.model, 'set_gradient_checkpointing'):
+                self.model.set_gradient_checkpointing(True)
+                print("Gradient checkpointing enabled")
+            elif self.args.size in ['medium', 'large']:
+                print("Warning: Gradient checkpointing was requested but model doesn't support it")
+        elif self.args.size in ['medium', 'large']:
+            # Auto-enable gradient checkpointing for medium and large models
+            if hasattr(self.model, 'set_gradient_checkpointing'):
+                self.model.set_gradient_checkpointing(True)
+                print("Gradient checkpointing automatically enabled for large model")
+            
         # Compile model if requested
         if hasattr(self.args, 'compile') and self.args.compile:
             print("Compiling model...")
-            if hasattr(self.model, 'set_gradient_checkpointing'):
-                self.model.set_gradient_checkpointing(True)
             try:
                 self.model = torch.compile(self.model, mode="max-autotune")
             except Exception as e:
@@ -584,11 +716,10 @@ class Trainer:
             
             # Generate text periodically
             if self.iter_num % 500 == 0 and self.master_process:
-            # if self.iter_num 100:
                 self.generate_sample_text()
             
             # Evaluate model periodically
-            if False and self.iter_num % self.args.eval_interval == 0 and self.master_process and self.iter_num > 0:
+            if self.iter_num % self.args.eval_interval == 0 and self.master_process and self.iter_num > 0:
                 self.evaluate_model()
             
             # Exit if eval_only is set
@@ -601,6 +732,7 @@ class Trainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 total_loss = 0
                 total_router_loss = 0
+                total_mtp_loss = 0
                 skip_optimizer_step = False
                 
                 try:
@@ -648,48 +780,41 @@ class Trainer:
                             if torch.cuda.is_available():
                                 torch.cuda.synchronize()
                             
-                            # Handle different model types
-                            if model_type == 'deepseek':
-                                # DeepSeek model via l'adaptateur
-                                # L'adaptateur s'occupe de gérer le modèle original
-                                logits, loss = self.model(input_ids, targets=targets)
-                                balance_loss = 0
+                            # Handle different model types with unified approach
+                            try:
+                                # First try the DeepSeek MTP model return format
+                                outputs = self.model(input_ids, targets=targets)
                                 
-                            elif model_type == 'llada':
-                                # LLaDA model
-                                with self.ctx:  # Use the appropriate context manager for the selected precision
-                                    # Add gradient and loss stabilization for LLaDA models
-                                    try:
-                                        # Apply stabilization techniques specifically to prevent NaN in router mechanism
-                                        logits, loss, router_loss = self.model(input_ids, targets=targets)
-                                        
-                                        # Implement additional checks for router_loss
-                                        if router_loss is not None:
-                                            # Check if router_loss contains NaN values
-                                            if torch.isnan(router_loss).any():
-                                                print(f"WARNING: NaN detected in router_loss at iteration {self.iter_num}")
-                                                # Replace NaN values with a small constant to prevent propagation
-                                                router_loss = torch.where(torch.isnan(router_loss), torch.tensor(0.1, device=router_loss.device), router_loss)
-                                            
-                                            # Cap extremely large router loss values to prevent explosion
-                                            router_loss = torch.clamp(router_loss, max=10.0)
-                                            balance_loss = router_loss
-                                        else:
-                                            balance_loss = 0
-                                    except Exception as e:
-                                        print(f"Error during LLaDA forward pass: {e}")
-                                        # Fallback to a simpler forward pass if there's an error
-                                        if hasattr(self.model, 'forward_simple') and callable(getattr(self.model, 'forward_simple')):
-                                            logits, loss = self.model.forward_simple(input_ids, targets)
-                                            balance_loss = 0
-                                            print("Used simplified forward pass to avoid NaN")
-                                        else:
-                                            raise
-                            else:
-                                # Standard GPT model
-                                logits, loss = self.model(input_ids, targets=targets)
-                                balance_loss = 0
-
+                                # Handle different return formats
+                                if isinstance(outputs, tuple) and len(outputs) == 2:
+                                    # Tuple of logits and loss information
+                                    logits, loss_info = outputs
+                                    
+                                    if isinstance(loss_info, tuple) and len(loss_info) == 2:
+                                        # DeepSeek MTP returns (total_loss, mtp_loss)
+                                        loss, mtp_loss = loss_info
+                                        balance_loss = mtp_loss  # Store MTP loss as balance_loss for compatibility
+                                    else:
+                                        # Standard model returns just the main loss
+                                        loss = loss_info
+                                        balance_loss = 0
+                                elif isinstance(outputs, tuple) and len(outputs) >= 3:
+                                    # LLaDA model returns (logits, loss, router_loss)
+                                    logits, loss, balance_loss = outputs
+                                elif isinstance(outputs, dict):
+                                    # Dictionary return format
+                                    logits = outputs.get("last_hidden_state")
+                                    loss = outputs.get("loss")
+                                    balance_loss = outputs.get("balance_loss", 0)
+                                else:
+                                    # Fallback - direct output as logits
+                                    logits = outputs
+                                    loss = None
+                                    balance_loss = 0
+                                    
+                            except Exception as e:
+                                print(f"Error during forward pass: {e}")
+                                raise
                                 
                             batch_tokens = input_ids.numel()
                             
@@ -702,8 +827,6 @@ class Trainer:
                             # Clean up to save memory
                             if 'logits' in locals():
                                 del logits
-                            if 'hidden_states' in locals():
-                                del hidden_states
                         
                         # Backward pass avec optimisations
                         with self.timing_stats.track("backward"):
@@ -711,15 +834,22 @@ class Trainer:
                                 # Scale loss for gradient accumulation
                                 loss = loss / self.args.gradient_accumulation_steps
                                 
-                                # Add router loss if available
+                                # Add auxiliary loss if available
                                 if balance_loss != 0:
                                     balance_loss = balance_loss / self.args.gradient_accumulation_steps
-                                    # Use a very small router_loss_coef for LLaDA models to prevent instability
-                                    if model_type == 'llada':
+                                    
+                                    # Track MTP loss separately for logging
+                                    if model_type == 'deepseek' and getattr(self.args, 'use_mtp', True):
+                                        total_mtp_loss += balance_loss.item()
+                                    elif model_type == 'llada':
+                                        # Use router loss coefficient for LLaDA
                                         router_loss_coef = getattr(self.args, 'router_z_loss_coef', 0.0001)
+                                        total_router_loss += balance_loss.item()
+                                        combined_loss = loss + router_loss_coef * balance_loss
                                     else:
+                                        # Default behavior
                                         router_loss_coef = getattr(self.args, 'router_z_loss_coef', 0.001)
-                                    combined_loss = loss + router_loss_coef * balance_loss
+                                        combined_loss = loss + router_loss_coef * balance_loss
                                 else:
                                     combined_loss = loss
                                 
@@ -740,8 +870,6 @@ class Trainer:
                                     
                                     # Track losses
                                     total_loss += loss.item()
-                                    if balance_loss != 0:
-                                        total_router_loss += balance_loss.item()
                                     
                                     # Clean up
                                     del loss
@@ -752,8 +880,8 @@ class Trainer:
                                     if self.scaler.is_enabled() and 'scaled_loss' in locals():
                                         del scaled_loss
                                 
-                                # Stabilize gradients after backward pass for LLaDA models
-                                if model_type == 'llada':
+                                # Stabilize gradients after backward pass
+                                if model_type == 'llada' or hasattr(self.args, 'stabilize_gradients'):
                                     with torch.no_grad():
                                         for param in (self.model.parameters() if not self.ddp else self.model.module.parameters()):
                                             if param.grad is not None:
@@ -832,8 +960,11 @@ class Trainer:
             self.t0 = t1
             
             if self.iter_num % self.args.log_interval == 0:
-                self.log_training_stats(total_loss, total_router_loss, dt, lr)
-                
+                # Choose appropriate auxiliary loss to log based on model type
+                if model_type == 'deepseek' and getattr(self.args, 'use_mtp', True):
+                    self.log_training_stats(total_loss, total_mtp_loss, dt, lr, loss_type="mtp_loss")
+                else:
+                    self.log_training_stats(total_loss, total_router_loss, dt, lr, loss_type="router_loss")
                 
                 # Save checkpoint periodically
                 if self.iter_num % 1000 == 0 and self.master_process:
@@ -842,7 +973,7 @@ class Trainer:
             self.iter_num += 1
             self.local_iter_num += 1
             
-            # # Periodic memory cleanup
+            # Periodic memory cleanup
             if self.iter_num % 100 == 0:
                 cleanup_memory()
             
@@ -909,115 +1040,52 @@ class Trainer:
     def generate_sample_text(self):
         """Génère un exemple de texte avec le modèle actuel"""
         model_type = self.args.model_type.lower()
-        
-        tokenizer = self.args.tokenizer
+        tokenizer = self.args.tokenizer if hasattr(self.args, 'tokenizer') else None
         
         print("\nText Generation:")
         
-      
-        
         try:
             with torch.no_grad(), self.ctx:
-                # Generate text
+                # Get raw model and prompt
                 raw_model = self.model.module if self.ddp else self.model
+                prompt, input_tokens = self.get_prompt()
                 
-                if model_type == 'deepseek':
-                    try:
-                        # Vérifier si le modèle a une méthode generate
-                        if hasattr(raw_model, 'generate'):
-                            # Utiliser la méthode generate de l'adaptateur
-                            output_ids = raw_model.generate(
-                                input_tokens,
-                                max_new_tokens=min(100, self.args.block_size - 10),
-                                temperature=0.7,
-                                top_k=40
-                            )
-                        else:
-                            # Pour le modèle DeepSeek original, implémenter la génération manuellement
-                            print("Utilisation de la génération manuelle pour DeepSeek original")
-                            
-                            # Initialiser les ids de sortie avec les tokens d'entrée
-                            output_ids = input_tokens.clone()
-                            max_new_tokens = min(100, self.args.block_size - 10)
-                            
-                            # Générer de nouveaux tokens un par un
-                            for _ in range(max_new_tokens):
-                                # Forward pass pour obtenir les logits du dernier token
-                                with torch.no_grad():
-                                    logits = raw_model(output_ids, start_pos=0)
-                                
-                                # Reshape logits si nécessaire
-                                if logits.dim() == 2:
-                                    # Si logits est [batch*seq, vocab], le reshaper en [batch, seq, vocab]
-                                    logits = logits.view(output_ids.size(0), output_ids.size(1), -1)
-                                
-                                # Obtenir les logits du dernier token
-                                next_token_logits = logits[:, -1, :]
-                                
-                                # Appliquer la température
-                                next_token_logits = next_token_logits / 0.7
-                                
-                                # Appliquer top-k
-                                top_k = 40
-                                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
-                                next_token_logits[indices_to_remove] = float('-inf')
-                                
-                                # Échantillonner le prochain token
-                                probs = F.softmax(next_token_logits, dim=-1)
-                                next_token = torch.multinomial(probs, num_samples=1)
-                                
-                                # Ajouter le nouveau token aux ids de sortie
-                                output_ids = torch.cat([output_ids, next_token], dim=1)
-                                
-                                # Arrêter si on génère un token de fin (à adapter selon le tokenizer)
-                                if hasattr(self.args, 'tokenizer') and next_token[0, 0].item() == self.args.tokenizer.eos_token_id:
-                                    break
-                    except Exception as e:
-                        print(f"Erreur lors de la génération avec DeepSeek: {e}")
-                        print(traceback.format_exc())
-                        # Fallback: utiliser la méthode générique
-                        output_text = generate_text(
-                            raw_model,
-                            input_tokens,
-                            max_new_tokens=min(100, self.args.block_size - 10),
-                            temperature=0.7,
-                            tokenizer=tokenizer if hasattr(self.args, 'tokenizer') else None
+                # Check if model has a generate method
+                if hasattr(raw_model, 'generate'):
+                    # Use the model's generate method
+                    output_ids = raw_model.generate(
+                        input_tokens,
+                        max_new_tokens=min(100, self.args.block_size - 10),
+                        temperature=0.7,
+                        top_k=40
+                    )
+                    
+                    # Decode the generated text if we have a tokenizer
+                    if tokenizer is not None:
+                        generated_text = tokenizer.decode(
+                            output_ids[0] if output_ids.dim() > 1 else output_ids,
+                            skip_special_tokens=True,
+                            clean_up_tokenization_spaces=True
                         )
-                        if output_text is not None:
-                            print(f"Generated text: {output_text}\n")
-                        else:
-                            print(f"Text generation completed (output format depends on model type)\n")
-                        return
+                        print(f"Generated text: {generated_text}\n")
+                    else:
+                        print(f"Generated tokens: {output_ids.tolist()}\n")
+                    
                 else:
-                    # Use the generic generate_text function
-                    for _ in range(5):
-                        prompt, input_tokens = self.get_prompt()
-                        output_text = generate_text(
-                            raw_model,
-                            input_tokens,
-                            max_new_tokens=min(100, self.args.block_size - 10),
-                            temperature=0.7,
-                            tokenizer=tokenizer if hasattr(self.args, 'tokenizer') else None
-                        )
+                    # Fallback: use the generic generate_text function
+                    output_text = generate_text(
+                        raw_model,
+                        input_tokens,
+                        max_new_tokens=min(100, self.args.block_size - 10),
+                        temperature=0.7,
+                        tokenizer=tokenizer
+                    )
                     
-                        # Si output_text est None (cas de LLaDAModel), on ne l'affiche pas
-                        if output_text is not None:
-                            print(f"Generated text: {output_text}\n")
-                        else:
-                            print(f"Text generation completed (output format depends on model type)\n")
-                        return
-                    
-                        # Decode the generated text
-                        if hasattr(self.args, 'tokenizer'):
-                            generated_text = tokenizer.decode(
-                                output_ids[0],
-                                skip_special_tokens=True,
-                                clean_up_tokenization_spaces=True
-                            )
-                            print(f"Generated text: {prompt} {generated_text}\n")
-                        else:
-                            print(f"Generated tokens: {output_ids[0].tolist()}\n")
-                    
+                    if output_text is not None:
+                        print(f"Generated text: {output_text}\n")
+                    else:
+                        print(f"Text generation completed (output format depends on model type)\n")
+                        
         except Exception as e:
             print(f"Generation error: {str(e)}")
             print(traceback.format_exc())
@@ -1048,10 +1116,10 @@ class Trainer:
             if self.iter_num > 0:
                 self.save_training_checkpoint(val_loss=losses['val'])
     
-    def log_training_stats(self, total_loss, total_router_loss, dt, lr):
+    def log_training_stats(self, total_loss, aux_loss, dt, lr, loss_type="router_loss"):
         """Affiche les statistiques d'entraînement"""
         lossf = total_loss
-        router_lossf = total_router_loss
+        aux_lossf = aux_loss
         
         # Calculate tokens/s on the sliding window
         if len(self.tokens_window) > 1:
@@ -1074,8 +1142,8 @@ class Trainer:
             mfu_str = ""
         
         # Print stats
-        if router_lossf > 0:
-            print(f"iter {self.iter_num}: loss {lossf:.4f}, router_loss {router_lossf:.4f}, "
+        if aux_lossf > 0:
+            print(f"iter {self.iter_num}: loss {lossf:.4f}, {loss_type} {aux_lossf:.4f}, "
                   f"time {dt*1000:.2f}ms, lr {lr:.2e}, "
                   f"tt {self.total_tokens:,}, t/s {current_tokens_per_sec:.2f}, "
                   f"avgt/s {avg_tokens_per_sec:.2f}{mfu_str}")
@@ -1095,15 +1163,20 @@ class Trainer:
         # Log to wandb if enabled
         if hasattr(self.args, 'wandb_log') and self.args.wandb_log:
             import wandb
-            wandb.log({
+            log_data = {
                 "iter": self.iter_num,
                 "loss": lossf,
-                "router_loss": router_lossf,
                 "tokens_per_sec": current_tokens_per_sec,
                 "avg_tokens_per_sec": avg_tokens_per_sec,
                 "learning_rate": lr,
                 "step_time_ms": dt * 1000
-            })
+            }
+            
+            # Add auxiliary loss to logging
+            if aux_lossf > 0:
+                log_data[loss_type] = aux_lossf
+                
+            wandb.log(log_data)
     
     def save_training_checkpoint(self, val_loss=None):
         """Sauvegarde un checkpoint d'entraînement"""
