@@ -11,26 +11,25 @@ import traceback
 import random
 
 # Import necessary components from your project
-from models.deepseek.deepseek_adapter import DeepSeekMini, DeepSeekMiniConfig
+from models.deepseek.deepseek_adapter_mtp import DeepSeekMiniMTP, DeepSeekMiniConfigMTP
 from models.llada.model import LLaDAModel, LLaDAConfig
 from models.models.model import GPT, GPTConfig
+from models.models.mla_model import MLAModel, MLAModelConfig, create_mla_model
 from train.train_utils import (
     get_lr, calculate_perplexity, ensure_model_dtype,
     AveragedTimingStats, generate_text, estimate_loss
 )
 from optimization.memory_optim import cleanup_memory, print_memory_stats
-from optimization.cuda_optim import setup_cuda_optimizations, print_gpu_stats, optimize_attention_operations, preallocate_cuda_memory
+from optimization.cuda_optim import setup_cuda_optimizations, print_gpu_stats
 
 # Try importing advanced optimizations, fallback if not available
 try:
     from optimization.cuda_optim import setup_cuda_optimizations, print_gpu_stats, optimize_attention_operations
-    from optimization.memory_optim import cleanup_memory, print_memory_stats, preallocate_cuda_memory
+    from optimization.memory_optim import cleanup_memory, print_memory_stats
     ENHANCED_OPTIMIZATIONS = True
 except ImportError:
     from optimization.cuda_optim import setup_cuda_optimizations, print_gpu_stats
     from optimization.memory_optim import cleanup_memory, print_memory_stats
-    preallocate_cuda_memory = lambda: print("preallocate_cuda_memory not available")
-    optimize_attention_operations = lambda: print("optimize_attention_operations not available")
     ENHANCED_OPTIMIZATIONS = False
 
 
@@ -42,7 +41,7 @@ class LLMLightningModule(pl.LightningModule):
         self.save_hyperparameters(args) # Saves args to self.hparams
         self.args = args # Keep args accessible directly too
         self.model = self._build_model()
-        self.timing_stats = AveragedTimingStats(print_interval=100)
+        self.timing_stats = AveragedTimingStats(print_interval=1000)
         self.train_start_time = time.time()
         self.total_tokens = 0
         self.tokens_window = []
@@ -72,10 +71,13 @@ class LLMLightningModule(pl.LightningModule):
         # Determine config based on model type and size
         if model_type == 'deepseek':
             config = self._create_deepseek_config()
-            model = DeepSeekMini(config)
+            model = DeepSeekMiniMTP(config)
         elif model_type == 'llada':
             config = self._create_llada_config()
             model = LLaDAModel(config)
+        elif model_type == 'mla':
+            config = self._create_mla_config()
+            model = self._create_mla_model(config)
         else: # gpt
             config = self._create_gpt_config()
             model = GPT(config)
@@ -87,7 +89,7 @@ class LLMLightningModule(pl.LightningModule):
     def _create_deepseek_config(self):
         from models.deepseek import DeepSeekMiniConfig
         if self.args.size == 'small':
-            config = DeepSeekMiniConfig(
+            config = DeepSeekMiniConfigMTP(
                 vocab_size=self.args.vocab_size, hidden_size=1024, num_hidden_layers=8,
                 num_attention_heads=8, head_dim=128, intermediate_size=2816,
                 num_experts=4, num_experts_per_token=1,
@@ -97,7 +99,7 @@ class LLMLightningModule(pl.LightningModule):
                 hidden_dropout=self.args.dropout, bias=self.args.bias
             )
         elif self.args.size == 'medium':
-             config = DeepSeekMiniConfig(
+             config = DeepSeekMiniConfigMTP(
                 vocab_size=self.args.vocab_size, hidden_size=2048, num_hidden_layers=24,
                 num_attention_heads=16, head_dim=128, intermediate_size=4096,
                 num_experts=32, num_experts_per_token=4,
@@ -107,7 +109,7 @@ class LLMLightningModule(pl.LightningModule):
                 hidden_dropout=self.args.dropout, bias=self.args.bias
             )
         else:  # large
-            config = DeepSeekMiniConfig(
+            config = DeepSeekMiniConfigMTP(
                 vocab_size=self.args.vocab_size, hidden_size=3072, num_hidden_layers=32,
                 num_attention_heads=24, head_dim=128, intermediate_size=8192,
                 num_experts=64, num_experts_per_token=4,
@@ -139,6 +141,65 @@ class LLMLightningModule(pl.LightningModule):
                 bias=self.args.bias, ratio_kv=8, use_checkpoint=False
             )
         return config
+
+    def _create_mla_config(self):
+        """Create configuration for MLA-Model."""
+        # Define key parameters based on size
+        if self.args.size == 'small':
+            n_layer = 12
+            n_embd = 768
+            n_head = 12
+        elif self.args.size == 'medium':
+            n_layer = 24
+            n_embd = 1024
+            n_head = 16
+        elif self.args.size == 'large':
+            n_layer = 32
+            n_embd = 2048
+            n_head = 16
+        else:  # xl
+            n_layer = 40
+            n_embd = 2560
+            n_head = 20
+        
+        # Create config object
+        config = MLAModelConfig(
+            # Architecture
+            n_layer=n_layer,
+            n_embd=n_embd,
+            n_head=n_head,
+            vocab_size=self.args.vocab_size,
+            block_size=self.args.block_size,
+            
+            # MLA parameters
+            q_lora_rank=0,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            
+            # MoE parameters
+            use_moe=False,  # Set to False for dense model
+            
+            # RoPE parameters
+            rope_theta=10000.0,
+            
+            # Precision
+            fp8_params=getattr(self.args, 'use_fp8', False),
+            fp8_mla_params=getattr(self.args, 'fp8_mla_params', False),
+            
+            # Other parameters
+            dropout=self.args.dropout,
+            bias=self.args.bias,
+            attention_backend=getattr(self.args, 'attention_backend', None),
+            use_gradient_checkpointing=True,
+        )
+        
+        return config
+        
+    def _create_mla_model(self, config):
+        """Create MLA-Model instance with the given configuration."""
+        return MLAModel(config)
 
     def _create_gpt_config(self):
         from models.models.model import GPTConfig
@@ -183,9 +244,34 @@ class LLMLightningModule(pl.LightningModule):
                      return logits, loss, None # Return None for router_loss
                  else:
                      raise
+        elif model_type == 'mla':
+            # MLA-Model returns logits, loss directly (no router loss in dense version)
+            logits, loss = self.model(input_ids, targets)
+            # No router loss in dense model
+            return logits, loss, None
         else: # deepseek or gpt
-            # These models typically return logits, loss
-            logits, loss = self.model(input_ids, targets=targets)
+            model_output = self.model(input_ids, targets=targets)
+
+            if isinstance(model_output, tuple):
+                if len(model_output) >= 2:
+                    logits = model_output[0]
+                    loss = model_output[1]
+                    # Additional elements in model_output are ignored for this path.
+                elif len(model_output) == 1:
+                    logits = model_output[0]
+                    loss = None # Loss will be calculated in training/validation step
+                else: # Empty tuple
+                    raise ValueError(
+                        f"Model returned an empty tuple. Expected at least logits. Got: {model_output}"
+                    )
+            elif torch.is_tensor(model_output):
+                # Model returned a single tensor, assume it's logits
+                logits = model_output
+                loss = None # Loss will be calculated in training/validation step
+            else:
+                raise ValueError(
+                    f"Unexpected output type from model. Expected tensor or tuple, got: {type(model_output)}"
+                )
             return logits, loss, None # Return None for router_loss consistency
 
     def training_step(self, batch, batch_idx):
@@ -195,55 +281,110 @@ class LLMLightningModule(pl.LightningModule):
         # Forward pass
         try:
             with self.timing_stats.track("forward"):
-                logits, loss, router_loss = self(input_ids, targets=targets)
+                # Completely detach and clone input tensors to prevent double backward issues
+                with torch.no_grad():
+                    input_ids = input_ids.detach().clone().requires_grad_(False)
+                    targets = targets.detach().clone().requires_grad_(False)
+                
+                # Add special handling for MLA model
+                if self.args.model_type.lower() == 'mla':
+                    # Use a context manager from torch.autograd to prevent double backward
+                    with torch.autograd.set_detect_anomaly(True):
+                        logits, loss, router_loss = self(input_ids, targets=targets)
+                else:
+                    logits, loss, router_loss = self(input_ids, targets=targets)
 
             if loss is None: # Handle cases where loss is calculated outside model.forward
-                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                # --- BEGIN SHAPE DIAGNOSTICS ---
+                if batch_idx < 2 and self.global_rank == 0: # Log for first few batches on rank 0
+                    print(f"TRAIN_STEP [{self.global_step}/{batch_idx}]: loss is None, calculating F.cross_entropy")
+                    print(f"TRAIN_STEP [{self.global_step}/{batch_idx}]: logits original shape: {logits.shape if logits is not None else 'None'}")
+                    print(f"TRAIN_STEP [{self.global_step}/{batch_idx}]: targets original shape: {targets.shape if targets is not None else 'None'}")
+                    if logits is not None and targets is not None:
+                        print(f"TRAIN_STEP [{self.global_step}/{batch_idx}]: logits.view(-1, logits.size(-1)) shape: {logits.view(-1, logits.size(-1)).shape}")
+                        print(f"TRAIN_STEP [{self.global_step}/{batch_idx}]: targets.view(-1) shape: {targets.view(-1).shape}")
+                # --- END SHAPE DIAGNOSTICS ---
+                
+                # Create fresh detached copies to avoid double backward
+                logits_detached = logits.detach().clone().requires_grad_(True)
+                loss = F.cross_entropy(logits_detached.view(-1, logits_detached.size(-1)), targets.view(-1), ignore_index=-1)
 
-            # Handle router loss for MoE models (like LLaDA)
+            # Handle router loss for MoE models
             if router_loss is not None and torch.is_tensor(router_loss):
-                 # Check for NaN/inf in router_loss and handle
-                 if torch.isnan(router_loss).any() or torch.isinf(router_loss).any():
-                     print(f"WARNING: NaN/Inf detected in router_loss at step {self.global_step}. Clamping.")
-                     router_loss = torch.where(torch.isnan(router_loss) | torch.isinf(router_loss),
-                                               torch.tensor(0.1, device=router_loss.device, dtype=router_loss.dtype),
-                                               router_loss)
-                     router_loss = torch.clamp(router_loss, max=10.0) # Clamp large values
+                # Router loss should already be detached, but ensure it with torch.no_grad
+                with torch.no_grad():
+                    router_loss = router_loss.clone()
+                
+                # Check for NaN/inf in router_loss and handle
+                if torch.isnan(router_loss).any() or torch.isinf(router_loss).any():
+                    print(f"WARNING: NaN/Inf detected in router_loss at step {self.global_step}. Setting to zero.")
+                    router_loss = torch.zeros_like(router_loss)
 
-                 router_loss_coef = getattr(self.args, 'router_z_loss_coef', 0.001)
-                 combined_loss = loss + router_loss_coef * router_loss
-                 self.log('train/router_loss', router_loss.item(), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+                # For MLA models, router loss is already incorporated internally
+                model_type = getattr(self.args, 'model_type', 'gpt')
+                
+                if model_type == 'mla':
+                    # Don't add router loss to prevent double counting
+                    combined_loss = loss
+                    # Still log the router loss for monitoring
+                    if router_loss is not None:
+                        self.log('train/router_loss', float(router_loss.item()), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+                else:
+                    # For other models, add the router loss with coefficient
+                    router_loss_coef = getattr(self.args, 'router_z_loss_coef', 0.001)
+                    combined_loss = loss + router_loss_coef * router_loss
+                    self.log('train/router_loss', float(router_loss.item()), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
             else:
-                 combined_loss = loss
-                 router_loss = torch.tensor(0.0) # For logging consistency
+                combined_loss = loss
+                # Create a tensor with no gradient history
+                with torch.no_grad():
+                    router_loss = torch.tensor(0.0, device=self.device, requires_grad=False) # For logging consistency
 
             # Check for NaN/inf in combined_loss before logging/returning
             if torch.isnan(combined_loss).any() or torch.isinf(combined_loss).any():
-                print(f"ERROR: NaN/Inf detected in combined_loss at step {self.global_step}. Skipping step.")
-                # Potentially log an error metric or return None to skip optimizer step if PL supports it easily
-                # For now, log and let PL handle the gradient explosion if it occurs
+                print(f"ERROR: NaN/Inf detected in combined_loss at step {self.global_step}. Using zero loss.")
                 self.log('train/nan_loss_skipped', 1.0, on_step=True, on_epoch=False, sync_dist=True)
-                # Returning None might skip the optimizer step in some PL versions/setups
-                # return None
-                # Safer: return a zero loss tensor to avoid breaking things, but log the issue
-                combined_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+                # Create a new tensor with requires_grad=True to allow optimizer to run
+                with torch.no_grad():
+                    combined_loss = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+                    combined_loss = combined_loss.requires_grad_(True)
 
 
         except Exception as e:
             print(f"Error during training step {self.global_step}: {e}")
             print(traceback.format_exc())
+            
+            # Try to clean up memory to recover
             cleanup_memory()
+            
             # Return a dummy loss to prevent crashing, log the error
             self.log('train/step_error', 1.0, on_step=True, on_epoch=False, sync_dist=True)
-            combined_loss = torch.tensor(0.0, device=self.device, requires_grad=True) # Dummy loss
-            loss = torch.tensor(0.0)
-            router_loss = torch.tensor(0.0)
+            
+            # Create loss tensors with no gradient history
+            combined_loss = torch.tensor(0.0, device=self.device, dtype=torch.float32, requires_grad=True)
+            with torch.no_grad():
+                loss = torch.tensor(0.0, device=self.device, requires_grad=False)
+                router_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
 
 
         # --- Logging ---
         dt = time.time() - t0
-        self.log('train/loss', loss.item(), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
-        self.log('train/combined_loss', combined_loss.item(), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        # Use float() to ensure no gradient tracking during logging
+        self.log('train/loss', float(loss.item()), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
+        
+        # Calculate gradient norms for monitoring
+        if self.global_step % 100 == 0:  # Log grad norms less frequently
+            with torch.no_grad():
+                total_norm = 0.0
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** 0.5
+                self.log('train/grad_norm', total_norm, on_step=True, on_epoch=False, sync_dist=True)
+        # Use float() for all tensor logging
+        with torch.no_grad():
+            self.log('train/combined_loss', float(combined_loss.item()), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
         self.log('train/step_time_ms', dt * 1000, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
         self.log('learning_rate', self.trainer.optimizers[0].param_groups[0]['lr'], on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 
@@ -264,9 +405,9 @@ class LLMLightningModule(pl.LightningModule):
         total_time_elapsed = time.time() - self.train_start_time
         avg_tokens_per_sec = self.total_tokens / total_time_elapsed if total_time_elapsed > 0 else 0
 
-        self.log('perf/tokens_per_sec_step', current_tokens_per_sec, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False) # Log local Tps
-        self.log('perf/tokens_per_sec_avg', avg_tokens_per_sec, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-        self.log('perf/total_tokens', float(self.total_tokens), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True) # Log as float for logger compatibility
+        self.log('tokens_per_sec_step', current_tokens_per_sec, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False) # Log local Tps
+        self.log('tokens_per_sec_avg', avg_tokens_per_sec, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        self.log('total_tokens', float(self.total_tokens), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True) # Log as float for logger compatibility
 
         # MFU calculation (optional, requires estimate_mfu method on model)
         if hasattr(self.model, 'estimate_mfu') and self.trainer.global_step >= 5:
@@ -289,8 +430,9 @@ class LLMLightningModule(pl.LightningModule):
         # Periodic memory cleanup and stats
         if self.global_step % 100 == 0:
             cleanup_memory()
-            if self.global_rank == 0:
-                 print_memory_stats(f"Step {self.global_step}")
+            
+        if self.global_rank == 0 and self.global_step % 1000 == 0:
+            print_memory_stats(f"Step {self.global_step}")
 
 
         return combined_loss
@@ -302,7 +444,16 @@ class LLMLightningModule(pl.LightningModule):
         logits, loss, router_loss = self(input_ids, targets=targets)
 
         if loss is None: # Handle cases where loss is calculated outside model.forward
-             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # --- BEGIN SHAPE DIAGNOSTICS ---
+            if batch_idx < 2 and self.global_rank == 0: # Log for first few batches on rank 0
+                print(f"VAL_STEP [{self.current_epoch}/{batch_idx}]: loss is None, calculating F.cross_entropy")
+                print(f"VAL_STEP [{self.current_epoch}/{batch_idx}]: logits original shape: {logits.shape if logits is not None else 'None'}")
+                print(f"VAL_STEP [{self.current_epoch}/{batch_idx}]: targets original shape: {targets.shape if targets is not None else 'None'}")
+                if logits is not None and targets is not None:
+                    print(f"VAL_STEP [{self.current_epoch}/{batch_idx}]: logits.view(-1, logits.size(-1)) shape: {logits.view(-1, logits.size(-1)).shape}")
+                    print(f"VAL_STEP [{self.current_epoch}/{batch_idx}]: targets.view(-1) shape: {targets.view(-1).shape}")
+            # --- END SHAPE DIAGNOSTICS ---
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
         # Log validation loss
         self.log('val/loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
@@ -318,14 +469,22 @@ class LLMLightningModule(pl.LightningModule):
 
     def configure_optimizers(self):
         """Sets up the optimizer and learning rate scheduler."""
-        # Use model's configure_optimizers method if available, otherwise default AdamW
-        if hasattr(self.model, 'configure_optimizers'):
+        # Force AdamW for MLA models to avoid double backward issue with Lion
+        if self.args.model_type == 'mla':
+            print(f"Using AdamW optimizer for MLA model (avoids double backward)")
+            optimizer = AdamW(
+                self.model.parameters(),
+                lr=self.args.learning_rate,
+                weight_decay=self.args.weight_decay,
+                betas=(self.args.beta1, self.args.beta2)
+            )
+        elif hasattr(self.model, 'configure_optimizers') and self.args.optimizer_type is not None:
              optimizer = self.model.configure_optimizers(
                  weight_decay=self.args.weight_decay,
                  learning_rate=self.args.learning_rate, # Initial LR, scheduler will adjust
                  betas=(self.args.beta1, self.args.beta2),
                  device_type=self.device.type,
-                 optimizer_type=getattr(self.args, 'optimizer_type', None) # Pass optimizer type if specified
+                 optimizer_type=getattr(self.args, 'optimizer_type', "AdamW") # Pass optimizer type if specified
              )
              print(f"Using optimizer configured by model: {type(optimizer)}")
         else:
@@ -362,12 +521,11 @@ class LLMLightningModule(pl.LightningModule):
         iter_num = self.global_step + 1 # global_step starts at 0
 
         return get_lr(
-            iter_num=iter_num,
+            current_iter=iter_num,
             warmup_iters=self.args.warmup_iters,
             lr_decay_iters=self.args.lr_decay_iters,
             learning_rate=self.args.learning_rate, # Base LR
             min_lr=self.args.min_lr,
-            decay_lr=self.args.decay_lr # Pass decay_lr flag
         ) / self.args.learning_rate # Lambda returns a multiplicative factor
 
 

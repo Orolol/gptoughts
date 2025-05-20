@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp import custom_fwd, custom_bwd
 import torch.utils.checkpoint as checkpoint
-from model import CausalSelfAttention
+from models.blocks.attention import CausalSelfAttention
 from typing import Optional
 import inspect
 import gc

@@ -86,7 +86,12 @@ class Trainer:
             self.master_process = True
             self.seed_offset = 0
             self.ddp_world_size = 1
-            self.device = self.args.device if hasattr(self.args, 'device') else 'cuda:0' if torch.cuda.is_available() else 'cpu'
+            # Allow explicit device override (useful for testing on CPU)
+            if hasattr(self.args, 'device') and self.args.device:
+                self.device = self.args.device
+                print(f"Using explicitly specified device: {self.device}")
+            else:
+                self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         
         # Create output directory
         if self.master_process:
@@ -220,6 +225,11 @@ class Trainer:
             config = self.create_llada_config()
             self.model = LLaDAModel(config)
             
+        elif model_type == 'mla':
+            from models.models.mla_model import MLAModel, MLAModelConfig, create_mla_model
+            # Create config based on model size
+            config = self.create_mla_config()
+            self.model = MLAModel(config)
         else:
             from models.models.model import GPT, GPTConfig
             # Create config based on model size
@@ -477,6 +487,63 @@ class Trainer:
         
         return config
     
+    def create_mla_config(self):
+        """Crée une configuration pour le modèle MLA"""
+        from models.models.mla_model import MLAModelConfig
+        
+        # Define key parameters based on size
+        if self.args.size == 'small':
+            n_layer = 12
+            n_embd = 768
+            n_head = 12
+        elif self.args.size == 'medium':
+            n_layer = 24
+            n_embd = 1024
+            n_head = 16
+        elif self.args.size == 'large':
+            n_layer = 32
+            n_embd = 2048
+            n_head = 16
+        else:  # xl
+            n_layer = 40
+            n_embd = 2560
+            n_head = 20
+        
+        # Create config object
+        config = MLAModelConfig(
+            # Architecture
+            n_layer=n_layer,
+            n_embd=n_embd,
+            n_head=n_head,
+            vocab_size=self.args.vocab_size,
+            block_size=self.args.block_size,
+            
+            # MLA parameters
+            q_lora_rank=0,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            
+            # MoE parameters
+            use_moe=False,  # Set to False for dense model
+            
+            # RoPE parameters
+            rope_theta=10000.0,
+            
+            # Precision
+            fp8_params=getattr(self.args, 'use_fp8', False),
+            fp8_mla_params=getattr(self.args, 'fp8_mla_params', False),
+            
+            # Other parameters
+            dropout=self.args.dropout,
+            bias=self.args.bias,
+            attention_backend=getattr(self.args, 'attention_backend', None),
+            use_gradient_checkpointing=True,
+        )
+        
+        return config
+
     def create_gpt_config(self):
         """Crée une configuration pour le modèle GPT standard"""
         from models.models.model import GPTConfig
@@ -572,6 +639,18 @@ class Trainer:
                 
             self.model = LLaDAModel(saved_config)
             self.config = saved_config
+        
+        elif model_type == 'mla':
+            from models.models.mla_model import MLAModel, MLAModelConfig
+            # Create new model with saved config
+            if 'model_args' in checkpoint and isinstance(checkpoint['model_args'], dict):
+                saved_config = MLAModelConfig(**checkpoint['model_args'])
+            else:
+                # Create default config
+                saved_config = self.create_mla_config()
+                
+            self.model = MLAModel(saved_config)
+            self.config = saved_config
             
         else:
             from models.models.model import GPT, GPTConfig
@@ -619,22 +698,24 @@ class Trainer:
     
     def setup_datasets(self):
         """Configure les datasets d'entraînement et de validation"""
-        # Import the get_datasets function from run_train
-        from run_train import get_datasets
+        # Import the get_datasets function from data module
+        from data.datasets import get_datasets
         
         # Get datasets
-        if hasattr(self.args, 'tokenizer'):
+        if hasattr(self.args, 'tokenizer') and self.args.tokenizer is not None:
+            print(f"Tokenizer found: {self.args.tokenizer}")
             self.train_dataset, self.val_dataset = get_datasets(
                 self.args.block_size, 
-                self.args.batch_size, 
-                self.device, 
-                tokenizer=self.args.tokenizer
+                self.args.batch_size,
+                tokenizer=self.args.tokenizer,
+                num_workers=getattr(self.args, 'num_workers', 4)
             )
         else:
             self.train_dataset, self.val_dataset = get_datasets(
                 self.args.block_size, 
-                self.args.batch_size, 
-                self.device
+                self.args.batch_size,
+                tokenizer=None,
+                num_workers=getattr(self.args, 'num_workers', 4)
             )
         
         # Create iterator
@@ -809,10 +890,47 @@ class Trainer:
                                 torch.cuda.synchronize()
                             
                             # Handle different model types with unified approach
-                            try:
+                            if model_type == 'deepseek':
                                 # First try the DeepSeek MTP model return format
                                 outputs = self.model(input_ids, targets=targets)
                                 
+                            elif model_type == 'mla':
+                                # MLA model
+                                try:
+                                    # MLA model returns logits, loss directly
+                                    logits, loss = self.model(input_ids, targets=targets)
+                                    
+                                    # Extract router loss from model if available, but ensure it doesn't have gradients
+                                    router_loss = None
+                                    if hasattr(self.model, 'last_router_loss') and self.model.last_router_loss is not None:
+                                        # last_router_loss should already be a detached tensor with requires_grad=False
+                                        router_loss = self.model.last_router_loss
+                                        # Create a completely new tensor to ensure no gradient connections
+                                        if router_loss is not None:
+                                            with torch.no_grad():
+                                                router_loss = router_loss.clone()
+                                        # Clear the model's router loss after extracting it
+                                        self.model.last_router_loss = None
+                                    
+                                    # Implement additional checks for router_loss
+                                    if router_loss is not None:
+                                        # Check if router_loss contains NaN values
+                                        if torch.isnan(router_loss).any():
+                                            print(f"WARNING: NaN detected in router_loss at iteration {self.iter_num}")
+                                            # Replace NaN values with a small constant to prevent propagation
+                                            router_loss = torch.where(torch.isnan(router_loss), torch.tensor(0.1, device=router_loss.device), router_loss)
+                                        
+                                        # Cap extremely large router loss values to prevent explosion
+                                        router_loss = torch.clamp(router_loss, max=10.0)
+                                        balance_loss = router_loss
+                                    else:
+                                        balance_loss = 0
+                                except Exception as e:
+                                    print(f"Error during MLA forward pass: {e}")
+                                    # Fallback to a simpler pass
+                                    logits, loss = self.model(input_ids, targets)
+                                    balance_loss = 0
+                                    print("Used simplified forward path for MLA model")
                             elif model_type == 'llada':
                                 # LLaDA model
                                 # Add gradient and loss stabilization for LLaDA models
@@ -904,7 +1022,9 @@ class Trainer:
                                     scaled_loss.backward(retain_graph=False)  # Changed to False to reduce memory usage
                                 else:
                                     # Direct backward for bfloat16 which has sufficient dynamic range
-                                    combined_loss.backward(retain_graph=False)  # Changed to False
+                                    # Now we can use retain_graph=False for all models including MLA
+                                    # since we've fixed the router loss handling
+                                    combined_loss.backward(retain_graph=False)
                                     
                                 # Track losses
                                 total_loss += loss.item()

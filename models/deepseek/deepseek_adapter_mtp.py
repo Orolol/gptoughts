@@ -216,52 +216,57 @@ class DeepSeekMiniMTP(nn.Module):
                 # En mode entraînement avec targets
                 if isinstance(outputs, tuple) and len(outputs) == 2:
                     logits, loss_info = outputs
-                    
-                    # Vérifier si loss_info est un tuple contenant aussi mtp_loss
-                    if isinstance(loss_info, tuple) and len(loss_info) == 2:
-                        loss, mtp_loss = loss_info
-                        
-                        # Format de retour attendu par train.py
-                        if return_dict:
-                            return {
-                                "last_hidden_state": logits,
-                                "loss": loss,
-                                "balance_loss": mtp_loss  # Utiliser balance_loss pour mtp_loss
-                            }
+                    primary_loss = None
+                    aux_loss = None # For mtp_loss or other auxiliary losses
+
+                    if isinstance(loss_info, tuple) and len(loss_info) == 2: # (loss, mtp_loss)
+                        primary_loss = loss_info[0]
+                        if self.config.use_mtp:
+                            mtp_loss = loss_info[1]
+                            # Combine mtp_loss into primary_loss for non-dict return
+                            primary_loss = primary_loss + self.config.mtp_loss_factor * mtp_loss
+                            aux_loss = mtp_loss # Keep for dict return if needed
                         else:
-                            return logits, loss, mtp_loss
+                            aux_loss = torch.tensor(0.0, device=primary_loss.device)
+
+                    elif torch.is_tensor(loss_info): # Only primary loss
+                        primary_loss = loss_info
+                        aux_loss = torch.tensor(0.0, device=primary_loss.device)
                     else:
-                        # Cas standard sans MTP ou si MTP est désactivé
-                        loss = loss_info
-                        
-                        if return_dict:
-                            return {
-                                "last_hidden_state": logits,
-                                "loss": loss,
-                                "balance_loss": torch.tensor(0.0, device=loss.device)
-                            }
-                        else:
-                            return logits, loss
-                else:
-                    # Cas inattendu - fallback
+                        # Should not happen if model.forward behaves
+                        raise ValueError(f"Unexpected loss_info format: {loss_info}")
+
                     if return_dict:
                         return {
-                            "last_hidden_state": outputs,
-                            "loss": torch.tensor(0.0, device=outputs.device),
-                            "balance_loss": torch.tensor(0.0, device=outputs.device)
+                            "last_hidden_state": logits,
+                            "loss": primary_loss, # This is the combined loss if MTP was active
+                            "balance_loss": aux_loss if aux_loss is not None else torch.tensor(0.0, device=logits.device) # or original mtp_loss
                         }
                     else:
-                        return outputs, torch.tensor(0.0, device=outputs.device)
+                        # Return combined loss
+                        return logits, primary_loss
+                else: # Model likely returned only logits
+                    logits_output = outputs[0] if isinstance(outputs, tuple) else outputs
+                    if return_dict:
+                        return {
+                            "last_hidden_state": logits_output,
+                            "loss": None, # Loss to be computed by LightningModule
+                            "balance_loss": None
+                        }
+                    else:
+                        # Return only logits, loss will be computed by LightningModule
+                        return logits_output # This will be caught by LLM.forward, and loss computed there.
             else:
-                # Mode inférence, seulement les logits
+                # Mode inférence, seulement les logits (ou model's raw output)
+                logits_output = outputs[0] if isinstance(outputs, tuple) else outputs
                 if return_dict:
                     return {
-                        "last_hidden_state": outputs,
+                        "last_hidden_state": logits_output,
                         "loss": None,
                         "balance_loss": None
                     }
                 else:
-                    return outputs
+                    return logits_output
                 
         except RuntimeError as e:
             # En cas d'erreur, afficher un message et retourner une perte élevée

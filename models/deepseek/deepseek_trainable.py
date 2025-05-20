@@ -30,6 +30,21 @@ class TrainableTransformer(Transformer):
         self.training_mode = False
         self.gradient_checkpointing = False
         
+        # Apply more stable initialization to head for better numerical stability
+        # The head layer is critical for avoiding NaN issues in loss calculation
+        if hasattr(self, 'head') and isinstance(self.head, nn.Module):
+            # Use Kaiming initialization with a small std to prevent extreme initial values
+            if hasattr(self.head, 'weight') and self.head.weight is not None:
+                nn.init.kaiming_normal_(self.head.weight, nonlinearity='linear', a=math.sqrt(5))
+                # Scale down the initialization to avoid extreme initial logits
+                with torch.no_grad():
+                    self.head.weight.data.mul_(0.1)
+            
+            # Initialize bias to small values if present
+            if hasattr(self.head, 'bias') and self.head.bias is not None:
+                # Bias at zero reduces initial logit variance
+                nn.init.zeros_(self.head.bias)
+        
     def set_training_mode(self, mode: bool = True):
         """Enables or disables training mode."""
         self.training_mode = mode
@@ -43,47 +58,32 @@ class TrainableTransformer(Transformer):
     def forward(self, tokens: torch.Tensor, start_pos: int = 0, targets: Optional[torch.Tensor] = None):
         """
         Forward pass with support for both inference and training.
-        
-        Args:
-            tokens (torch.Tensor): Input token IDs with shape (batch_size, seq_len)
-            start_pos (int): Starting position in the sequence for rotary embeddings
-            targets (Optional[torch.Tensor]): Target token IDs for computing loss
-            
-        Returns:
-            torch.Tensor or Tuple: Model logits or (logits, loss) tuple in training mode
+        This method will now consistently return full sequence logits if targets are not provided,
+        or (full sequence logits, loss) if targets are provided.
+        The nn.Module's self.training state controls layer behavior (e.g., dropout).
         """
         seqlen = tokens.size(1)
         
-        # In training mode we don't use @torch.inference_mode() decorator
-        if not self.training_mode:
-            return self._inference_forward(tokens, start_pos)
-        
-        # Training forward pass (with grad enabled)
+        # Main computation path for hidden states
         h = self.embed(tokens)
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
         
-        # Apply attention mask for causal attention
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
         
         # Process through transformer blocks
+        # self.training (from nn.Module) controls behavior of layers like dropout
         for i, layer in enumerate(self.layers):
-            if self.gradient_checkpointing and self.training:
-                # Use gradient checkpointing to save memory
+            if self.gradient_checkpointing and self.training: # Use nn.Module's self.training state
                 h = self._checkpointed_layer_forward(layer, h, start_pos, freqs_cis, mask)
             else:
                 h = layer(h, start_pos, freqs_cis, mask)
         
-        # Apply final normalization
-        h = self.norm(h)
+        h_normalized = self.norm(h) # h_normalized has shape (B, S, H)
         
-        # For training, we need the last hidden states of all positions
-        # For inference, we only need the last position
-        if self.training:
-            logits = self._project_hidden_states(h)
-        else:
-            logits = self._project_hidden_states(h[:, -1:])
+        # Always project all hidden states to get full sequence logits
+        logits = self._project_hidden_states(h_normalized) # logits has shape (B, S, V)
         
         # Compute loss if targets are provided
         loss = None
@@ -92,7 +92,6 @@ class TrainableTransformer(Transformer):
             shift_logits = logits[:, :-1, :]
             shift_targets = targets[:, 1:]
             
-            # Compute cross-entropy loss
             loss = F.cross_entropy(
                 shift_logits.reshape(-1, shift_logits.size(-1)),
                 shift_targets.reshape(-1),
@@ -101,16 +100,18 @@ class TrainableTransformer(Transformer):
             
             # Handle NaN loss - set to high value without breaking backward pass
             if torch.isnan(loss).any():
-                print("Warning: NaN loss detected")
+                print("Warning: NaN loss detected in TrainableTransformer internal calculation")
                 loss = torch.where(torch.isnan(loss), torch.full_like(loss, 100.0), loss)
                 
             # Cap loss to avoid gradient explosions
             loss = torch.clamp(loss, max=100.0)
         
-        # Return appropriate values based on mode
+        # Return appropriate values
         if targets is not None:
             return logits, loss
         else:
+            # No targets provided to this specific forward call, return full sequence logits.
+            # The caller (e.g., LLMLightningModule) will handle further processing or loss calculation.
             return logits
     
     def _inference_forward(self, tokens: torch.Tensor, start_pos: int = 0):
