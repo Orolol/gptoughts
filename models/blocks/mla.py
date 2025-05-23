@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
+from .positional_encoding import RoPE
+
 
 try:
     from flash_attn import flash_attn_func_2
@@ -127,28 +129,66 @@ class MLA(nn.Module):
         print(f"Using attention backend for MLA: {self.attention_backend}")
         
         # Set up caching for inference
-        max_batch_size = getattr(config, 'max_batch_size', 8)
-        max_seq_len = getattr(config, 'max_seq_len', 4096)
-        attn_impl = getattr(config, 'attn_impl', "absorb")
+        self.max_batch_size = getattr(config, 'max_batch_size', 8)
+        self.max_seq_len = getattr(config, 'max_seq_len', 4096)
+        self.attn_impl = getattr(config, 'attn_impl', "absorb")
         
-        if attn_impl == "naive":
-            self.register_buffer("k_cache", torch.zeros(
-                max_batch_size, max_seq_len, self.n_local_heads, self.qk_head_dim
-            ), persistent=False)
-            self.register_buffer("v_cache", torch.zeros(
-                max_batch_size, max_seq_len, self.n_local_heads, self.v_head_dim
-            ), persistent=False)
+                # Initialize RoPE before anything else
+        self.rope = RoPE(self.qk_rope_head_dim, self.max_seq_len)
+        
+        # Only create caches for inference, not for training
+        # This prevents memory leaks during training
+        self.inference_mode = False
+        
+    def set_inference_mode(self, mode=True):
+        """
+        Set the module to inference mode (with caching) or training mode (no caching).
+        
+        Args:
+            mode (bool): True for inference mode, False for training mode
+        """
+        if mode == self.inference_mode:
+            return  # No change needed
+            
+        self.inference_mode = mode
+        
+        # Create caches for inference mode if they don't exist
+        if mode:
+            if self.attn_impl == "naive":
+                if not hasattr(self, "k_cache") or self.k_cache is None:
+                    self.register_buffer("k_cache", torch.zeros(
+                        self.max_batch_size, self.max_seq_len, self.n_local_heads, self.qk_head_dim
+                    ), persistent=False)
+                if not hasattr(self, "v_cache") or self.v_cache is None:
+                    self.register_buffer("v_cache", torch.zeros(
+                        self.max_batch_size, self.max_seq_len, self.n_local_heads, self.v_head_dim
+                    ), persistent=False)
+            else:
+                if not hasattr(self, "kv_cache") or self.kv_cache is None:
+                    self.register_buffer("kv_cache", torch.zeros(
+                        self.max_batch_size, self.max_seq_len, self.kv_lora_rank
+                    ), persistent=False)
+                if not hasattr(self, "pe_cache") or self.pe_cache is None:
+                    self.register_buffer("pe_cache", torch.zeros(
+                        self.max_batch_size, self.max_seq_len, self.qk_rope_head_dim
+                    ), persistent=False)
         else:
-            self.register_buffer("kv_cache", torch.zeros(
-                max_batch_size, max_seq_len, self.kv_lora_rank
-            ), persistent=False)
-            self.register_buffer("pe_cache", torch.zeros(
-                max_batch_size, max_seq_len, self.qk_rope_head_dim
-            ), persistent=False)
+            # Remove caches in training mode to free memory
+            if hasattr(self, "k_cache"):
+                delattr(self, "k_cache")
+            if hasattr(self, "v_cache"):
+                delattr(self, "v_cache")
+            if hasattr(self, "kv_cache"):
+                delattr(self, "kv_cache")
+            if hasattr(self, "pe_cache"):
+                delattr(self, "pe_cache")
         
-        # From positional_encoding module
-        from .positional_encoding import RoPE
-        self.rope = RoPE(self.qk_rope_head_dim, max_seq_len)
+
+
+        # No need to create caches here now that we have set_inference_mode
+        # If this is an inference context, initialize the caches
+        if not self.training:
+            self.set_inference_mode(True)
     
     def _memory_efficient_attention(self, q, k, v, mask=None, is_causal=True):
         """
@@ -353,6 +393,9 @@ class MLA(nn.Module):
         # Select attention implementation approach
         attn_impl = getattr(self, 'attn_impl', "absorb")
         
+        # Check if we're in training or inference mode
+        is_inference = self.inference_mode
+        
         if attn_impl == "naive":
             # Standard approach: compute full attention matrices
             q = torch.cat([q_nope, q_pe], dim=-1)
@@ -361,12 +404,21 @@ class MLA(nn.Module):
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_heads, -1)], dim=-1)
             
-            # Update caches
-            self.k_cache[:bsz, start_pos:end_pos] = k
-            self.v_cache[:bsz, start_pos:end_pos] = v
+            if is_inference and hasattr(self, 'k_cache') and hasattr(self, 'v_cache'):
+                # Only update caches in inference mode
+                self.k_cache[:bsz, start_pos:end_pos] = k
+                self.v_cache[:bsz, start_pos:end_pos] = v
+                # Use the cached values for attention
+                k_to_use = self.k_cache[:bsz, :end_pos]
+                v_to_use = self.v_cache[:bsz, :end_pos]
+            else:
+                # In training mode, just use the current batch values (no caching)
+                # This dramatically reduces memory usage
+                k_to_use = k
+                v_to_use = v
             
             # Compute attention scores
-            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
+            scores = torch.einsum("bshd,bthd->bsht", q, k_to_use) * self.softmax_scale
         else:
             # Optimized approach: use low-rank decomposition
             # Extract weight for wkv_b
@@ -376,13 +428,26 @@ class MLA(nn.Module):
             # Project q_nope to the low-rank space
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
             
-            # Update caches
-            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
-            self.pe_cache[:bsz, start_pos:end_pos] = k_pe
+            # Prepare normalized kv and pe tensors
+            kv_norm_tensor = self.kv_norm(kv)
+            
+            if is_inference and hasattr(self, 'kv_cache') and hasattr(self, 'pe_cache'):
+                # Only update caches in inference mode
+                self.kv_cache[:bsz, start_pos:end_pos] = kv_norm_tensor  
+                self.pe_cache[:bsz, start_pos:end_pos] = k_pe
+                
+                # Use the cached values for attention
+                kv_to_use = self.kv_cache[:bsz, :end_pos]
+                pe_to_use = self.pe_cache[:bsz, :end_pos]
+            else:
+                # In training mode, just use the current batch values (no caching)
+                # This dramatically reduces memory usage
+                kv_to_use = kv_norm_tensor
+                pe_to_use = k_pe
             
             # Compute attention scores through efficient decomposition
-            scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
-                    torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
+            scores = (torch.einsum("bshc,btc->bsht", q_nope, kv_to_use) +
+                    torch.einsum("bshr,btr->bsht", q_pe, pe_to_use)) * self.softmax_scale
         
         # Apply mask if provided
         if mask is not None:
@@ -394,10 +459,16 @@ class MLA(nn.Module):
         
         # Compute weighted sum with values
         if attn_impl == "naive":
-            x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
+            if is_inference and hasattr(self, 'v_cache'):
+                x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
+            else:
+                x = torch.einsum("bsht,bthd->bshd", scores, v_to_use)
         else:
             # Project through the low-rank space for values
-            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
+            if is_inference and hasattr(self, 'kv_cache'):
+                x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
+            else:
+                x = torch.einsum("bsht,btc->bshc", scores, kv_to_use)
             x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
         
         # Reshape and project to output dimension

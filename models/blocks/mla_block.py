@@ -65,69 +65,37 @@ class MLABlock(nn.Module):
         Returns:
             torch.Tensor: Processed tensor with same shape as input
         """
-        # Create a completely isolated copy of inputs to avoid double backward issues
-        with torch.no_grad():
-            x_local = x.detach().clone().requires_grad_(x.requires_grad)
-            
-            # Also isolate other tensor inputs
-            if freqs_cis is not None:
-                freqs_cis = freqs_cis.detach().clone()
-            if mask is not None:
-                mask = mask.detach().clone()
-        
         # Disable gradient checkpointing when using compiled model
         if hasattr(self, '_compiled_forward'):
             self.use_checkpoint = False
+            
+        # Standard residual transformer block implementation
+        if self.use_checkpoint and self.training:
+            # Gradient checkpointing for memory efficiency
+            attn_out = checkpoint.checkpoint(
+                self._attn_block, 
+                x, 
+                start_pos,
+                freqs_cis,
+                mask,
+                use_reentrant=False
+            )
+            # First residual connection
+            x = x + attn_out
+            
+            # FFN with checkpoint
+            ffn_output = checkpoint.checkpoint(
+                self._ffn_block, 
+                x,
+                use_reentrant=False
+            )
+            # Second residual connection
+            x = x + ffn_output
+        else:
+            # Standard forward pass without checkpoint
+            # First residual connection
+            x = x + self._attn_block(x, start_pos, freqs_cis, mask)
+            # Second residual connection
+            x = x + self._ffn_block(x)
         
-        # Use the prevent_backward_reuse context manager for the forward pass
-        with prevent_backward_reuse():
-            if self.use_checkpoint and self.training:
-                # Gradient checkpointing for memory efficiency
-                def create_custom_forward(func):
-                    def custom_forward(*inputs):
-                        # Filter out None inputs
-                        valid_inputs = [inp for inp in inputs if inp is not None]
-                        return func(*valid_inputs)
-                    return custom_forward
-
-                # Attention with checkpoint
-                attn_func = create_custom_forward(self._attn_block)
-                attn_out = checkpoint.checkpoint(
-                    attn_func, 
-                    x_local, 
-                    start_pos,
-                    freqs_cis,
-                    mask,
-                    use_reentrant=False,
-                    preserve_rng_state=True
-                )
-                # Create a fresh intermediate tensor
-                x_mid = x_local.detach().clone().requires_grad_(True) + attn_out
-
-                # FFN with checkpoint
-                ffn_func = create_custom_forward(self._ffn_block)
-                ffn_output = checkpoint.checkpoint(
-                    ffn_func, 
-                    x_mid,
-                    use_reentrant=False,
-                    preserve_rng_state=True
-                )
-                output = x_mid + ffn_output
-            else:
-                # Standard forward pass without checkpoint
-                attn_out = self._attn_block(x_local, start_pos, freqs_cis, mask)
-                # Create a fresh intermediate tensor
-                x_mid = x_local + attn_out
-                # Detach intermediate results to avoid double backward
-                x_mid_detached = x_mid.detach().clone().requires_grad_(True)
-                ffn_output = self._ffn_block(x_mid_detached)
-                output = x_mid_detached + ffn_output
-
-        # Create a fresh output tensor to completely isolate from computation graph
-        with torch.no_grad():
-            final_output = output.detach().clone().requires_grad_(True)
-            # Manually copy the gradient function
-            if output.requires_grad and final_output.requires_grad:
-                final_output.retain_grad()
-        
-        return final_output
+        return x

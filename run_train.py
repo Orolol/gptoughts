@@ -43,7 +43,7 @@ def parse_args():
     # Data Parameters
     parser.add_argument('--batch_size', type=int, default=12, help='Batch size per device')
     parser.add_argument('--block_size', type=int, default=512, help='Context size')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of dataloader workers')
+    parser.add_argument('--num_workers', type=int, default=2, help='Number of dataloader workers')
 
     # Model Config Parameters (passed to LightningModule)
     parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate')
@@ -66,7 +66,7 @@ def parse_args():
     parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping value (0 for no clipping)')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Gradient accumulation steps')
     parser.add_argument('--eval_interval_steps', type=int, default=10000, help='Validation interval in steps')
-    parser.add_argument('--log_interval_steps', type=int, default=10, help='Logging interval in steps')
+    parser.add_argument('--log_interval_steps', type=int, default=1, help='Logging interval in steps')
     parser.add_argument('--eval_only', action='store_true', help='Run only evaluation')
     parser.add_argument('--compile', action='store_true', help='Compile the model with torch.compile')
 
@@ -220,7 +220,7 @@ def main():
             # compile=args.compile, # torch.compile integration - enable if needed
             # deterministic=False, # For performance
             benchmark=True, # Enable cudnn benchmarking
-            # limit_val_batches=100, # Limit validation batches if dataset is large
+            limit_val_batches=50, # Limit validation batches to reduce validation time
         )
     
         # Compile model if requested (do it after Trainer setup for FSDP compatibility)

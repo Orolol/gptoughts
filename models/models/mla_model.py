@@ -218,13 +218,18 @@ class MLAModel(nn.Module):
         # Initialize weights
         self.apply(self._init_weights)
         
-        # Convert to FP8 if requested
-        if config.fp8_params:
+        # Convert to FP8 if requested and if we're in a CUDA context
+        # Skip FP8 conversion for CPU-only operation as it's not supported
+        if config.fp8_params and torch.cuda.is_available() and torch.cuda.device_count() > 0:
             exclude_patterns = []
             if not config.fp8_mla_params:
                 exclude_patterns.extend(["attn", "wkv", "wq"])
             
-            self._apply_fp8_to_params(exclude_patterns)
+            try:
+                self._apply_fp8_to_params(exclude_patterns)
+            except Exception as e:
+                print(f"Warning: FP8 conversion failed: {e}")
+                print("Continuing with standard precision")
         
         # Parameter count
         self.param_count = sum(p.numel() for p in self.parameters())
@@ -308,6 +313,11 @@ class MLAModel(nn.Module):
         return n_params
 
     def forward(self, idx, targets=None):
+        # Always ensure we're in training mode when doing a forward pass
+        # This prevents KV caching which causes memory leaks
+        if self.training:
+            self._set_inference_mode(False)
+        
         # Completely isolate input tensors to ensure no connections to previous computation graphs
         with torch.no_grad():
             idx = idx.detach().clone().requires_grad_(False)
@@ -337,21 +347,23 @@ class MLAModel(nn.Module):
                 # Extract rotary embeddings for this sequence length
                 freqs_cis = self.freqs_cis[:t].detach().clone()
             
-            # Process through layers - ensuring each layer gets a fresh tensor
+            # Process through layers while maintaining gradient flow
             for i, block in enumerate(self.transformer.h):
-                # Always detach between blocks to prevent double backward
-                x_input = isolate_tensor(x)
-                x = block(x_input, 0, freqs_cis, mask)
+                # Process through the block, maintaining gradient flow
+                x = block(x, 0, freqs_cis, mask)
+                
+                # Periodically clear CUDA cache to help with memory usage
+                # But don't do it too frequently as it can slow down training
+                if i % 6 == 5 and i > 0:
+                    torch.cuda.empty_cache()
             
-            # Apply final normalization with a fresh tensor
-            x_final = isolate_tensor(x)
-            x = self.transformer.ln_f(x_final)
+            # Keep gradient flow for final normalization  
+            x = self.transformer.ln_f(x)
             
             # Compute logits and loss if needed
             if targets is not None:
-                # Compute logits for the entire sequence with a fresh tensor
-                x_logits = isolate_tensor(x)
-                logits = self.lm_head(x_logits)
+                # Compute logits directly with gradient flow
+                logits = self.lm_head(x)
                 
                 if self.config.label_smoothing > 0.0:
                     # Apply label smoothing
@@ -390,22 +402,44 @@ class MLAModel(nn.Module):
                 loss = None
         
         # Create fresh tensor outputs with no connections to the previous graph
-        with torch.no_grad():
-            # Create detached copies that still have gradients
-            if loss is not None:
-                final_loss = loss.detach().clone().requires_grad_(True)
-                # Copy the gradient function
-                if loss.requires_grad:
-                    final_loss.retain_grad()
-            else:
-                final_loss = None
-                
-            final_logits = logits.detach().clone().requires_grad_(True)
-            # Copy the gradient function 
-            if logits.requires_grad:
-                final_logits.retain_grad()
+        # Create copies that properly preserve gradient flow
+        if loss is not None:
+            final_loss = loss.clone()  # Keep the gradient connection
+        else:
+            final_loss = None
+            
+        final_logits = logits.clone()  # Keep the gradient connection
+        
+        # Clean up intermediate tensors to prevent memory leaks
+        del x, logits
+        if loss is not None:
+            del loss
+        
+        # Force cleanup to prevent memory growth
+        # This is crucial for the training loop memory stability
+        torch.cuda.empty_cache()
         
         return final_logits, final_loss
+    
+    def _set_inference_mode(self, use_inference=True):
+        """Set the MLA blocks to inference mode for KV caching"""
+        try:
+            # First explicitly set training mode correctly
+            if use_inference:
+                self.eval()  # Set to evaluation mode
+            else:
+                self.train()  # Set to training mode
+                
+            # Then walk through all MLA modules and set their inference mode
+            for name, module in self.named_modules():
+                if hasattr(module, 'set_inference_mode') and module is not self:
+                    try:
+                        module.set_inference_mode(use_inference)
+                    except Exception as internal_e:
+                        print(f"Error setting inference mode for module {name}: {internal_e}")
+        except Exception as e:
+            print(f"Error setting inference mode: {e}")
+            # Continue without failing if there's an issue
     
     @torch.no_grad()
     def generate(self, idx, max_new_tokens=None, temperature=1.0, top_k=None, prompt=None, gen_length=None):
@@ -462,7 +496,15 @@ class MLAModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
         
         # Return a tuple to match the expected return signature from other models
-        return idx, None
+        result = (idx, None)
+        
+        # Reset to training mode and clear caches after generation
+        self._set_inference_mode(False)
+        
+        # Manually trigger garbage collection to free memory
+        torch.cuda.empty_cache()
+        
+        return result
     
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, optimizer_type=None):
         """
