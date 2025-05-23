@@ -352,10 +352,8 @@ class MLAModel(nn.Module):
                 # Process through the block, maintaining gradient flow
                 x = block(x, 0, freqs_cis, mask)
                 
-                # Periodically clear CUDA cache to help with memory usage
-                # But don't do it too frequently as it can slow down training
-                if i % 6 == 5 and i > 0:
-                    torch.cuda.empty_cache()
+                # REMOVED: torch.cuda.empty_cache() calls during forward pass
+                # These were causing VRAM fluctuations and performance issues
             
             # Keep gradient flow for final normalization  
             x = self.transformer.ln_f(x)
@@ -415,9 +413,9 @@ class MLAModel(nn.Module):
         if loss is not None:
             del loss
         
-        # Force cleanup to prevent memory growth
-        # This is crucial for the training loop memory stability
-        torch.cuda.empty_cache()
+        # REMOVED: torch.cuda.empty_cache() at end of forward pass
+        # PyTorch's memory allocator handles this more efficiently
+        # Manual calls were causing performance issues and VRAM fluctuations
         
         return final_logits, final_loss
     
@@ -498,11 +496,11 @@ class MLAModel(nn.Module):
         # Return a tuple to match the expected return signature from other models
         result = (idx, None)
         
-        # Reset to training mode and clear caches after generation
+        # Reset to training mode after generation
         self._set_inference_mode(False)
         
-        # Manually trigger garbage collection to free memory
-        torch.cuda.empty_cache()
+        # Let PyTorch's memory allocator handle memory management
+        # Removed manual torch.cuda.empty_cache() call
         
         return result
     

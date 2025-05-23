@@ -43,7 +43,7 @@ def parse_args():
     # Data Parameters
     parser.add_argument('--batch_size', type=int, default=12, help='Batch size per device')
     parser.add_argument('--block_size', type=int, default=512, help='Context size')
-    parser.add_argument('--num_workers', type=int, default=2, help='Number of dataloader workers')
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of dataloader workers')
 
     # Model Config Parameters (passed to LightningModule)
     parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate')
