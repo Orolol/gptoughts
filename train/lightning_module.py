@@ -438,9 +438,9 @@ class LLMLightningModule(pl.LightningModule):
             # cleanup_memory()
         
         # I want to print logs to check what tokens are sent to the models periodically
-        if self.global_step % 10 == 0:
-            print(f"TEXT INPUT: {self.args.tokenizer.decode(input_ids[0])}")
-            print(f"TEXT TARGET: {self.args.tokenizer.decode(targets[0])}")
+        # if self.global_step % 100 == 0:
+        #     print(f"TEXT INPUT: {self.args.tokenizer.decode(input_ids[0])}")
+        #     print(f"TEXT TARGET: {self.args.tokenizer.decode(targets[0])}")
 
         return combined_loss
 
