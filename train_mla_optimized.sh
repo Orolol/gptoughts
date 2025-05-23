@@ -29,10 +29,11 @@ python run_train.py \
     --learning_rate 5e-5 \
     --weight_decay 0.1 \
     --warmup_iters 200 \
-    --max_iters 100000 \
-    --eval_interval_steps 1000 \
+    --max_iters 10000000 \
+    --eval_interval_steps 10000 \
     --log_interval_steps 10 \
-    --gradient_accumulation_steps 1
+    --gradient_accumulation_steps 1 \
+    --use_fp8
 
 # Note: To disable gradient checkpointing, you would need to modify the model config
 # in _create_mla_config to set use_gradient_checkpointing=False

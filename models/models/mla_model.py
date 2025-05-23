@@ -148,6 +148,10 @@ class MLAModelBlock(nn.Module):
         else:
             attn_output = self._attn_block(x, start_pos, freqs_cis, mask)
         
+        # Handle FP8 to BFloat16/Float16 conversion for residual connection
+        if attn_output.dtype in [torch.float8_e4m3fn, torch.float8_e5m2] and x.dtype != attn_output.dtype:
+            attn_output = attn_output.to(x.dtype)
+        
         x = x + attn_output
         
         # Apply feed-forward network
@@ -158,6 +162,10 @@ class MLAModelBlock(nn.Module):
             )
         else:
             ffn_output = self._ffn_block(x)
+        
+        # Handle FP8 to BFloat16/Float16 conversion for residual connection
+        if ffn_output.dtype in [torch.float8_e4m3fn, torch.float8_e5m2] and x.dtype != ffn_output.dtype:
+            ffn_output = ffn_output.to(x.dtype)
         
         x = x + ffn_output
         
@@ -218,47 +226,18 @@ class MLAModel(nn.Module):
         # Initialize weights
         self.apply(self._init_weights)
         
-        # Convert to FP8 if requested and if we're in a CUDA context
-        # Skip FP8 conversion for CPU-only operation as it's not supported
-        if config.fp8_params and torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            exclude_patterns = []
-            if not config.fp8_mla_params:
-                exclude_patterns.extend(["attn", "wkv", "wq"])
-            
-            try:
-                self._apply_fp8_to_params(exclude_patterns)
-            except Exception as e:
-                print(f"Warning: FP8 conversion failed: {e}")
-                print("Continuing with standard precision")
+        # Note: FP8 parameter storage is not compatible with optimizers like Adam
+        # Instead, FP8 should be used only during forward pass computations
+        # We'll rely on mixed precision training (fp16/bf16) for memory savings
+        if config.fp8_params:
+            print("Warning: FP8 parameter storage is not compatible with most optimizers.")
+            print("Using BFloat16 mixed precision training instead for memory efficiency.")
+            print("FP8 can be used in forward pass computations with transformer_engine if available.")
         
         # Parameter count
         self.param_count = sum(p.numel() for p in self.parameters())
         print(f"Number of parameters: {self.param_count/1e6:.2f}M")
     
-    def _apply_fp8_to_params(self, exclude_patterns):
-        """Apply FP8 precision to eligible parameters."""
-        if not hasattr(torch, 'float8_e4m3fn'):
-            print("Warning: FP8 precision requested but not supported by PyTorch. Skipping conversion.")
-            return
-        
-        # Keep track of converted parameters
-        fp8_param_count = 0
-        total_param_count = 0
-        
-        for name, module in self.named_modules():
-            if isinstance(module, nn.Linear):
-                should_exclude = any(pattern in name for pattern in exclude_patterns)
-                
-                if not should_exclude:
-                    # Convert parameters to FP8
-                    if hasattr(module, 'weight') and module.weight is not None:
-                        module.weight.data = module.weight.data.to(torch.float8_e4m3fn)
-                        fp8_param_count += module.weight.numel()
-                    
-                total_param_count += sum(p.numel() for p in module.parameters())
-        
-        print(f"Converted {fp8_param_count / 1e6:.2f}M parameters to FP8 precision "
-              f"({fp8_param_count / total_param_count * 100:.2f}% of model parameters)")
     
     def _init_weights(self, module):
         """Initialize weights with scaled initialization."""

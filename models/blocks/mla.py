@@ -9,7 +9,7 @@ from .positional_encoding import RoPE
 
 
 try:
-    from flash_attn import flash_attn_func_2
+    from flash_attn import flash_attn_func
     FLASH_ATTENTION_AVAILABLE = True
 except ImportError:
     FLASH_ATTENTION_AVAILABLE = False
@@ -474,6 +474,12 @@ class MLA(nn.Module):
         # Reshape and project to output dimension
         x = x.reshape(bsz, seqlen, -1)
         x = self.wo(x)
+        
+        # Handle FP8 conversion: ensure output matches the expected dtype for residual connections
+        # Convert back to BFloat16 if the output is in FP8 format
+        if x.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            x = x.to(torch.bfloat16)
+        
         x = self.resid_dropout(x)
         
         return x
