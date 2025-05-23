@@ -47,7 +47,7 @@ class TokenCache:
 class StreamingDataset(IterableDataset):
     def __init__(self, block_size, batch_size, dataset_name="HuggingFaceFW/fineweb-edu", 
                  dataset_config="CC-MAIN-2024-10", split="train", device='cuda',
-                 cache_size=1000, eval_cache_size=100):
+                 cache_size=10, eval_cache_size=10):
         super().__init__()
         self.block_size = block_size
         self.batch_size = batch_size
@@ -209,26 +209,23 @@ class StreamingDataset(IterableDataset):
         actual_batch_size = min(self.batch_size, available_sequences // 2)  # Divise par 2 car on a besoin d'input et target
         total_length = self.block_size * actual_batch_size
 
-        # Prepare les tensors comme avant, mais avec la taille de batch ajustée
-        encoder_input = torch.tensor(self.token_buffer[:total_length], 
-                                   dtype=torch.long, device=self.device)
-        # decoder_input = torch.tensor(self.token_buffer[total_length:total_length*2], 
-        #                            dtype=torch.long, device=self.device)
-        target = torch.tensor(self.token_buffer[total_length+1:total_length*2+1], 
-                            dtype=torch.long, device=self.device)
-
-        # Reshape avec la taille de batch ajustée
-        encoder_input = encoder_input.view(actual_batch_size, self.block_size)
-        # decoder_input = decoder_input.view(actual_batch_size, self.block_size)
-        target = target.view(actual_batch_size, self.block_size)
-
-        # Nettoie le buffer
-        self.token_buffer = self.token_buffer[total_length*2:]
+        # Prepare tensors for autoregressive training
+        # For autoregressive models: target[i] = input[i+1]
+        input_ids = torch.tensor(self.token_buffer[:total_length+1],  # Need one extra token for targets
+                                dtype=torch.long, device=self.device)
+        
+        # Create input and target sequences
+        encoder_input = input_ids[:-1].view(actual_batch_size, self.block_size)
+        target = input_ids[1:].view(actual_batch_size, self.block_size)
+        
+        # Clean up buffer - we used total_length+1 tokens
+        self.token_buffer = self.token_buffer[total_length+1:]
         
         end_time = time.time()
         # print(f"Time to get a batch: {end_time - start_time:.4f} seconds")
 
         self.current_iter += 1
+        # Return input_ids and targets (decoder_input is same as encoder_input for compatibility)
         return encoder_input, encoder_input, target
     
     def __iter__(self):

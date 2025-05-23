@@ -1,0 +1,13 @@
+# Requirements pour RTX 6000 Ada avec support partiel FP8
+-r requirements.txt
+
+# PyTorch avec support CUDA 12.x
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch>=2.1.0
+
+# Version moins récente de transformer-engine avec support Ada Lovelace
+# Version 0.10.0 devrait fonctionner sur Ada sans nécessiter une compilation complète
+transformer-engine
+
+# Pour optimiser les opérations d'attention avec la RTX 6000 Ada
+flash-attn>=2.3.0 

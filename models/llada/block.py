@@ -33,17 +33,20 @@ class LLaDABlock(nn.Module):
         # Gradient checkpointing flag
         self.use_checkpoint = False
 
-    def forward(self, x, use_kv_cache=False):
+    def forward(self, x, attn_mask=None, past_key_value=None, use_kv_cache=False): # Added past_key_value
         """
         Forward pass with optimized memory usage
         
         Args:
             x: Input tensor [batch_size, seq_len, hidden_dim]
-            use_kv_cache: Whether to use KV caching during generation
+            attn_mask: Optional attention mask for BD3-LM support
+            past_key_value: Optional tuple (k, v) for the attention layer of this block.
+            use_kv_cache: Whether to use KV caching during generation (internal LLaDA cache)
             
         Returns:
             output: Processed tensor [batch_size, seq_len, hidden_dim]
             router_loss: Auxiliary loss from router
+            present_key_value: Tuple (k, v) state from the attention layer.
         """
         # Make sure input is contiguous for better performance
         if not x.is_contiguous():
@@ -52,7 +55,11 @@ class LLaDABlock(nn.Module):
         # 1. Attention block
         residual_attn = x
         x_ln1 = self.ln_1(x)
-        attn_out = self.attn(x_ln1, use_kv_cache=use_kv_cache)
+        attn_out, present_key_value = self.attn(
+            x_ln1,
+            attn_mask=attn_mask,
+            past_key_value=past_key_value,
+            use_kv_cache=use_kv_cache) # Pass attn_mask and past_kv
         x = residual_attn + attn_out
         
         # 2. MoE block
@@ -68,4 +75,4 @@ class LLaDABlock(nn.Module):
         # Add residual
         x = residual_moe + expert_output
         
-        return x, router_loss 
+        return x, router_loss, present_key_value # Return present_key_value

@@ -21,6 +21,24 @@ from gpu_optimization_enhanced import (
 )
 from train.train_utils import get_gpu_count
 
+# Vérifier si transformer-engine est disponible pour FP8
+try:
+    import transformer_engine
+    TRANSFORMER_ENGINE_AVAILABLE = True
+except ImportError:
+    TRANSFORMER_ENGINE_AVAILABLE = False
+
+def is_fp8_compatible():
+    """Vérifie si le GPU est compatible avec FP8 (H100, H200)"""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        # FP8 est supporté sur Hopper (SM90) et certains Ampere supérieurs (SM86+)
+        props = torch.cuda.get_device_properties(0)
+        return (props.major >= 9) or (props.major == 8 and props.minor >= 6)
+    except:
+        return False
+
 def get_enhanced_datasets(block_size, batch_size, device, tokenizer=None, async_loading=True):
     """
     Retourne les datasets d'entraînement et de validation avec chargement asynchrone.
@@ -161,6 +179,46 @@ def monitor_processes(processes):
             return False
     return True
 
+def optimize_fp8_settings(args):
+    """
+    Optimise les paramètres pour l'entraînement FP8.
+    
+    Args:
+        args: Arguments de configuration
+        
+    Returns:
+        args: Arguments mis à jour
+    """
+    if not args.use_fp8:
+        return args
+        
+    # Vérifier si FP8 est supporté
+    if not is_fp8_compatible():
+        print("ATTENTION: FP8 demandé mais non supporté par le GPU. Utilisation de BF16 à la place.")
+        args.use_fp8 = False
+        args.dtype = 'bfloat16' if torch.cuda.is_bf16_supported() else 'float16'
+        return args
+        
+    # Vérifier si transformer-engine est disponible
+    if not TRANSFORMER_ENGINE_AVAILABLE:
+        print("ATTENTION: FP8 demandé mais transformer-engine non installé. Utilisation de BF16 à la place.")
+        print("Installez transformer-engine avec: pip install -r requirements-fp8.txt")
+        args.use_fp8 = False
+        args.dtype = 'bfloat16' if torch.cuda.is_bf16_supported() else 'float16'
+        return args
+        
+    # Optimisations spécifiques à FP8
+    print("Configuration des optimisations pour FP8")
+    args.dtype = 'fp8'
+    
+    # Augmenter la taille de batch pour FP8 si elle n'est pas spécifiée
+    if getattr(args, 'batch_size_auto_optimize', True) and args.batch_size <= 16:
+        # FP8 utilise moins de mémoire, peut supporter des batchs plus grands
+        args.batch_size = int(args.batch_size * 1.5)
+        print(f"Taille de batch augmentée pour FP8: {args.batch_size}")
+    
+    return args
+
 def main():
     """Point d'entrée principal avec optimisations GPU avancées"""
     parser = argparse.ArgumentParser(description='Entraîner des modèles LLM avec optimisations GPU avancées')
@@ -254,8 +312,10 @@ def main():
                        help='Utiliser le chargement de données asynchrone')
     parser.add_argument('--optimize_attention', action='store_true', default=True,
                        help='Optimiser les opérations d\'attention')
-    parser.add_argument('--dtype', type=str, choices=['float32', 'float16', 'bfloat16'], default='bfloat16',
+    parser.add_argument('--dtype', type=str, choices=['float32', 'float16', 'bfloat16', 'fp8'], default='bfloat16',
                        help='Type de données à utiliser pour l\'entraînement')
+    parser.add_argument('--use_fp8', action='store_true',
+                       help='Utiliser la précision FP8 pour l\'entraînement (nécessite un GPU H100/H200 et transformer-engine)')
     
     args = parser.parse_args()
     
@@ -271,6 +331,16 @@ def main():
         print(f"Échec du chargement du tokenizer: {e}")
         args.vocab_size = 32000  # Valeur par défaut
         args.tokenizer = None
+    
+    # Détecter et configurer FP8 si demandé ou disponible
+    if args.use_fp8 or args.dtype == 'fp8':
+        args.use_fp8 = True
+        # Appliquer les optimisations spécifiques à FP8
+        args = optimize_fp8_settings(args)
+    
+    # Si FP8 est activé, mais dtype n'est pas défini, le fixer
+    if args.use_fp8 and args.dtype != 'fp8':
+        args.dtype = 'fp8'
     
     # Initialiser les optimisations CUDA avancées
     if torch.cuda.is_available():

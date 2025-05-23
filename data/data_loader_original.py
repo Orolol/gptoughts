@@ -121,10 +121,22 @@ class FinewebDataset(IterableDataset):
             max_length=self.max_length,
             return_tensors='pt'
         )
-        # For decoder inputs, use shifted version of input_ids
-        tokenized['decoder_input_ids'] = tokenized['input_ids'].clone()
+        
+        # For autoregressive models like MLA:
+        # input_ids: the input sequence
+        # labels: shifted by one position (next token prediction)
+        input_ids = tokenized['input_ids']
+        
+        # Create labels by shifting input_ids left by 1
+        # labels[i] should be input_ids[i+1]
+        labels = input_ids.clone()
+        labels[:, :-1] = input_ids[:, 1:]
+        labels[:, -1] = -1  # Set last position to -1 (will be ignored by loss)
+        
+        # For consistency with the interface, keep decoder_input_ids same as input_ids
+        tokenized['decoder_input_ids'] = input_ids.clone()
         tokenized['decoder_attention_mask'] = tokenized['attention_mask'].clone()
-        tokenized['labels'] = tokenized['input_ids'].clone()
+        tokenized['labels'] = labels
         
         # Ensure all tensors are contiguous for better performance
         return {k: v.contiguous() if isinstance(v, torch.Tensor) else v 

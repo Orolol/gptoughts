@@ -30,17 +30,25 @@ class RoPE(nn.Module):
     def _rotate_half(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
         B, H, T, D = x.shape
         
-        # Reshape avec des dimensions explicites
+        # Safety check for sequence length
+        seq_len = min(seq_len, self.max_seq_len)
+        
+        # Reshape with explicit dimensions
         x_reshaped = x.view(B, H, T, D // 2, 2)
         x1, x2 = x_reshaped[..., 0], x_reshaped[..., 1]
         
-        # Get the cos and sin values for the current sequence length
-        cos = self.cos_cached[:, :, :seq_len, :(D//2)]
-        sin = self.sin_cached[:, :, :seq_len, :(D//2)]
+        # Make sure we have enough cached values
+        if T > self.max_seq_len:
+            # Extend the cache if needed
+            self._extend_cos_sin_cache(T)
         
-        # Ensure broadcasting works correctly
-        cos = cos.expand(B, H, -1, -1)
-        sin = sin.expand(B, H, -1, -1)
+        # Get the cos and sin values for the current sequence length
+        cos = self.cos_cached[:, :, :T, :(D//2)]
+        sin = self.sin_cached[:, :, :T, :(D//2)]
+        
+        # Ensure broadcasting works correctly by explicitly matching dimensions
+        cos = cos.expand(B, H, T, -1)
+        sin = sin.expand(B, H, T, -1)
         
         # Apply rotation
         rotated = torch.stack([
@@ -49,6 +57,30 @@ class RoPE(nn.Module):
         ], dim=-1)
         
         return rotated.view(B, H, T, D)
+        
+    def _extend_cos_sin_cache(self, new_max_len):
+        """Extend the cached cos and sin values if needed."""
+        if new_max_len <= self.max_seq_len:
+            return
+            
+        # Update max_seq_len
+        old_max_len = self.max_seq_len
+        self.max_seq_len = new_max_len
+        
+        # Recalculate for the new sequence length
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
+        inv_freq = inv_freq.to(self.cos_cached.device)
+        t = torch.arange(self.max_seq_len, device=self.cos_cached.device).type_as(inv_freq)
+        freqs = torch.einsum('i,j->ij', t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        
+        # Create new cache
+        cos_cached = emb.cos().view(1, 1, self.max_seq_len, self.dim)
+        sin_cached = emb.sin().view(1, 1, self.max_seq_len, self.dim)
+        
+        # Update buffers
+        self.register_buffer('cos_cached', cos_cached, persistent=False)
+        self.register_buffer('sin_cached', sin_cached, persistent=False)
 
     def forward(self, x: torch.Tensor, seq_len: Optional[int] = None) -> torch.Tensor:
         if seq_len is None:

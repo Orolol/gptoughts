@@ -1,251 +1,275 @@
-"""
-Point d'entrée pour l'entraînement des modèles LLM.
-Ce script permet de configurer et lancer l'entraînement de différents types de modèles.
-"""
-
 import os
 import sys
 import argparse
 import torch
-import subprocess
 from transformers import AutoTokenizer
+from torch.utils.data import DataLoader, IterableDataset # Import necessary data components
 
-from gpu_optimization import setup_cuda_optimizations, print_gpu_stats
-from train.train_utils import get_gpu_count
+# Conditional imports for Lightning
+LIGHTNING_AVAILABLE = False
+try:
+    import pytorch_lightning as pl
+    from pytorch_lightning.loggers import WandbLogger, TensorBoardLogger
+    from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, TQDMProgressBar
+    LIGHTNING_AVAILABLE = True
+except (ImportError, RuntimeError):
+    pass
 
-def get_datasets(block_size, batch_size, device, tokenizer=None):
-    """
-    Retourne les datasets d'entraînement et de validation.
-    """
-    try:
-        # Essayer d'abord d'importer FinewebDataset
-        from data.data_loader_original import FinewebDataset
-        
-        print("Using FinewebDataset for training")
-        train_dataset = FinewebDataset(
-            split='train',
-            max_length=block_size,
-            buffer_size=batch_size * 4,
-            shuffle=True,
-            tokenizer=tokenizer,
-            batch_size=batch_size
-        )
-        
-        val_dataset = FinewebDataset(
-            split='train',
-            max_length=block_size,
-            buffer_size=batch_size * 2,
-            shuffle=False,
-            tokenizer=tokenizer,
-            batch_size=batch_size
-        )
-        
-    except ImportError:
-        try:
-            # Essayer ensuite StreamingDataset
-            from data.data_loader_legacy import StreamingDataset
-            
-            print("Using StreamingDataset for training")
-            train_dataset = StreamingDataset(
-                split='train',
-                block_size=block_size,
-                batch_size=batch_size,
-                device=device,
-                tokenizer=tokenizer
-            )
-            
-            val_dataset = StreamingDataset(
-                split='validation',
-                block_size=block_size,
-                batch_size=batch_size,
-                device=device,
-                tokenizer=tokenizer
-            )
-            
-        except ImportError:
-            # Fallback sur un dataset simple
-            print("Warning: Could not import specialized datasets, using simple dataset")
-            from torch.utils.data import TensorDataset
-            
-            # Créer des données aléatoires pour le test
-            train_data = torch.randint(0, 1000, (100, block_size))
-            val_data = torch.randint(0, 1000, (20, block_size))
-            
-            train_dataset = TensorDataset(train_data, train_data)
-            val_dataset = TensorDataset(val_data, val_data)
-    
-    return train_dataset, val_dataset
+# Import local modules
+from optimization.cuda_optim import setup_cuda_optimizations, print_gpu_stats
+from train.train_utils import find_latest_checkpoint, get_gpu_count
 
-def launch_distributed_training(args, world_size):
-    """
-    Lance l'entraînement distribué avec le nombre spécifié de GPUs.
-    """
-    print(f"Found {world_size} GPUs. Launching distributed training...")
-    
-    current_env = os.environ.copy()
-    current_env["MASTER_ADDR"] = "localhost"
-    current_env["MASTER_PORT"] = "29500"
-    current_env["WORLD_SIZE"] = str(world_size)
-    
-    # Construire la commande avec tous les arguments
-    cmd = [sys.executable, "train/train.py"]
-    for arg_name, arg_value in vars(args).items():
-        if arg_value is not None:
-            if isinstance(arg_value, bool):
-                if arg_value:
-                    cmd.append(f"--{arg_name}")
-            else:
-                cmd.append(f"--{arg_name}")
-                cmd.append(str(arg_value))
-    
-    processes = []
-    for rank in range(world_size):
-        current_env["RANK"] = str(rank)
-        current_env["LOCAL_RANK"] = str(rank)
-        
-        process = subprocess.Popen(cmd, env=current_env)
-        processes.append(process)
-    
-    return processes
+# Set TOKENIZERS_PARALLELISM to avoid warnings with Hugging Face tokenizers when using multiprocessing
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-def monitor_processes(processes):
-    """
-    Surveille les processus d'entraînement et gère les échecs.
-    """
-    for process in processes:
-        process.wait()
-        if process.returncode != 0:
-            print(f"Training failed with return code {process.returncode}")
-            # Tuer tous les processus restants
-            for p in processes:
-                if p.poll() is None:  # Si le processus est toujours en cours
-                    p.kill()
-            return False
-    return True
+# Import datasets helper
+from data.datasets import get_datasets
 
-def main():
-    """Point d'entrée principal"""
-    parser = argparse.ArgumentParser(description='Train LLM models')
-    
-    # Paramètres du modèle
-    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'gpt'], default='gpt',
-                       help='Type de modèle à entraîner')
-    parser.add_argument('--size', type=str, choices=['small', 'medium', 'large'], default='small',
-                       help='Taille du modèle')
-    
-    # Paramètres d'E/S
-    parser.add_argument('--output_dir', type=str, default='out',
-                       help='Répertoire de sortie pour les checkpoints')
-    parser.add_argument('--eval_interval', type=int, default=1000,
-                       help='Intervalle d\'évaluation')
-    parser.add_argument('--log_interval', type=int, default=1,
-                       help='Intervalle de journalisation')
-    parser.add_argument('--eval_iters', type=int, default=100,
-                       help='Nombre d\'itérations d\'évaluation')
-    parser.add_argument('--eval_only', action='store_true',
-                       help='Exécuter uniquement l\'évaluation')
-    parser.add_argument('--always_save_checkpoint', action='store_true',
-                       help='Toujours sauvegarder un checkpoint après chaque évaluation')
-    parser.add_argument('--init_from', type=str, default='scratch', choices=['scratch', 'resume'],
-                       help='Initialiser depuis zéro ou reprendre l\'entraînement')
-    parser.add_argument('--keep_checkpoints', type=int, default=3,
-                       help='Nombre de checkpoints à conserver')
-    
-    # Paramètres de données
-    parser.add_argument('--batch_size', type=int, default=12,
-                       help='Taille du batch')
-    parser.add_argument('--block_size', type=int, default=512,
-                       help='Taille du contexte')
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
-                       help='Nombre d\'étapes d\'accumulation de gradient')
-    parser.add_argument('--dropout', type=float, default=0.0,
-                       help='Taux de dropout')
-    parser.add_argument('--bias', action='store_true',
-                       help='Utiliser des biais dans les couches linéaires')
-    parser.add_argument('--attention_backend', type=str, default=None,
-                       help='Backend d\'attention à utiliser')
-    
-    # Paramètres d'optimisation
-    parser.add_argument('--optimizer_type', type=str, default=None,
-                       choices=['adamw', 'lion', 'apollo', 'apollo-mini'],
-                       help='Type d\'optimiseur à utiliser (par défaut: adamw pour GPT, lion pour MoE/LLaDA)')
-    parser.add_argument('--learning_rate', type=float, default=5e-5,
-                       help='Taux d\'apprentissage')
-    parser.add_argument('--max_iters', type=int, default=100000,
-                       help='Nombre maximal d\'itérations')
-    parser.add_argument('--weight_decay', type=float, default=0.1,
-                       help='Décroissance des poids')
-    parser.add_argument('--beta1', type=float, default=0.9,
-                       help='Beta1 pour Adam')
-    parser.add_argument('--beta2', type=float, default=0.95,
-                       help='Beta2 pour Adam')
-    parser.add_argument('--grad_clip', type=float, default=0.5,
-                       help='Clip de gradient')
-    parser.add_argument('--decay_lr', action='store_true',
-                       help='Décroissance du taux d\'apprentissage')
-    parser.add_argument('--warmup_iters', type=int, default=200,
-                       help='Nombre d\'itérations de warmup')
-    parser.add_argument('--lr_decay_iters', type=int, default=600000,
-                       help='Nombre d\'itérations pour la décroissance du taux d\'apprentissage')
-    parser.add_argument('--min_lr', type=float, default=3e-6,
-                       help='Taux d\'apprentissage minimal')
-    
-    # Paramètres DDP
-    parser.add_argument('--backend', type=str, default='nccl',
-                       help='Backend pour DDP')
-    parser.add_argument('--compile', action='store_true',
-                       help='Compiler le modèle avec torch.compile')
-    parser.add_argument('--distributed', action='store_true',
-                       help='Utiliser l\'entraînement distribué')
-    
-    # Paramètres MoE
-    parser.add_argument('--router_z_loss_coef', type=float, default=0.001,
-                       help='Coefficient pour la perte du routeur')
-    
-    # Paramètres de tokenizer
-    parser.add_argument('--tokenizer_name', type=str, default="meta-llama/Llama-3.2-1B-Instruct",
-                       help='Nom du tokenizer à utiliser')
-    
+# --- Argument Parsing ---
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train LLM models with PyTorch Lightning')
+
+    # Model Parameters
+    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'gpt', 'mla'], default='gpt', help='Type of model to train')
+    parser.add_argument('--size', type=str, choices=['small', 'medium', 'large', 'xl'], default='small', help='Size of the model')
+    parser.add_argument('--use_lightning', action='store_true', default=True, help='Use PyTorch Lightning for training')
+
+    # IO Parameters
+    parser.add_argument('--output_dir', type=str, default='out_lightning', help='Output directory for checkpoints and logs')
+    parser.add_argument('--init_from', type=str, default='scratch', choices=['scratch', 'resume'], help='Initialize from scratch or resume training')
+    parser.add_argument('--resume_ckpt_path', type=str, default=None, help='Specific checkpoint path to resume from (overrides searching in output_dir)')
+    parser.add_argument('--keep_checkpoints', type=int, default=3, help='Number of checkpoints to keep (-1 for all)')
+
+    # Data Parameters
+    parser.add_argument('--batch_size', type=int, default=12, help='Batch size per device')
+    parser.add_argument('--block_size', type=int, default=512, help='Context size')
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of dataloader workers')
+
+    # Model Config Parameters (passed to LightningModule)
+    parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate')
+    parser.add_argument('--bias', action='store_true', help='Use bias in linear layers')
+    parser.add_argument('--attention_backend', type=str, default=None, help='Attention backend (e.g., flash)')
+
+    # Optimizer Parameters (passed to LightningModule)
+    parser.add_argument('--optimizer_type', type=str, default=None, choices=['adamw', 'lion', 'apollo', 'apollo-mini'], help='Optimizer type')
+    parser.add_argument('--learning_rate', type=float, default=5e-5, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.1, help='Weight decay')
+    parser.add_argument('--beta1', type=float, default=0.9, help='Adam beta1')
+    parser.add_argument('--beta2', type=float, default=0.95, help='Adam beta2')
+    parser.add_argument('--decay_lr', action='store_true', default=True, help='Decay learning rate') # Default to True as common practice
+    parser.add_argument('--warmup_iters', type=int, default=200, help='Warmup iterations')
+    parser.add_argument('--lr_decay_iters', type=int, default=600000, help='LR decay iterations')
+    parser.add_argument('--min_lr', type=float, default=3e-6, help='Minimum learning rate')
+
+    # Training Parameters (for Lightning Trainer)
+    parser.add_argument('--max_iters', type=int, default=100000, help='Maximum training iterations (steps)')
+    parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping value (0 for no clipping)')
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Gradient accumulation steps')
+    parser.add_argument('--eval_interval_steps', type=int, default=10000, help='Validation interval in steps')
+    parser.add_argument('--log_interval_steps', type=int, default=1, help='Logging interval in steps')
+    parser.add_argument('--eval_only', action='store_true', help='Run only evaluation')
+    parser.add_argument('--compile', action='store_true', help='Compile the model with torch.compile')
+
+    # Precision Parameters (for Lightning Trainer)
+    parser.add_argument('--precision', type=str, default='bf16-mixed', choices=['32-true', '16-mixed', 'bf16-mixed'], help='Training precision')
+    # FP8 requires specific setup, handled separately if needed via transformer_engine integration within the module
+    parser.add_argument('--use_fp8', action='store_true', help='Use FP8 precision for models that support it (requires H100/H200 GPU)')
+    parser.add_argument('--fp8_mla_params', action='store_true', help='Use FP8 precision for MLA params (default is FP16 for stability)')
+
+    # Distributed Parameters (for Lightning Trainer)
+    parser.add_argument('--strategy', type=str, default='ddp', help='Distributed strategy (e.g., ddp, fsdp)')
+    parser.add_argument('--devices', type=int, default=-1, help='Number of GPUs to use (-1 for all available)')
+    parser.add_argument('--device', type=str, default=None, help='Device to use for training (e.g., cpu, cuda:0)')
+
+    # MoE Parameters (passed to LightningModule)
+    parser.add_argument('--router_z_loss_coef', type=float, default=0.001, help='Router loss coefficient')
+
+    # BD3-LM Specific Args (passed to LightningModule)
+    parser.add_argument('--use_bd3_training', action='store_true', help='Enable BD3-LM vectorized training path for LLaDA model')
+
+    # Tokenizer Parameters
+    parser.add_argument('--tokenizer_name', type=str, default="meta-llama/Llama-3.2-1B-Instruct", help='Tokenizer name from Hugging Face Hub')
+
+    # Logging
+    parser.add_argument('--wandb_project', type=str, default=None, help='WandB project name (if None, uses TensorBoard)')
+    parser.add_argument('--wandb_entity', type=str, default=None, help='WandB entity name')
+
+    # Advanced Optimizations (passed to LightningModule)
+    parser.add_argument('--optimize_attention', action='store_true', help='Enable attention optimizations (if available)')
+    parser.add_argument('--preallocate_memory', action='store_true', help='Preallocate CUDA memory (if available)')
+
     args = parser.parse_args()
-    
-    # Initialiser le tokenizer
+    return args
+
+# --- Main Execution ---
+def main():
+    args = parse_args()
+
+    # Setup CUDA optimizations early
+    if torch.cuda.is_available():
+        setup_cuda_optimizations()
+        if args.devices == -1: # Auto-detect GPUs if not specified
+             args.devices = get_gpu_count()
+        print(f"Detected {args.devices} GPUs.")
+        if args.devices > 0:
+             print_gpu_stats() # Print initial stats
+
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # --- Tokenizer ---
     try:
         access_token = os.getenv('HF_TOKEN')
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=True, access_token=access_token)
-        tokenizer.pad_token = tokenizer.eos_token
-        args.vocab_size = len(tokenizer)
-        args.tokenizer = tokenizer
-        print(f"Initialized tokenizer: {args.tokenizer_name} with vocab size {args.vocab_size}")
+        tokenizer.pad_token = tokenizer.eos_token # Set pad token if needed
+        args.vocab_size = len(tokenizer) # Get vocab size from len(tokenizer) for robustness
+        args.tokenizer = tokenizer # Pass tokenizer via args for generation in module
+        print(f"Initialized tokenizer: {args.tokenizer_name} with effective vocab size {args.vocab_size} (from len(tokenizer))")
     except Exception as e:
-        print(f"Failed to load tokenizer: {e}")
-        args.vocab_size = 32000  # Valeur par défaut
+        print(f"Failed to load tokenizer '{args.tokenizer_name}': {e}")
+        print("Proceeding without a tokenizer. Generation and some datasets might not work.")
+        # Estimate vocab size or set a default if needed by model config
+        args.vocab_size = getattr(args, 'vocab_size', 32000) # Use provided or default
         args.tokenizer = None
-    
-    # Initialiser les optimisations CUDA
-    if torch.cuda.is_available():
-        setup_cuda_optimizations()
-        print_gpu_stats()
-    
-    # Obtenir le nombre de GPUs disponibles
-    world_size = get_gpu_count()
-    
-    if args.distributed and world_size > 1:
-        # Lancer l'entraînement distribué
-        processes = launch_distributed_training(args, world_size)
+
+    # --- DataLoaders ---
+    print("Setting up datasets...")
+    train_loader, val_loader = get_datasets(
+        args.block_size,
+        args.batch_size,
+        tokenizer=args.tokenizer,
+        num_workers=args.num_workers
+    )
+    print("Datasets ready.")
+
+    # Choose between Lightning and standard training
+    if args.use_lightning and LIGHTNING_AVAILABLE:
+        print("Using PyTorch Lightning for training...")
         
-        # Surveiller les processus
-        success = monitor_processes(processes)
-        if not success:
-            sys.exit(1)
+        # Import Lightning module if available
+        from train.lightning_module import LLMLightningModule
+        
+        # --- LightningModule ---
+        print("Initializing LightningModule...")
+        model = LLMLightningModule(args)
+        print("LightningModule initialized.")
+    
+        # --- Callbacks ---
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=args.output_dir,
+            filename='{epoch}-{step}-{val/loss:.2f}',
+            save_top_k=args.keep_checkpoints,
+            monitor='val/loss',
+            mode='min',
+            save_last=True, # Always save the last checkpoint
+            every_n_train_steps=args.eval_interval_steps # Save checkpoint after validation
+        )
+        lr_monitor = LearningRateMonitor(logging_interval='step')
+        progress_bar = TQDMProgressBar(refresh_rate=10) # Adjust refresh rate as needed
+    
+        callbacks = [checkpoint_callback, lr_monitor, progress_bar]
+    
+        # --- Logger ---
+        if args.wandb_project:
+            logger = WandbLogger(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                log_model=False, # Don't log model checkpoints to WandB by default
+                save_dir=args.output_dir,
+                config=vars(args) # Log hyperparameters
+            )
+            print(f"Using WandB logger (Project: {args.wandb_project})")
+        else:
+            logger = TensorBoardLogger(
+                save_dir=args.output_dir,
+                name="logs"
+            )
+            print(f"Using TensorBoard logger (Directory: {args.output_dir}/logs)")
+    
+        # --- Trainer ---
+        # Determine checkpoint path for resuming
+        ckpt_path = None
+        if args.init_from == 'resume':
+            if args.resume_ckpt_path:
+                ckpt_path = args.resume_ckpt_path
+                print(f"Resuming from specified checkpoint: {ckpt_path}")
+            else:
+                # Try to find the last checkpoint in the output directory
+                ckpt_path = find_latest_checkpoint(args.output_dir, pattern="last.ckpt") # PL saves last as 'last.ckpt'
+                if ckpt_path:
+                    print(f"Resuming from last checkpoint found: {ckpt_path}")
+                else:
+                    print(f"Resume requested but no checkpoint found in {args.output_dir}. Starting from scratch.")
+                    args.init_from = 'scratch' # Fallback to scratch if no checkpoint
+    
+        # Configure Trainer
+        trainer = pl.Trainer(
+            devices=args.devices,
+            accelerator="gpu" if torch.cuda.is_available() and args.devices != 0 else "cpu",
+            strategy=args.strategy if args.devices > 1 else "auto",
+            precision=args.precision,
+            max_steps=args.max_iters,
+            val_check_interval=args.eval_interval_steps, # Check validation every N steps
+            check_val_every_n_epoch=None, # Disable epoch-based validation checking
+            log_every_n_steps=args.log_interval_steps,
+            accumulate_grad_batches=args.gradient_accumulation_steps,
+            gradient_clip_val=args.grad_clip if args.grad_clip > 0 else None,
+            logger=logger,
+            callbacks=callbacks,
+            enable_checkpointing=True,
+            # compile=args.compile, # torch.compile integration - enable if needed
+            # deterministic=False, # For performance
+            benchmark=True, # Enable cudnn benchmarking
+            limit_val_batches=50, # Limit validation batches to reduce validation time
+        )
+    
+        # Compile model if requested (do it after Trainer setup for FSDP compatibility)
+        if args.compile:
+            print("Compiling model with torch.compile...")
+            try:
+                model = torch.compile(model, mode="max-autotune") # or reduce-overhead
+                print("Model compiled successfully.")
+            except Exception as e:
+                print(f"Model compilation failed: {e}")
+                print("Proceeding without compilation.")
+    
+        # --- Start Training with Lightning ---
+        if args.eval_only:
+            print("Starting evaluation only...")
+            if not ckpt_path:
+                 print("Error: Evaluation only requested but no checkpoint specified or found.")
+                 sys.exit(1)
+            trainer.validate(model, dataloaders=val_loader, ckpt_path=ckpt_path)
+            print("Evaluation finished.")
+        else:
+            print("Starting training with Lightning...")
+            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader, ckpt_path=ckpt_path)
+            print("Lightning training finished.")
+    
     else:
-        # Entraînement sur un seul GPU ou CPU
-        print("Running on single device")
+        # Lightning not available or not requested
+        if args.use_lightning and not LIGHTNING_AVAILABLE:
+            print("PyTorch Lightning is not available. Falling back to standard training.")
+        else:
+            print("Using standard training (non-Lightning)...")
+        
+        # Import Trainer from train.py
         from train.train import Trainer
         
+        # Set evaluation interval for standard training
+        args.eval_interval = args.eval_interval_steps  # Rename to match standard training parameter name
+        args.log_interval = args.log_interval_steps    # Rename to match standard training parameter name
+        
+        # Create and run trainer
         trainer = Trainer(args)
-        trainer.train()
-    
-    print("Training completed successfully")
+        
+        if args.eval_only:
+            print("Evaluation only mode not supported yet in standard training. Use Lightning for evaluation.")
+            sys.exit(1)
+        else:
+            print("Starting standard training...")
+            trainer.train()
+            print("Standard training finished.")
 
 if __name__ == "__main__":
     main()

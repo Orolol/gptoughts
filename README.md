@@ -44,22 +44,23 @@ GPToughts est un projet personnel visant à faciliter l'entraînement et l'expé
     └── llada.md
 ```
 
-## 💻 Installation
+## �� Installation
 
-1. Cloner le dépôt :
+Pour installer et configurer ce projet :
+
 ```bash
-git clone https://github.com/votre-username/gptoughts.git
+# Cloner le dépôt
+git clone https://github.com/Orolol/gptoughts
 cd gptoughts
-```
 
-2. Installer les dépendances :
-```bash
+# Utiliser la branche llada pour les dernières fonctionnalités
+git checkout llada
+
+# Installer les dépendances
 pip install -r requirements.txt
-```
 
-3. (Optionnel) Pour les optimisations avancées :
-```bash
-pip install flash-attn xformers deepspeed
+# Configurer le token Hugging Face (nécessaire pour accéder à certains modèles)
+export HF_TOKEN=your_huggingface_token
 ```
 
 ## 🚀 Utilisation
@@ -70,6 +71,17 @@ pip install flash-attn xformers deepspeed
 python run_train.py --model_name huggyllama/llama-7b \
                    --block_size 2048 \
                    --batch_size 2 \
+                   --learning_rate 1e-5
+```
+
+### Entraînement avec précision FP8 (requiert GPU H100/H200)
+
+```bash
+python run_train.py --model_type llada \
+                   --size medium \
+                   --use_fp8 \
+                   --batch_size 32 \
+                   --block_size 4096 \
                    --learning_rate 1e-5
 ```
 
@@ -87,15 +99,23 @@ python run_train.py --model_name huggyllama/llama-7b \
 
 ## 🔧 Optimisations GPU
 
-Ce projet met l'accent sur l'optimisation maximale de l'utilisation GPU. Les principales optimisations incluent :
+Ce projet inclut plusieurs optimisations GPU pour améliorer les performances d'entraînement des modèles LLM. Pour utiliser ces optimisations, exécutez :
 
-- **Optimisations CUDA avancées** pour différentes architectures GPU
-- **Chargement de données asynchrone** pour réduire les temps d'attente du GPU
-- **Ajustement automatique des paramètres d'entraînement** en fonction du matériel
-- **Optimisations spécifiques aux opérations d'attention** (Flash Attention, etc.)
-- **Gestion fine de la mémoire** pour réduire la fragmentation et maximiser l'espace disponible
+```bash
+# Voir toutes les options disponibles
+./optimize.sh --help
 
-Pour plus de détails, consultez les documents `GPU_OPTIMIZATION_README.md` et `ADVANCED_GPU_OPTIMIZATION.md`.
+# Activer toutes les optimisations
+./optimize.sh --all
+
+# Activer uniquement certaines optimisations
+./optimize.sh --memory --cuda
+
+# Activer les optimisations et lancer l'entraînement
+./optimize.sh --all --train --model llada --size medium
+```
+
+Pour plus de détails sur les optimisations disponibles, consultez le fichier [OPTIMIZATION_README.md](OPTIMIZATION_README.md).
 
 ## 🧪 Modèles supportés
 
