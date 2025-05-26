@@ -707,8 +707,8 @@ class LLMLightningModule(pl.LightningModule):
     def on_validation_epoch_end(self):
         """Called at the end of the validation epoch."""
         # Generate sample text only on rank 0
-        if self.global_rank == 0 and hasattr(self.args, 'tokenizer') and self.args.tokenizer:
-            self.generate_sample_text()
+        # if self.global_rank == 0 and hasattr(self.args, 'tokenizer') and self.args.tokenizer:
+        #     self.generate_sample_text()
 
         # Optional: Perform more complex validation loss estimation like in original code
         # This might involve running estimate_loss utility if needed, but PL's logging

@@ -131,8 +131,9 @@ def configure_optimizer_for_gpt(
         learning_rate: Learning rate
         betas: Adam beta parameters
         device_type: Device type ('cuda' or 'cpu')
-        optimizer_type: Type of optimizer to use ('adamw', 'apollo', 'apollo-mini')
+        optimizer_type: Type of optimizer to use ('adamw', 'lion', 'apollo', 'apollo-mini', 'galore', 'galore-8bit')
         apollo_config: Configuration for APOLLO optimizer if used
+        galore_config: Configuration for GaLore optimizer if used
         
     Returns:
         Configured optimizer
@@ -179,7 +180,6 @@ def configure_optimizer_for_gpt(
             apollo_config=config
         )
     
-    # Otherwise, use standard AdamW
     # Group parameters - standard categorization for GPT
     optimizer_groups = get_grouped_params(
         model=model,
@@ -187,6 +187,37 @@ def configure_optimizer_for_gpt(
         learning_rate=learning_rate
     )
     
+    # Use Lion if requested
+    if optimizer_type == "lion" and device_type == 'cuda':
+        try:
+            # First try to use torch_optimizer's Lion
+            if TORCH_OPTIMIZER_AVAILABLE and hasattr(extra_optim, 'Lion'):
+                optimizer = extra_optim.Lion(
+                    optimizer_groups,
+                    lr=learning_rate,
+                    betas=betas
+                )
+                print("Using Lion optimizer from torch_optimizer for GPT model")
+                return optimizer
+            # Then try lion-pytorch
+            else:
+                try:
+                    from lion_pytorch import Lion
+                    optimizer = Lion(
+                        optimizer_groups,
+                        lr=learning_rate,
+                        betas=betas
+                    )
+                    print("Using Lion optimizer from lion-pytorch for GPT model")
+                    return optimizer
+                except ImportError:
+                    # Fall back to AdamW
+                    raise ImportError("Lion optimizer requested but not available")
+        except ImportError:
+            print("Lion optimizer requested but not available. Falling back to AdamW.")
+            optimizer_type = "adamw"  # Fall back to AdamW
+    
+    # Default to AdamW
     # Create optimizer based on device type
     if device_type == 'cuda':
         optimizer = torch.optim.AdamW(

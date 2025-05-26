@@ -27,3 +27,4 @@ pytorch-lightning
 tensorboardX
 galore_torch
 apollo_torch
+lion_pytorch
