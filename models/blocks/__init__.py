@@ -7,6 +7,7 @@ from .mlp import MLP, Block
 from .moe import Router, ExpertGroup, MoELayer
 from .mla import MLA
 from .mla_block import MLABlock
+from .mla_selective import MLASelective
 
 __all__ = [
     'RMSNorm',
@@ -15,6 +16,7 @@ __all__ = [
     'CausalSelfAttention',
     'MLA',
     'MLABlock',
+    'MLASelective',
     'MLP',
     'Block',
     'Router',

@@ -23,3 +23,8 @@ deepspeed
 # flash-attn
 torch_optimizer
 apollo_torch
+pytorch-lightning
+tensorboardX
+galore_torch
+apollo_torch
+lion_pytorch

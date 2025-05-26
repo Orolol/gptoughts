@@ -30,7 +30,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train LLM models with PyTorch Lightning')
 
     # Model Parameters
-    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'gpt', 'mla'], default='gpt', help='Type of model to train')
+    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'gpt', 'mla', 'mla_selective', 'parscale_mla'], default='gpt', help='Type of model to train')
     parser.add_argument('--size', type=str, choices=['small', 'medium', 'large', 'xl'], default='small', help='Size of the model')
     parser.add_argument('--use_lightning', action='store_true', default=True, help='Use PyTorch Lightning for training')
 
@@ -51,7 +51,7 @@ def parse_args():
     parser.add_argument('--attention_backend', type=str, default=None, help='Attention backend (e.g., flash)')
 
     # Optimizer Parameters (passed to LightningModule)
-    parser.add_argument('--optimizer_type', type=str, default=None, choices=['adamw', 'lion', 'apollo', 'apollo-mini'], help='Optimizer type')
+    parser.add_argument('--optimizer_type', type=str, default=None, choices=['adamw', 'lion', 'apollo', 'apollo-mini', 'galore', 'galore-8bit'], help='Optimizer type')
     parser.add_argument('--learning_rate', type=float, default=5e-5, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.1, help='Weight decay')
     parser.add_argument('--beta1', type=float, default=0.9, help='Adam beta1')
@@ -97,6 +97,33 @@ def parse_args():
     # Advanced Optimizations (passed to LightningModule)
     parser.add_argument('--optimize_attention', action='store_true', help='Enable attention optimizations (if available)')
     parser.add_argument('--preallocate_memory', action='store_true', help='Preallocate CUDA memory (if available)')
+    
+    # Dynamic Tanh (DyT) Parameters
+    parser.add_argument('--use_dyt', action='store_true', help='Use Dynamic Tanh (DyT) instead of RMSNorm for ~8% speedup')
+    parser.add_argument('--dyt_alpha_init', type=float, default=0.5, help='Initial value for DyT alpha parameter')
+
+    # ParScale-MLA Parameters
+    parser.add_argument('--parallel_streams', type=int, default=8, help='Number of parallel streams for ParScale')
+    parser.add_argument('--prefix_length', type=int, default=48, help='Length of input-space prefixes')
+    parser.add_argument('--latent_prefix_length', type=int, default=16, help='Length of latent-space prefixes')
+    parser.add_argument('--aggregator_epsilon', type=float, default=0.1, help='Label smoothing for aggregation')
+    parser.add_argument('--diversity_weight', type=float, default=0.1, help='Weight for diversity regularization')
+    parser.add_argument('--use_dynamic_inference', action='store_true', default=True, help='Enable dynamic inference based on complexity')
+    parser.add_argument('--complexity_threshold', type=float, default=0.5, help='Threshold for full stream activation')
+    parser.add_argument('--training_stage', type=int, default=1, choices=[1, 2], help='ParScale training stage (1: base, 2: parscale)')
+    parser.add_argument('--freeze_base_in_stage2', action='store_true', default=True, help='Freeze base model in stage 2')
+    parser.add_argument('--base_checkpoint', type=str, default=None, help='Base model checkpoint for ParScale stage 2')
+    
+    # GaLore Parameters
+    parser.add_argument('--galore_rank', type=int, default=128, help='GaLore low-rank dimension')
+    parser.add_argument('--galore_update_proj_gap', type=int, default=200, help='GaLore projection update interval')
+    parser.add_argument('--galore_scale', type=float, default=0.25, help='GaLore scaling factor')
+    parser.add_argument('--galore_proj_type', type=str, default='std', help='GaLore projection type')
+    
+    # Selective Attention Parameters (for MLA-Selective model)
+    parser.add_argument('--selection_ratio', type=float, default=0.5, help='Ratio of tokens to select (0.0 to 1.0)')
+    parser.add_argument('--selection_method', type=str, default='top_k', choices=['top_k', 'threshold', 'gumbel'], help='Method for token selection')
+    parser.add_argument('--selection_temperature', type=float, default=1.0, help='Temperature for Gumbel selection')
 
     args = parser.parse_args()
     return args

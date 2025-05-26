@@ -3,8 +3,6 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, IterableDataset
-from torch.amp import GradScaler
 import os
 import time
 import traceback
@@ -12,9 +10,11 @@ import random
 
 # Import necessary components from your project
 from models.deepseek.deepseek_adapter_mtp import DeepSeekMiniMTP, DeepSeekMiniConfigMTP
-from models.llada.model import LLaDAModel, LLaDAConfig
-from models.models.model import GPT, GPTConfig
-from models.models.mla_model import MLAModel, MLAModelConfig, create_mla_model
+from models.llada.model import LLaDAModel
+from models.models.model import GPT
+from models.models.mla_model import MLAModel, MLAModelConfig
+from models.models.parscale_mla import ParScaleMLA, ParScaleMLAConfig, create_parscale_mla
+from models.models.mla_selective_model import MLASelectiveModel, MLASelectiveModelConfig
 from train.train_utils import (
     get_lr, calculate_perplexity, ensure_model_dtype,
     AveragedTimingStats, generate_text, estimate_loss
@@ -52,7 +52,15 @@ class LLMLightningModule(pl.LightningModule):
 
         # Print model size
         param_count = sum(p.numel() for p in self.model.parameters()) / 1e6
+        trainable_count = sum(p.numel() for p in self.model.parameters() if p.requires_grad) / 1e6
         print(f"Initialized {self.args.model_type} model ({self.args.size}) with {param_count:.2f}M parameters.")
+        print(f"Trainable parameters: {trainable_count:.2f}M")
+        
+        # Special logging for ParScale stage 2
+        if self.args.model_type == 'parscale_mla' and getattr(self.args, 'training_stage', 1) == 2:
+            print(f"ParScale Stage 2: Training only ParScale components ({trainable_count:.2f}M params)")
+            print(f"Base model parameters frozen: {(param_count - trainable_count):.2f}M params")
+            
         print_memory_stats("After Model Init")
 
     def _build_model(self):
@@ -70,6 +78,12 @@ class LLMLightningModule(pl.LightningModule):
         elif model_type == 'mla':
             config = self._create_mla_config()
             model = self._create_mla_model(config)
+        elif model_type == 'mla_selective':
+            config = self._create_mla_selective_config()
+            model = self._create_mla_selective_model(config)
+        elif model_type == 'parscale_mla':
+            config = self._create_parscale_mla_config()
+            model = self._create_parscale_mla_model(config)
         else: # gpt
             config = self._create_gpt_config()
             model = GPT(config)
@@ -192,6 +206,115 @@ class LLMLightningModule(pl.LightningModule):
     def _create_mla_model(self, config):
         """Create MLA-Model instance with the given configuration."""
         return MLAModel(config)
+    
+    def _create_mla_selective_config(self):
+        """Create configuration for MLA-Selective Model."""
+        # First get base MLA config
+        base_config = self._create_mla_config()
+        
+        # Create MLA Selective config with base MLA parameters
+        config = MLASelectiveModelConfig(
+            # Copy base MLA parameters
+            n_layer=base_config.n_layer,
+            n_embd=base_config.n_embd,
+            n_head=base_config.n_head,
+            vocab_size=base_config.vocab_size,
+            block_size=base_config.block_size,
+            q_lora_rank=base_config.q_lora_rank,
+            kv_lora_rank=base_config.kv_lora_rank,
+            qk_nope_head_dim=base_config.qk_nope_head_dim,
+            qk_rope_head_dim=base_config.qk_rope_head_dim,
+            v_head_dim=base_config.v_head_dim,
+            rope_theta=base_config.rope_theta,
+            fp8_params=base_config.fp8_params,
+            fp8_mla_params=base_config.fp8_mla_params,
+            dropout=base_config.dropout,
+            bias=base_config.bias,
+            attention_backend=base_config.attention_backend,
+            use_gradient_checkpointing=base_config.use_gradient_checkpointing,
+            
+            # Add selective attention specific parameters
+            selection_ratio=getattr(self.args, 'selection_ratio', 0.5),
+            selection_method=getattr(self.args, 'selection_method', 'top_k'),
+            selection_temperature=getattr(self.args, 'selection_temperature', 1.0),
+        )
+        
+        return config
+    
+    def _create_mla_selective_model(self, config):
+        """Create MLA-Selective Model instance with the given configuration."""
+        return MLASelectiveModel(config)
+    
+    def _create_parscale_mla_config(self):
+        """Create configuration for ParScale-MLA model."""
+        # First get base MLA config
+        base_config = self._create_mla_config()
+        
+        # Create ParScale config with MLA parameters
+        config = ParScaleMLAConfig(
+            # Copy base MLA parameters
+            n_layer=base_config.n_layer,
+            n_embd=base_config.n_embd,
+            n_head=base_config.n_head,
+            vocab_size=base_config.vocab_size,
+            block_size=base_config.block_size,
+            q_lora_rank=base_config.q_lora_rank,
+            kv_lora_rank=base_config.kv_lora_rank,
+            qk_nope_head_dim=base_config.qk_nope_head_dim,
+            qk_rope_head_dim=base_config.qk_rope_head_dim,
+            v_head_dim=base_config.v_head_dim,
+            use_moe=base_config.use_moe,
+            rope_theta=base_config.rope_theta,
+            fp8_params=base_config.fp8_params,
+            fp8_mla_params=base_config.fp8_mla_params,
+            dropout=base_config.dropout,
+            bias=base_config.bias,
+            attention_backend=base_config.attention_backend,
+            use_gradient_checkpointing=base_config.use_gradient_checkpointing,
+            
+            # Add ParScale specific parameters
+            parallel_streams=getattr(self.args, 'parallel_streams', 8),
+            prefix_length=getattr(self.args, 'prefix_length', 48),
+            latent_prefix_length=getattr(self.args, 'latent_prefix_length', 16),
+            aggregator_epsilon=getattr(self.args, 'aggregator_epsilon', 0.1),
+            diversity_weight=getattr(self.args, 'diversity_weight', 0.1),
+            use_dynamic_inference=getattr(self.args, 'use_dynamic_inference', True),
+            complexity_threshold=getattr(self.args, 'complexity_threshold', 0.5),
+            freeze_base_in_stage2=getattr(self.args, 'freeze_base_in_stage2', True),
+        )
+        
+        return config
+    
+    def _create_parscale_mla_model(self, config):
+        """Create ParScale-MLA model instance."""
+        # Check if we're in stage 2 and have a base checkpoint
+        if getattr(self.args, 'training_stage', 1) == 2 and getattr(self.args, 'base_checkpoint', None):
+            print(f"Loading base model from checkpoint: {self.args.base_checkpoint}")
+            # Load base model checkpoint
+            checkpoint = torch.load(self.args.base_checkpoint, map_location='cpu')
+            
+            # Extract base model state dict
+            if 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+                # Remove 'model.' prefix if present
+                state_dict = {k.replace('model.', ''): v for k, v in state_dict.items()}
+            else:
+                state_dict = checkpoint
+            
+            # Create base MLA model and load weights
+            base_model = MLAModel(config)
+            base_model.load_state_dict(state_dict, strict=False)
+            
+            # Create ParScale model with pre-trained base
+            model = ParScaleMLA(base_model=base_model, config=config)
+        else:
+            # Create ParScale model from scratch
+            model = create_parscale_mla(size=self.args.size, parallel_streams=config.parallel_streams)
+        
+        # Set training stage
+        model.set_training_stage(getattr(self.args, 'training_stage', 1))
+        
+        return model
 
     def _create_gpt_config(self):
         from models.models.model import GPTConfig
@@ -241,6 +364,14 @@ class LLMLightningModule(pl.LightningModule):
             logits, loss = self.model(input_ids, targets)
             # No router loss in dense model
             return logits, loss, None
+        elif model_type == 'mla_selective':
+            # MLA-Selective Model returns logits, loss directly
+            logits, loss = self.model(input_ids, targets)
+            return logits, loss, None
+        elif model_type == 'parscale_mla':
+            # ParScale-MLA returns logits, loss directly
+            logits, loss = self.model(input_ids, targets)
+            return logits, loss, None
         else: # deepseek or gpt
             model_output = self.model(input_ids, targets=targets)
 
@@ -278,8 +409,8 @@ class LLMLightningModule(pl.LightningModule):
                     input_ids = input_ids.detach().clone().requires_grad_(False)
                     targets = targets.detach().clone().requires_grad_(False)
                 
-                # Add special handling for MLA model
-                if self.args.model_type.lower() == 'mla':
+                # Add special handling for MLA and ParScale-MLA models
+                if self.args.model_type.lower() in ['mla', 'mla_selective', 'parscale_mla']:
                     try:
                         # Ensure the model knows we're in training mode
                         self.model.train()
@@ -295,7 +426,7 @@ class LLMLightningModule(pl.LightningModule):
                         if loss is not None and not loss.requires_grad:
                             loss = loss.clone().requires_grad_(True)
                     except Exception as e:
-                        print(f"Error in MLA forward pass: {e}")
+                        print(f"Error in MLA/ParScale-MLA forward pass: {e}")
                         # Create error tensor with gradient for safe fallback
                         logits = torch.zeros(1, device=self.device).requires_grad_(True)
                         loss = torch.tensor(10.0, device=self.device).requires_grad_(True)
@@ -329,10 +460,10 @@ class LLMLightningModule(pl.LightningModule):
                     print(f"WARNING: NaN/Inf detected in router_loss at step {self.global_step}. Setting to zero.")
                     router_loss = torch.zeros_like(router_loss)
 
-                # For MLA models, router loss is already incorporated internally
+                # For MLA and ParScale-MLA models, router loss is already incorporated internally
                 model_type = getattr(self.args, 'model_type', 'gpt')
                 
-                if model_type == 'mla':
+                if model_type in ['mla', 'parscale_mla']:
                     # Don't add router loss to prevent double counting
                     combined_loss = loss
                     # Still log the router loss for monitoring
@@ -435,6 +566,13 @@ class LLMLightningModule(pl.LightningModule):
         elif self.global_step % 100 == 0:
             self.generate_sample_text()
             
+            # Log ParScale-specific metrics if applicable
+            if self.args.model_type == 'parscale_mla' and hasattr(self.model, 'analyze_stream_diversity'):
+                diversity_stats = self.model.analyze_stream_diversity()
+                self.log('parscale/input_similarity', diversity_stats['input_similarity'], on_step=True, on_epoch=False, sync_dist=True)
+                self.log('parscale/layer_similarity', diversity_stats['layer_similarity'], on_step=True, on_epoch=False, sync_dist=True)
+                self.log('parscale/effective_streams', diversity_stats['effective_streams'], on_step=True, on_epoch=False, sync_dist=True)
+            
             # cleanup_memory()
         
         # I want to print logs to check what tokens are sent to the models periodically
@@ -453,7 +591,7 @@ class LLMLightningModule(pl.LightningModule):
             targets = targets.detach().clone().requires_grad_(False)
             
         # Forward pass with model-specific handling
-        if self.args.model_type.lower() == 'mla':
+        if self.args.model_type.lower() in ['mla', 'parscale_mla']:
             try:
                 # Ensure the model knows we're in eval mode
                 self.model.eval()
@@ -465,7 +603,7 @@ class LLMLightningModule(pl.LightningModule):
                 if loss is not None:
                     loss = loss.detach()
             except Exception as e:
-                print(f"Error in MLA validation: {e}")
+                print(f"Error in MLA/ParScale-MLA validation: {e}")
                 # Create dummy values for safe fallback
                 logits = torch.zeros(1, device=self.device)
                 loss = torch.tensor(10.0, device=self.device)
@@ -499,32 +637,39 @@ class LLMLightningModule(pl.LightningModule):
 
     def configure_optimizers(self):
         """Sets up the optimizer and learning rate scheduler."""
-        # Force AdamW for MLA models to avoid double backward issue with Lion
-        if self.args.model_type == 'mla':
-            print(f"Using AdamW optimizer for MLA model (avoids double backward)")
+        # Check if the model has configure_optimizers method
+        if hasattr(self.model, 'configure_optimizers'):
+            # Prepare kwargs for optimizer configuration
+            optimizer_kwargs = {}
+            
+            # Add GaLore-specific parameters if using GaLore
+            if hasattr(self.args, 'optimizer_type') and self.args.optimizer_type in ['galore', 'galore-8bit']:
+                optimizer_kwargs.update({
+                    'galore_rank': getattr(self.args, 'galore_rank', 128),
+                    'galore_update_proj_gap': getattr(self.args, 'galore_update_proj_gap', 200),
+                    'galore_scale': getattr(self.args, 'galore_scale', 0.25),
+                    'galore_proj_type': getattr(self.args, 'galore_proj_type', 'std')
+                })
+            
+            # For models with configure_optimizers method, use it
+            optimizer = self.model.configure_optimizers(
+                weight_decay=self.args.weight_decay,
+                learning_rate=self.args.learning_rate,
+                betas=(self.args.beta1, self.args.beta2),
+                device_type=self.device.type,
+                optimizer_type=getattr(self.args, 'optimizer_type', None),  # Pass optimizer type
+                **optimizer_kwargs
+            )
+            print(f"Using optimizer configured by model: {type(optimizer).__name__}")
+        else:
+            # Fallback to default AdamW for models without configure_optimizers
+            print(f"Using default AdamW optimizer")
             optimizer = AdamW(
                 self.model.parameters(),
                 lr=self.args.learning_rate,
                 weight_decay=self.args.weight_decay,
                 betas=(self.args.beta1, self.args.beta2)
             )
-        elif hasattr(self.model, 'configure_optimizers') and self.args.optimizer_type is not None:
-             optimizer = self.model.configure_optimizers(
-                 weight_decay=self.args.weight_decay,
-                 learning_rate=self.args.learning_rate, # Initial LR, scheduler will adjust
-                 betas=(self.args.beta1, self.args.beta2),
-                 device_type=self.device.type,
-                 optimizer_type=getattr(self.args, 'optimizer_type', "AdamW") # Pass optimizer type if specified
-             )
-             print(f"Using optimizer configured by model: {type(optimizer)}")
-        else:
-             print(f"Using default AdamW optimizer")
-             optimizer = AdamW(
-                 self.model.parameters(),
-                 lr=self.args.learning_rate,
-                 weight_decay=self.args.weight_decay,
-                 betas=(self.args.beta1, self.args.beta2)
-             )
 
         # Learning rate scheduler
         if self.args.decay_lr:
@@ -562,8 +707,8 @@ class LLMLightningModule(pl.LightningModule):
     def on_validation_epoch_end(self):
         """Called at the end of the validation epoch."""
         # Generate sample text only on rank 0
-        if self.global_rank == 0 and hasattr(self.args, 'tokenizer') and self.args.tokenizer:
-            self.generate_sample_text()
+        # if self.global_rank == 0 and hasattr(self.args, 'tokenizer') and self.args.tokenizer:
+        #     self.generate_sample_text()
 
         # Optional: Perform more complex validation loss estimation like in original code
         # This might involve running estimate_loss utility if needed, but PL's logging

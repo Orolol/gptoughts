@@ -70,14 +70,24 @@ class MLP(nn.Module):
         """
         Fusionne les opérations quand c'est possible pour une meilleure efficacité
         """
+        # Remember input dtype for output conversion
+        input_dtype = x.dtype
+        
         # Combiner les projections up et gate en une seule opération
         combined = self.gate_up_proj(x)
         
         # Appliquer l'activation
         hidden = self.act_fn(combined)
         
-        # Projection finale avec dropout
-        return self.dropout(self.down_proj(hidden))
+        # Projection finale
+        output = self.down_proj(hidden)
+        
+        # Handle FP8 conversion: ensure output matches input dtype for residual connections
+        if output.dtype in [torch.float8_e4m3fn, torch.float8_e5m2] and input_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
+            output = output.to(input_dtype)
+        
+        # Apply dropout
+        return self.dropout(output)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

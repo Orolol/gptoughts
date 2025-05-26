@@ -1,146 +1,182 @@
-# GPToughts - Framework personnel d'entraînement de LLMs
+# GPToughts - Framework d'entraînement LLM optimisé pour GPU
 
-Un framework léger mais puissant pour l'entraînement et le fine-tuning de modèles de langage (LLMs) comme hobby, avec un accent particulier sur l'optimisation des performances GPU.
+GPToughts est un framework de pointe pour l'entraînement et le fine-tuning de Large Language Models (LLMs), avec un focus particulier sur les optimisations GPU pour l'entraînement à échelle hobby/recherche.
 
-## 🌟 Vue d'ensemble
+## 🚀 Caractéristiques principales
 
-GPToughts est un projet personnel visant à faciliter l'entraînement et l'expérimentation avec des modèles de langage. Ce framework a été conçu pour :
+### Architectures de modèles supportées
 
-- Servir de plateforme d'apprentissage et d'expérimentation pour les modèles LLM
-- Maximiser l'utilisation des ressources GPU disponibles
-- Offrir une flexibilité dans le choix des modèles et des datasets
-- Permettre d'implémenter et tester facilement des optimisations de performance
+- **GPT-style autoregressive models** : Modèles de langage classiques avec attention causale
+- **DeepSeek models** : Implémentation complète avec adapters et variantes MTP (Multi-Token Prediction)
+- **MLA (Multi-head Latent Attention)** : Architecture d'attention optimisée avec compression latente
+- **LLaDA (Large Language Diffusion with mAsking)** : Approche innovante basée sur la diffusion
+- **MoE (Mixture of Experts)** : Support pour les modèles à experts multiples
 
-## 🧩 Caractéristiques principales
+### Optimisations GPU avancées
 
-- **Entraînement hautement optimisé** : Multiples couches d'optimisations GPU pour maximiser l'utilisation du matériel
-- **Architecture modulaire** : Séparation claire entre les modules de données, d'entraînement et d'optimisation
-- **Support de divers modèles** : Compatible avec les modèles de la bibliothèque Hugging Face Transformers
-- **Chargement de données efficace** : Implémentation de chargeurs de données asynchrones et optimisés
-- **Optimisations spécifiques au matériel** : Configurations adaptées à différentes architectures GPU (Hopper, Ampere, etc.)
-- **Entraînement distribué** : Support pour l'entraînement sur plusieurs GPUs
+- **Support FP8** : Précision réduite pour GPUs H100/H200 avec stabilité numérique
+- **GaLore optimizer** : Optimiseur à faible rang pour réduire l'utilisation mémoire
+- **AdEMAMix optimizer** : Optimiseur adaptatif avec momentum mixte
+- **Gradient checkpointing** : Économie de mémoire via recomputation
+- **Flash Attention** : Implémentation optimisée de l'attention
+- **Optimisations CUDA spécifiques** : Kernels personnalisés pour DeepSeek
 
-## 🛠️ Structure du projet
+### Infrastructure d'entraînement
 
-```
-├── run_train.py              # Point d'entrée principal pour l'entraînement
-├── run_train_enhanced.py     # Version améliorée avec optimisations avancées
-├── gpu_optimization.py       # Optimisations GPU de base
-├── gpu_optimization_advanced.py  # Optimisations GPU avancées
-├── gpu_optimization_enhanced.py  # Optimisations GPU encore plus poussées
-├── data/                     # Modules de chargement de données
-├── train/                    # Utilitaires et modules d'entraînement
-├── models/                   # Configurations et définitions de modèles
-├── checkpoints/              # Sauvegarde des points de contrôle d'entraînement
-├── out/                      # Sorties et logs d'entraînement
-├── scripts d'entraînement    # Scripts pour lancer différentes configurations
-│   ├── train_optimized.sh
-│   ├── train_max_gpu.sh
-│   ├── train_deepseek_optimized.sh
-│   └── train_deepseek_stable.sh
-└── documentation             # Documentation détaillée des fonctionnalités
-    ├── GPU_OPTIMIZATION_README.md
-    ├── ADVANCED_GPU_OPTIMIZATION.md
-    └── llada.md
-```
+- **PyTorch Lightning** : Framework d'entraînement moderne et scalable
+- **Data loaders optimisés** : Multiples implémentations (packed, concatenated, legacy)
+- **Monitoring avancé** : Intégration Weights & Biases, métriques détaillées
+- **Checkpointing intelligent** : Sauvegarde automatique et reprise d'entraînement
 
-## �� Installation
-
-Pour installer et configurer ce projet :
+## 📦 Installation
 
 ```bash
-# Cloner le dépôt
-git clone https://github.com/Orolol/gptoughts
+# Cloner le repository
+git clone https://github.com/yourusername/gptoughts.git
 cd gptoughts
-
-# Utiliser la branche llada pour les dernières fonctionnalités
-git checkout llada
 
 # Installer les dépendances
 pip install -r requirements.txt
 
-# Configurer le token Hugging Face (nécessaire pour accéder à certains modèles)
-export HF_TOKEN=your_huggingface_token
+# Configuration de l'environnement (recommandé)
+pyenv activate 5090
 ```
 
-## 🚀 Utilisation
+## 🏃 Utilisation rapide
 
-### Entraînement de base
+### Entraînement basique
 
 ```bash
-python run_train.py --model_name huggyllama/llama-7b \
-                   --block_size 2048 \
-                   --batch_size 2 \
-                   --learning_rate 1e-5
+# Entraîner un modèle GPT small
+python run_train.py --model_type gpt --size small --batch_size 8 --block_size 2048
+
+# Entraîner un modèle MLA avec optimisations
+./train_mla_optimized.sh
+
+# Entraîner avec GaLore (économie de mémoire)
+./train_mla_galore.sh
 ```
 
-### Entraînement avec précision FP8 (requiert GPU H100/H200)
+### Scripts d'entraînement spécialisés
+
+- `train_mla_optimized.sh` : MLA avec toutes les optimisations
+- `train_mla_galore.sh` : MLA avec optimiseur GaLore
+- `train_mla_selective.sh` : MLA avec attention sélective
+- `train_parscale_mla.sh` : MLA avec ParScale (normalisation avancée)
+- `train_deepseek_mtp.sh` : DeepSeek avec Multi-Token Prediction
+
+### Optimisations GPU
 
 ```bash
-python run_train.py --model_type llada \
-                   --size medium \
-                   --use_fp8 \
-                   --batch_size 32 \
-                   --block_size 4096 \
-                   --learning_rate 1e-5
-```
-
-### Entraînement optimisé
-
-```bash
-./train_optimized.sh
-```
-
-### Entraînement avec optimisations maximales
-
-```bash
-./train_max_gpu.sh
-```
-
-## 🔧 Optimisations GPU
-
-Ce projet inclut plusieurs optimisations GPU pour améliorer les performances d'entraînement des modèles LLM. Pour utiliser ces optimisations, exécutez :
-
-```bash
-# Voir toutes les options disponibles
-./optimize.sh --help
-
 # Activer toutes les optimisations
 ./optimize.sh --all
 
-# Activer uniquement certaines optimisations
-./optimize.sh --memory --cuda
+# Optimisations spécifiques
+./optimize.sh --memory --cuda --fp8
 
-# Activer les optimisations et lancer l'entraînement
-./optimize.sh --all --train --model llada --size medium
+# Récupération d'urgence en cas d'instabilité
+./emergency_training.sh [checkpoint_dir]
 ```
 
-Pour plus de détails sur les optimisations disponibles, consultez le fichier [OPTIMIZATION_README.md](OPTIMIZATION_README.md).
+## 🏗️ Architecture du projet
 
-## 🧪 Modèles supportés
+```
+gptoughts/
+├── models/               # Architectures de modèles
+│   ├── blocks/          # Blocs de base (attention, MLP, etc.)
+│   ├── deepseek/        # Variantes DeepSeek
+│   ├── llada/           # Implémentation LLaDA
+│   └── models/          # Classes de modèles haut niveau
+├── train/               # Utilitaires d'entraînement
+├── data/                # Loaders de données
+├── optimization/        # Modules d'optimisation GPU
+└── docs/                # Documentation détaillée
+```
 
-- Modèles Llama (Llama 2, Llama 3)
-- Modèles DeepSeek
-- Autres modèles compatibles avec l'interface HuggingFace Transformers
+## 🔧 Configurations avancées
 
-## 📊 Suivi des expériences
+### MLA (Multi-head Latent Attention)
 
-Le framework intègre optionnellement Weights & Biases (wandb) pour le suivi des expérimentations :
-- Métriques d'entraînement en temps réel
-- Suivi de l'utilisation des ressources GPU
-- Comparaison des différentes configurations d'entraînement
+```python
+# Configuration recommandée pour MLA
+config = {
+    "model_type": "mla",
+    "size": "medium",
+    "grad_clip": 1.0,
+    "learning_rate": 3e-4,
+    "use_fp8": False,  # Activer sur H100/H200
+    "optimizer": "galore",  # ou "ademamix"
+}
+```
 
-## 🔮 Projets futurs
+### Stabilité numérique
 
-- Implémentation de techniques d'optimisation supplémentaires
-- Support pour PEFT (Parameter-Efficient Fine-Tuning)
-- Intégration de techniques d'évaluation automatique de modèles
-- Support pour l'entraînement hybride CPU/GPU pour les grands modèles
+Pour éviter les problèmes de NaN/Inf :
+- Utiliser `--grad_clip 1.0`
+- Commencer avec BF16 avant FP8
+- Activer les normalisations ParScale
+- Voir `docs/numerical_stability.md`
 
-## 📝 Licence
+## 📊 Performances
 
-Ce projet est un projet personnel développé comme hobby. Merci de respecter la propriété intellectuelle.
+### Benchmarks typiques (RTX 4090)
+
+| Modèle | Taille | Batch Size | Seq Length | Tokens/sec |
+|--------|--------|------------|------------|------------|
+| GPT    | Small  | 8          | 2048       | ~15K       |
+| MLA    | Small  | 8          | 2048       | ~18K       |
+| MLA+FP8| Small  | 16         | 2048       | ~32K       |
+
+### Utilisation mémoire
+
+- **Sans optimisations** : ~20GB pour modèle medium
+- **Avec GaLore** : ~12GB pour modèle medium
+- **Avec FP8** : ~10GB pour modèle medium
+
+## 🛠️ Développement
+
+### Ajouter une nouvelle architecture
+
+1. Créer les blocs dans `models/blocks/`
+2. Implémenter le modèle dans `models/models/`
+3. Ajouter la configuration dans `models/config.py`
+4. Créer un script d'entraînement
+
+### Tests
+
+```bash
+# Validation rapide
+python run_train.py --model_type your_model --size small --batch_size 1 --block_size 128 --max_steps 10
+
+# Test de stabilité numérique
+python test_dyt.py
+```
+
+## 📚 Documentation
+
+- `docs/mla_doc.md` : Architecture MLA détaillée
+- `docs/llada.md` : Approche diffusion LLaDA
+- `docs/numerical_stability.md` : Guide de stabilité
+- `docs/parscale_mla.md` : Normalisation ParScale
+
+## 🤝 Contribution
+
+Les contributions sont les bienvenues ! Points d'intérêt actuels :
+- Optimisations supplémentaires pour GPUs consumer
+- Support de nouvelles architectures (Mamba, RWKV)
+- Amélioration de la stabilité FP8
+- Documentation et tutoriels
+
+## 📄 Licence
+
+[À définir]
+
+## 🙏 Remerciements
+
+- PyTorch et PyTorch Lightning teams
+- Auteurs des papers MLA, DeepSeek, et LLaDA
+- Communauté open-source ML
 
 ---
 
-*GPToughts - Parce que l'entraînement des LLMs devrait être accessible à tous les passionnés d'IA.* 
+*GPToughts - Entraînez vos LLMs efficacement, même sur du hardware consumer !*

@@ -2,17 +2,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.amp import custom_fwd, custom_bwd
-import torch.utils.checkpoint as checkpoint
-from models.blocks.attention import CausalSelfAttention
 from typing import Optional
-import inspect
-import gc
-import time
-from collections import defaultdict
 from contextlib import nullcontext
-import threading
-from queue import Queue
+
 
 # Import des fonctions de calcul de FLOPS et MFU
 from train.train_utils import estimate_mfu as utils_estimate_mfu

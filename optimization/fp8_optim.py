@@ -139,7 +139,15 @@ def check_fp8_support():
             return False
     except ImportError:
         print("❌ transformer-engine non installé")
-        return False
+        print("ℹ️  Vérification du support FP8 natif de PyTorch...")
+        
+        # Check if PyTorch has native FP8 support
+        if hasattr(torch, 'float8_e4m3fn'):
+            print("✓ PyTorch supporte nativement FP8 (float8_e4m3fn)")
+            return True
+        else:
+            print("❌ PyTorch ne supporte pas FP8 nativement")
+            return False
     except Exception as e:
         print(f"❌ Erreur lors de la vérification de transformer-engine: {e}")
         return False
