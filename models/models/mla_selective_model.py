@@ -1,9 +1,9 @@
 """
-MLA-Model: Un modèle sparse Mixture-of-Experts utilisant Multi-head Latent Attention.
+MLA-Selective Model: Un modèle utilisant Multi-head Latent Attention avec Selective Attention.
 
 Ce modèle combine:
 - Multi-head Latent Attention (MLA) pour une attention efficace en mémoire
-- Mixture-of-Experts (MoE) extrêmement sparse pour le scaling des paramètres
+- Selective Attention pour une sélection dynamique des tokens importants
 - RoPE (Rotary Positional Encoding) pour le positionnement
 - Support pour l'entraînement en FP8 (avec paramètres critiques en FP16)
 """
@@ -18,7 +18,7 @@ from typing import Optional, Dict, List, Tuple, Union, Any
 from dataclasses import dataclass
 
 # Import components from blocks
-from models.blocks.mla import MLA
+from models.blocks.mla_selective import MLASelective
 from models.blocks.mla_block import MLABlock
 from models.blocks.normalization import RMSNorm, DynamicTanh
 from models.blocks.positional_encoding import RoPE
@@ -29,8 +29,8 @@ from models.blocks.tensor_utils import isolate_tensor, prevent_backward_reuse
 from train.train_utils import estimate_mfu as utils_estimate_mfu
 
 @dataclass
-class MLAModelConfig:
-    """Configuration for MLA-Model."""
+class MLASelectiveModelConfig:
+    """Configuration for MLA-Selective Model."""
     # Architecture
     n_layer: int = 24
     n_embd: int = 2048
@@ -46,8 +46,10 @@ class MLAModelConfig:
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
     
-    # MoE parameters - kept but not used in dense model
-    use_moe: bool = False  # Set to False for dense model
+    # Selective attention parameters
+    selection_ratio: float = 0.5  # Ratio of tokens to select
+    selection_method: str = 'top_k'  # Method for token selection
+    selection_temperature: float = 1.0  # Temperature for Gumbel selection
     
     # Méthodes d'attention
     attention_backend: Optional[str] = None  # Si None, utilisera automatiquement le meilleur backend
@@ -110,11 +112,9 @@ class FP8Module(nn.Module):
             pass
         return super().to(device_or_dtype)
 
-# MoE removed - using only dense model
-
-class MLAModelBlock(nn.Module):
+class MLASelectiveModelBlock(nn.Module):
     """
-    MLA-Model block combining MLA attention and dense MLP feed-forward network.
+    MLA-Selective Model block combining MLA selective attention and dense MLP feed-forward network.
     """
     def __init__(self, config, layer_id):
         super().__init__()
@@ -129,8 +129,8 @@ class MLAModelBlock(nn.Module):
             self.norm1 = RMSNorm(config.n_embd)
             self.norm2 = RMSNorm(config.n_embd)
         
-        # Multi-head Latent Attention
-        self.attn = MLA(config)
+        # Multi-head Latent Attention with Selective Attention
+        self.attn = MLASelective(config)
         
         # Regular MLP (all layers are dense)
         self.ffn = MLP(config)
@@ -179,9 +179,9 @@ class MLAModelBlock(nn.Module):
         
         return x
 
-class MLAModel(nn.Module):
+class MLASelectiveModel(nn.Module):
     """
-    MLA-Model: Un modèle sparse Mixture-of-Experts utilisant Multi-head Latent Attention.
+    MLA-Selective Model: Un modèle utilisant Multi-head Latent Attention avec Selective Attention.
     """
     def __init__(self, config):
         super().__init__()
@@ -191,7 +191,7 @@ class MLAModel(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([MLAModelBlock(config, i) for i in range(config.n_layer)]),
+            h = nn.ModuleList([MLASelectiveModelBlock(config, i) for i in range(config.n_layer)]),
             ln_f = DynamicTanh(config.n_embd, alpha_init=config.dyt_alpha_init) if config.use_dyt else RMSNorm(config.n_embd)
         ))
         
@@ -427,7 +427,7 @@ class MLAModel(nn.Module):
             # Continue without failing if there's an issue
     
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens=None, temperature=1.0, top_k=None, prompt=None, gen_length=None):
+    def generate(self, idx=None, max_new_tokens=None, temperature=1.0, top_k=None, prompt=None, gen_length=None):
         """
         Generate text autoregressively.
         
@@ -533,7 +533,7 @@ class MLAModel(nn.Module):
             galore_config=galore_config
         )
         
-        print(f"Configured {optimizer_type} optimizer for MLA model")
+        print(f"Configured {optimizer_type} optimizer for MLA Selective model")
         return optimizer
 
 def precompute_freqs_cis(dim, max_seq_len, theta):
@@ -563,7 +563,7 @@ def precompute_freqs_cis_with_linear_scaling(dim, max_seq_len, theta, scaling_fa
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
 
-def create_mla_model(
+def create_mla_selective_model(
     size: str = 'small',
     n_layer: Optional[int] = None,
     n_embd: Optional[int] = None,
@@ -572,10 +572,13 @@ def create_mla_model(
     block_size: int = 4096,
     dropout: float = 0.0,
     fp8_params: bool = True,
+    selection_ratio: float = 0.5,
+    selection_method: str = 'top_k',
+    selection_temperature: float = 1.0,
     **kwargs
 ):
     """
-    Create an MLA-Model with predefined sizes.
+    Create an MLA-Selective Model with predefined sizes.
     
     Args:
         size: Model size ('small', 'medium', 'large', 'xl')
@@ -586,10 +589,13 @@ def create_mla_model(
         block_size: Maximum sequence length
         dropout: Dropout probability
         fp8_params: Whether to use FP8 precision for eligible parameters
+        selection_ratio: Ratio of tokens to select
+        selection_method: Method for token selection
+        selection_temperature: Temperature for Gumbel selection
         **kwargs: Additional configuration arguments
     
     Returns:
-        MLAModel: Configured model
+        MLASelectiveModel: Configured model
     """
     # Define model sizes
     sizes = {
@@ -635,14 +641,16 @@ def create_mla_model(
         'block_size': block_size,
         'dropout': dropout,
         'fp8_params': fp8_params,
-        'use_moe': False,  # Explicitly set to False for dense model
+        'selection_ratio': selection_ratio,
+        'selection_method': selection_method,
+        'selection_temperature': selection_temperature,
     })
     
     # Add any additional parameters
     config_dict.update(kwargs)
     
     # Create config and model
-    config = MLAModelConfig(**config_dict)
-    model = MLAModel(config)
+    config = MLASelectiveModelConfig(**config_dict)
+    model = MLASelectiveModel(config)
     
     return model

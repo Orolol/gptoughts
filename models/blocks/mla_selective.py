@@ -1,4 +1,4 @@
-"""Multi-Head Latent Attention (MLA) mechanisms for transformer models."""
+"""Multi-Head Latent Attention with Selective Attention mechanisms for transformer models."""
 
 import math
 import torch
@@ -7,33 +7,12 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 from .positional_encoding import RoPE
 
-
-try:
-    from flash_attn import flash_attn_func
-    FLASH_ATTENTION_AVAILABLE = True
-except ImportError:
-    FLASH_ATTENTION_AVAILABLE = False
-
-try:
-    import xformers.ops as xops
-    XFORMERS_AVAILABLE = True
-except ImportError:
-    XFORMERS_AVAILABLE = False
-
-# Attention backends available
-ATTENTION_BACKENDS = {
-    'flash_attn_2': FLASH_ATTENTION_AVAILABLE,
-    'xformers': XFORMERS_AVAILABLE,
-    'sdpa': hasattr(F, 'scaled_dot_product_attention'),
-    'standard': True
-}
-
-class MLA(nn.Module):
+class MLASelective(nn.Module):
     """
-    Multi-Head Latent Attention (MLA) Layer.
+    Multi-Head Latent Attention (MLA) Layer with Selective Attention.
     
-    MLA uses a low-rank projection for compressing the key-value representations,
-    reducing memory usage and computational complexity while maintaining model quality.
+    This implementation combines MLA's low-rank projections with selective attention
+    mechanism that dynamically selects which tokens to attend to based on importance scores.
     
     Attributes:
         dim (int): Dimensionality of the input features.
@@ -47,6 +26,8 @@ class MLA(nn.Module):
         v_head_dim (int): Dimensionality of value projections.
         softmax_scale (float): Scaling factor for softmax in attention computation.
         attention_backend (str): Backend used for attention computation.
+        selection_ratio (float): Ratio of tokens to select (0.0 to 1.0).
+        selection_method (str): Method for token selection ('top_k', 'threshold', 'gumbel').
     """
     def __init__(self, config):
         super().__init__()
@@ -67,6 +48,11 @@ class MLA(nn.Module):
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = getattr(config, 'v_head_dim', 128)
         
+        # Selective attention parameters
+        self.selection_ratio = getattr(config, 'selection_ratio', 0.5)
+        self.selection_method = getattr(config, 'selection_method', 'top_k')
+        self.temperature = getattr(config, 'selection_temperature', 1.0)
+        
         # Optional values from config
         self.dropout = getattr(config, 'dropout', 0.0)
         
@@ -85,6 +71,13 @@ class MLA(nn.Module):
         self.kv_norm = nn.LayerNorm(self.kv_lora_rank)
         self.wkv_b = nn.Linear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=config.bias if hasattr(config, 'bias') else False)
         
+        # Importance scoring network for selective attention
+        self.importance_score = nn.Sequential(
+            nn.Linear(self.dim, self.dim // 4),
+            nn.ReLU(),
+            nn.Linear(self.dim // 4, 1)
+        )
+        
         # Output projection
         self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.dim, bias=config.bias if hasattr(config, 'bias') else False)
         
@@ -102,14 +95,13 @@ class MLA(nn.Module):
                 mscale = getattr(config, 'mscale', 1.0)
                 mscale = 0.1 * mscale * math.log(rope_factor) + 1.0
                 self.softmax_scale = self.softmax_scale * mscale * mscale
-
         
         # Set up caching for inference
         self.max_batch_size = getattr(config, 'max_batch_size', 8)
         self.max_seq_len = getattr(config, 'max_seq_len', 4096)
         self.attn_impl = getattr(config, 'attn_impl', "absorb")
         
-                # Initialize RoPE before anything else
+        # Initialize RoPE before anything else
         self.rope = RoPE(self.qk_rope_head_dim, self.max_seq_len)
         
         # Only create caches for inference, not for training
@@ -159,18 +151,73 @@ class MLA(nn.Module):
             if hasattr(self, "pe_cache"):
                 delattr(self, "pe_cache")
         
-
-
         # No need to create caches here now that we have set_inference_mode
         # If this is an inference context, initialize the caches
         if not self.training:
             self.set_inference_mode(True)
     
-
+    def _compute_importance_scores(self, x):
+        """
+        Compute importance scores for each token.
+        
+        Args:
+            x: Input tensor of shape [batch_size, seq_len, dim]
+            
+        Returns:
+            scores: Importance scores of shape [batch_size, seq_len]
+        """
+        scores = self.importance_score(x).squeeze(-1)  # [batch_size, seq_len]
+        return scores
+    
+    def _select_tokens(self, scores, seq_len):
+        """
+        Select tokens based on importance scores.
+        
+        Args:
+            scores: Importance scores of shape [batch_size, seq_len]
+            seq_len: Sequence length
+            
+        Returns:
+            indices: Selected token indices
+            mask: Binary mask indicating selected tokens
+        """
+        batch_size = scores.shape[0]
+        
+        if self.selection_method == 'top_k':
+            # Select top-k tokens based on importance scores
+            k = max(1, int(seq_len * self.selection_ratio))
+            _, indices = torch.topk(scores, k, dim=1, sorted=True)
+            
+            # Create mask
+            mask = torch.zeros_like(scores, dtype=torch.bool)
+            mask.scatter_(1, indices, True)
+            
+        elif self.selection_method == 'threshold':
+            # Select tokens above a threshold
+            threshold = scores.quantile(1.0 - self.selection_ratio, dim=1, keepdim=True)
+            mask = scores >= threshold
+            indices = mask.nonzero(as_tuple=False)[:, 1].view(batch_size, -1)
+            
+        elif self.selection_method == 'gumbel':
+            # Use Gumbel-Softmax for differentiable selection
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(scores) + 1e-8) + 1e-8)
+            scores_with_noise = (scores + gumbel_noise) / self.temperature
+            
+            k = max(1, int(seq_len * self.selection_ratio))
+            _, indices = torch.topk(scores_with_noise, k, dim=1, sorted=True)
+            
+            # Create soft mask using Gumbel-Softmax
+            mask = F.gumbel_softmax(scores_with_noise, tau=self.temperature, hard=True, dim=1)
+            mask = mask > 0.5  # Convert to binary
+            
+        else:
+            raise ValueError(f"Unknown selection method: {self.selection_method}")
+            
+        return indices, mask
     
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: Optional[torch.Tensor] = None, mask: Optional[torch.Tensor] = None):
         """
-        Forward pass for the Multi-Head Latent Attention (MLA) Layer.
+        Forward pass for the Multi-Head Latent Attention (MLA) Layer with Selective Attention.
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
@@ -183,6 +230,12 @@ class MLA(nn.Module):
         """
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
+        
+        # Compute importance scores for selective attention
+        importance_scores = self._compute_importance_scores(x)
+        
+        # Select tokens based on importance
+        selected_indices, selection_mask = self._select_tokens(importance_scores, seqlen)
         
         # Apply query projections (either direct or low-rank)
         if self.q_lora_rank == 0:
@@ -245,22 +298,33 @@ class MLA(nn.Module):
                 k_to_use = k
                 v_to_use = v
             
-            # Reshape for SDPA: [B, H, S, D]
+            # Prepare tensors for SDPA
             q_sdpa = q.transpose(1, 2)  # [B, H, S, D]
             k_sdpa = k_to_use.transpose(1, 2)  # [B, H, T, D]
             v_sdpa = v_to_use.transpose(1, 2)  # [B, H, T, D]
             
-            # Use SDPA for attention computation
-            # Expand mask if provided from [S, T] to [B, H, S, T]
+            # Create attention mask combining selection mask and causal mask
             attn_mask = None
-            if mask is not None:
-                attn_mask = mask.unsqueeze(0).unsqueeze(0).expand(bsz, self.n_heads, -1, -1)
+            if mask is not None or not selection_mask.all():
+                # Initialize attention mask
+                attn_mask = torch.zeros(bsz, self.n_heads, seqlen, k_sdpa.size(2), device=x.device, dtype=x.dtype)
+                
+                # Apply selection mask (mask out non-selected tokens)
+                selection_mask_expanded = selection_mask.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, T]
+                attn_mask.masked_fill_(~selection_mask_expanded, float('-inf'))
+                
+                # Apply causal mask if provided
+                if mask is not None:
+                    # Expand mask from [S, T] to [B, H, S, T]
+                    causal_mask_expanded = mask.unsqueeze(0).unsqueeze(0).expand(bsz, self.n_heads, -1, -1)
+                    attn_mask += causal_mask_expanded
             
+            # Use SDPA for attention computation
             attn_output = F.scaled_dot_product_attention(
                 q_sdpa, k_sdpa, v_sdpa,
                 attn_mask=attn_mask,
                 dropout_p=self.dropout if self.training else 0.0,
-                is_causal=mask is None and seqlen > 1,  # Use causal mask if no explicit mask provided
+                is_causal=False,  # We handle causality in attn_mask
                 scale=self.softmax_scale
             )
             
@@ -293,8 +357,8 @@ class MLA(nn.Module):
             # First, extract values from the low-rank representation
             v = torch.einsum("btc,hdc->bthd", kv_to_use, wkv_b[:, -self.v_head_dim:])
             
-            # Reshape queries for SDPA - keep q_nope and q_pe in their original dimensions
-            q_full = torch.cat([q_nope, q_pe], dim=-1)  # Combine q components [B, S, H, D]
+            # Reshape queries for SDPA
+            q_full = torch.cat([q_nope, q_pe], dim=-1)  # Combine q components
             q_sdpa = q_full.transpose(1, 2)  # [B, H, S, D]
             
             # For keys, we need to reconstruct from low-rank space
@@ -303,17 +367,28 @@ class MLA(nn.Module):
             k_sdpa = k_full.transpose(1, 2)  # [B, H, T, D]
             v_sdpa = v.transpose(1, 2)  # [B, H, T, D]
             
-            # Use SDPA for attention computation
-            # Expand mask if provided from [S, T] to [B, H, S, T]
+            # Create attention mask combining selection mask and causal mask
             attn_mask = None
-            if mask is not None:
-                attn_mask = mask.unsqueeze(0).unsqueeze(0).expand(bsz, self.n_heads, -1, -1)
+            if mask is not None or not selection_mask.all():
+                # Initialize attention mask
+                attn_mask = torch.zeros(bsz, self.n_heads, seqlen, k_sdpa.size(2), device=x.device, dtype=x.dtype)
+                
+                # Apply selection mask (mask out non-selected tokens)
+                selection_mask_expanded = selection_mask.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, T]
+                attn_mask.masked_fill_(~selection_mask_expanded, float('-inf'))
+                
+                # Apply causal mask if provided
+                if mask is not None:
+                    # Expand mask from [S, T] to [B, H, S, T]
+                    causal_mask_expanded = mask.unsqueeze(0).unsqueeze(0).expand(bsz, self.n_heads, -1, -1)
+                    attn_mask += causal_mask_expanded
             
+            # Use SDPA for attention computation
             attn_output = F.scaled_dot_product_attention(
                 q_sdpa, k_sdpa, v_sdpa,
                 attn_mask=attn_mask,
                 dropout_p=self.dropout if self.training else 0.0,
-                is_causal=mask is None and seqlen > 1,
+                is_causal=False,  # We handle causality in attn_mask
                 scale=self.softmax_scale
             )
             

@@ -15,6 +15,12 @@ try:
 except ImportError:
     APOLLO_AVAILABLE = False
 
+try:
+    from galore_torch import GaLoreAdamW, GaLoreAdamW8bit
+    GALORE_AVAILABLE = True
+except ImportError:
+    GALORE_AVAILABLE = False
+
 def get_grouped_params(
     model: torch.nn.Module,
     weight_decay: float,
@@ -113,7 +119,8 @@ def configure_optimizer_for_gpt(
     betas: Tuple[float, float],
     device_type: str,
     optimizer_type: str = "adamw",
-    apollo_config: Optional[Dict[str, Any]] = None
+    apollo_config: Optional[Dict[str, Any]] = None,
+    galore_config: Optional[Dict[str, Any]] = None
 ) -> torch.optim.Optimizer:
     """
     Configure optimizer for GPT-style models.
@@ -130,10 +137,28 @@ def configure_optimizer_for_gpt(
     Returns:
         Configured optimizer
     """
+    # Check if GaLore is requested but not available
+    if optimizer_type in ["galore", "galore-8bit"] and not GALORE_AVAILABLE:
+        print(f"Warning: {optimizer_type} requested but not available. Falling back to AdamW.")
+        optimizer_type = "adamw"
+    
     # Check if APOLLO is requested but not available
     if optimizer_type in ["apollo", "apollo-mini"] and not APOLLO_AVAILABLE:
         print(f"Warning: {optimizer_type} requested but not available. Falling back to AdamW.")
         optimizer_type = "adamw"
+    
+    # Use GaLore if requested and available
+    if optimizer_type in ["galore", "galore-8bit"] and GALORE_AVAILABLE:
+        use_8bit = optimizer_type == "galore-8bit"
+        return configure_optimizer_with_galore(
+            model=model,
+            weight_decay=weight_decay,
+            learning_rate=learning_rate,
+            betas=betas,
+            device_type=device_type,
+            galore_config=galore_config,
+            use_8bit=use_8bit
+        )
     
     # Use APOLLO if requested and available
     if optimizer_type in ["apollo", "apollo-mini"] and APOLLO_AVAILABLE:
@@ -632,5 +657,117 @@ def configure_optimizer_with_apollo(
         print(f"Using MultiOptimizer with {len(optimizers)} sub-optimizers")
     
     print(f"Using APOLLO optimizer ({config['mode']} mode) with rank={config['rank']}, scale={config['scale']}")
+    
+    return optimizer
+
+def configure_optimizer_with_galore(
+    model: torch.nn.Module,
+    weight_decay: float,
+    learning_rate: float,
+    betas: Tuple[float, float],
+    device_type: str,
+    galore_config: Dict[str, Any] = None,
+    use_8bit: bool = False
+) -> torch.optim.Optimizer:
+    """
+    Configure optimizer using GaLore (Gradient Low-Rank Projection).
+    
+    Args:
+        model: The model to optimize
+        weight_decay: Weight decay coefficient
+        learning_rate: Learning rate
+        betas: Adam beta parameters
+        device_type: Device type ('cuda' or 'cpu')
+        galore_config: Configuration for GaLore optimizer
+            - rank: Low-rank dimension (default: 128)
+            - update_proj_gap: How often to update projection matrices (default: 200)
+            - scale: Scaling factor (default: 0.25)
+            - proj_type: Projection type (default: 'std')
+        use_8bit: Whether to use 8-bit GaLore (more memory efficient)
+            
+    Returns:
+        Configured GaLore optimizer
+    """
+    if not GALORE_AVAILABLE:
+        raise ImportError(
+            "GaLore optimizer is not available. Install it with: pip install galore-torch"
+        )
+    
+    # Set default GaLore configuration
+    default_config = {
+        "rank": 128,
+        "update_proj_gap": 200,
+        "scale": 0.25,
+        "proj_type": "std"
+    }
+    
+    # Update with user-provided config
+    config = default_config.copy()
+    if galore_config:
+        config.update(galore_config)
+    
+    # Group parameters - separate GaLore and non-GaLore params
+    params_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
+    
+    # Identify which parameters should use GaLore
+    # GaLore is most effective on large weight matrices (linear layers)
+    galore_params = []
+    non_galore_params = []
+    
+    for param_name, param in params_dict.items():
+        # Apply GaLore to weight matrices with at least 2 dimensions
+        # Skip biases, normalization layers, and embeddings
+        if (len(param.shape) >= 2 and 
+            'bias' not in param_name and 
+            'norm' not in param_name and
+            'ln' not in param_name and
+            'embed' not in param_name):
+            galore_params.append(param)
+        else:
+            non_galore_params.append(param)
+    
+    # Create parameter groups
+    param_groups = []
+    
+    # Non-GaLore parameters
+    if non_galore_params:
+        param_groups.append({
+            'params': non_galore_params,
+            'weight_decay': weight_decay,
+            'lr': learning_rate
+        })
+    
+    # GaLore parameters with projection config
+    if galore_params:
+        param_groups.append({
+            'params': galore_params,
+            'weight_decay': weight_decay,
+            'lr': learning_rate,
+            'rank': config['rank'],
+            'update_proj_gap': config['update_proj_gap'],
+            'scale': config['scale'],
+            'proj_type': config['proj_type']
+        })
+    
+    # Create optimizer
+    if use_8bit and device_type == 'cuda':
+        optimizer = GaLoreAdamW8bit(
+            param_groups,
+            lr=learning_rate,
+            betas=betas
+        )
+        print(f"Using 8-bit GaLore optimizer with rank={config['rank']}, "
+              f"update_proj_gap={config['update_proj_gap']}, scale={config['scale']}")
+    else:
+        optimizer = GaLoreAdamW(
+            param_groups,
+            lr=learning_rate,
+            betas=betas
+        )
+        print(f"Using GaLore optimizer with rank={config['rank']}, "
+              f"update_proj_gap={config['update_proj_gap']}, scale={config['scale']}")
+    
+    print(f"GaLore applied to {len(galore_params)} parameters, "
+          f"standard AdamW for {len(non_galore_params)} parameters")
     
     return optimizer

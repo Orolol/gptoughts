@@ -18,6 +18,8 @@ class GPTConfig:
     label_smoothing: float = 0.1  # Label smoothing factor
     attention_backend: Optional[str] = None  # Force specific attention backend (flash_attn_2, xformers, sdpa, or None for auto)
     use_gradient_checkpointing: bool = False  # Whether to use gradient checkpointing to save memory
+    use_dyt: bool = False  # Whether to use Dynamic Tanh (DyT) instead of RMSNorm
+    dyt_alpha_init: float = 0.5  # Initial value for DyT alpha parameter
 
 @dataclass
 class LLaDAConfig:
@@ -37,6 +39,8 @@ class LLaDAConfig:
     temperature: float = 0.0  # Temperature for sampling during generation
     remasking: str = 'low_confidence'  # Remasking strategy: 'low_confidence' or 'random'
     use_checkpoint: bool = False  # Whether to use gradient checkpointing
+    use_dyt: bool = False  # Whether to use Dynamic Tanh (DyT) instead of RMSNorm
+    dyt_alpha_init: float = 0.5  # Initial value for DyT alpha parameter
 
 @dataclass
 class ModelArgs:
@@ -103,4 +107,7 @@ class ModelArgs:
     rope_factor: float = 40
     beta_fast: int = 32
     beta_slow: int = 1
-    mscale: float = 1. 
+    mscale: float = 1.
+    # Dynamic Tanh (DyT) options
+    use_dyt: bool = False  # Whether to use Dynamic Tanh (DyT) instead of RMSNorm
+    dyt_alpha_init: float = 0.5  # Initial value for DyT alpha parameter 
