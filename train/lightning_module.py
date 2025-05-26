@@ -3,8 +3,6 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, IterableDataset
-from torch.amp import GradScaler
 import os
 import time
 import traceback
@@ -12,11 +10,11 @@ import random
 
 # Import necessary components from your project
 from models.deepseek.deepseek_adapter_mtp import DeepSeekMiniMTP, DeepSeekMiniConfigMTP
-from models.llada.model import LLaDAModel, LLaDAConfig
-from models.models.model import GPT, GPTConfig
-from models.models.mla_model import MLAModel, MLAModelConfig, create_mla_model
+from models.llada.model import LLaDAModel
+from models.models.model import GPT
+from models.models.mla_model import MLAModel, MLAModelConfig
 from models.models.parscale_mla import ParScaleMLA, ParScaleMLAConfig, create_parscale_mla
-from models.models.mla_selective_model import MLASelectiveModel, MLASelectiveModelConfig, create_mla_selective_model
+from models.models.mla_selective_model import MLASelectiveModel, MLASelectiveModelConfig
 from train.train_utils import (
     get_lr, calculate_perplexity, ensure_model_dtype,
     AveragedTimingStats, generate_text, estimate_loss
