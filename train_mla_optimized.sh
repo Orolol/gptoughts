@@ -27,13 +27,15 @@ python run_train.py \
     --preallocate_memory \
     --grad_clip 1.0 \
     --learning_rate 5e-5 \
+    --optimizer_type lion \
     --weight_decay 0.1 \
     --warmup_iters 200 \
     --max_iters 10000000 \
     --eval_interval_steps 1000 \
     --log_interval_steps 10 \
     --gradient_accumulation_steps 1 \
-    --use_fp8 \
+    --use_dyt \
+    --use_fp8
 
 
 # Note: To disable gradient checkpointing, you would need to modify the model config
