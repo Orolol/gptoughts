@@ -35,7 +35,8 @@ python run_train.py \
     --log_interval_steps 10 \
     --gradient_accumulation_steps 1 \
     --use_dyt \
-    --use_fp8
+    --use_fp8 \
+    --compile
 
 
 # Note: To disable gradient checkpointing, you would need to modify the model config

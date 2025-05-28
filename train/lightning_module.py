@@ -7,6 +7,8 @@ import os
 import time
 import traceback
 import random
+import csv
+from datetime import datetime
 
 # Import necessary components from your project
 from models.deepseek.deepseek_adapter_mtp import DeepSeekMiniMTP, DeepSeekMiniConfigMTP
@@ -19,12 +21,9 @@ from train.train_utils import (
     get_lr, calculate_perplexity, ensure_model_dtype,
     AveragedTimingStats, generate_text, estimate_loss
 )
-from optimization.memory_optim import cleanup_memory, print_memory_stats
-from optimization.cuda_optim import setup_cuda_optimizations, print_gpu_stats
-
-
-from optimization.cuda_optim import setup_cuda_optimizations, print_gpu_stats
 from optimization.memory_optim import cleanup_memory, print_memory_stats, preallocate_cuda_memory
+from optimization.cuda_optim import setup_cuda_optimizations, print_gpu_stats
+from optimization.training_optim import enable_torch_compile
 
 
 class LLMLightningModule(pl.LightningModule):
@@ -41,6 +40,15 @@ class LLMLightningModule(pl.LightningModule):
         self.tokens_window = []
         self.window_size = 10
         self.running_mfu = -1.0
+        
+        # CSV logging attributes
+        self.metrics_buffer = []  # Store all metrics for each step
+        self.csv_file_path = None
+        self.csv_writer = None
+        self.csv_file = None
+        # Keep track of last validation metrics
+        self.last_val_loss = None
+        self.last_val_perplexity = None
 
         # Apply CUDA optimizations if available and requested
         if torch.cuda.is_available():
@@ -49,6 +57,29 @@ class LLMLightningModule(pl.LightningModule):
                 preallocate_cuda_memory()
             if self.global_rank == 0:
                  print_gpu_stats()
+        
+        # Compile model if requested
+        if hasattr(self.args, 'compile') and self.args.compile:
+            # For MLA-selective model, disable gradient checkpointing before compilation
+            if self.args.model_type.lower() == 'mla_selective':
+                print("Disabling gradient checkpointing for MLA-selective model compilation...")
+                for module in self.model.modules():
+                    if hasattr(module, 'use_checkpoint'):
+                        module.use_checkpoint = False
+            
+            print("Compiling model with torch.compile...")
+            try:
+                # Use reduce-overhead mode for models with complex attention patterns
+                compile_mode = 'max-autotune'
+                self.model = enable_torch_compile(
+                    self.model,
+                    mode=compile_mode,
+                    backend='inductor'
+                )
+                print(f"Model compilation successful with mode: {compile_mode}!")
+            except Exception as e:
+                print(f"Model compilation failed: {e}")
+                print("Continuing without compilation...")
 
         # Print model size
         param_count = sum(p.numel() for p in self.model.parameters()) / 1e6
@@ -62,6 +93,9 @@ class LLMLightningModule(pl.LightningModule):
             print(f"Base model parameters frozen: {(param_count - trainable_count):.2f}M params")
             
         print_memory_stats("After Model Init")
+        
+        # Initialize CSV logging
+        self._init_csv_logging()
 
     def _build_model(self):
         """Initializes the model based on configuration."""
@@ -231,12 +265,9 @@ class LLMLightningModule(pl.LightningModule):
             dropout=base_config.dropout,
             bias=base_config.bias,
             attention_backend=base_config.attention_backend,
+            # Disable gradient checkpointing if using torch.compile
             use_gradient_checkpointing=base_config.use_gradient_checkpointing,
-            
-            # Add selective attention specific parameters
-            selection_ratio=getattr(self.args, 'selection_ratio', 0.5),
-            selection_method=getattr(self.args, 'selection_method', 'top_k'),
-            selection_temperature=getattr(self.args, 'selection_temperature', 1.0),
+
         )
         
         return config
@@ -510,18 +541,20 @@ class LLMLightningModule(pl.LightningModule):
         # --- Logging ---
         dt = time.time() - t0
         # Use float() to ensure no gradient tracking during logging
-        self.log('train/loss', float(loss.item()), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
+        loss_value = float(loss.item())
+        self.log('train/loss', loss_value, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
         
         # Calculate gradient norms for monitoring
-        if self.global_step % 100 == 0:  # Log grad norms less frequently
+        grad_norm = 0.0
+        if self.global_step % 10 == 0:  # Calculate grad norm every 10 steps
             with torch.no_grad():
                 total_norm = 0.0
                 for p in self.model.parameters():
                     if p.grad is not None:
                         param_norm = p.grad.data.norm(2)
                         total_norm += param_norm.item() ** 2
-                total_norm = total_norm ** 0.5
-                self.log('train/grad_norm', total_norm, on_step=True, on_epoch=False, sync_dist=True)
+                grad_norm = total_norm ** 0.5
+                self.log('train/grad_norm', grad_norm, on_step=True, on_epoch=False, sync_dist=True)
         # Use float() for all tensor logging
         with torch.no_grad():
             self.log('train/combined_loss', float(combined_loss.item()), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
@@ -548,6 +581,36 @@ class LLMLightningModule(pl.LightningModule):
         self.log('tokens_per_sec_step', current_tokens_per_sec, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False) # Log local Tps
         self.log('tokens_per_sec_avg', avg_tokens_per_sec, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
         self.log('total_tokens', float(self.total_tokens), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True) # Log as float for logger compatibility
+        
+        # Store metrics in buffer for CSV logging
+        lr = self.trainer.optimizers[0].param_groups[0]['lr']
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Get validation metrics from callback metrics (if available)
+        # Update last known values if new ones are available
+        current_val_loss = self.trainer.callback_metrics.get('val/loss', None)
+        current_val_perplexity = self.trainer.callback_metrics.get('val/perplexity', None)
+        
+        if current_val_loss is not None:
+            self.last_val_loss = current_val_loss
+        if current_val_perplexity is not None:
+            self.last_val_perplexity = current_val_perplexity
+        
+        # Use the last known values for logging
+        val_loss = self.last_val_loss
+        val_perplexity = self.last_val_perplexity
+        
+        self.metrics_buffer.append([
+            self.global_step,
+            f"{loss_value:.6f}",
+            f"{val_loss:.6f}" if val_loss is not None else "N/A",
+            f"{val_perplexity:.6f}" if val_perplexity is not None else "N/A",
+            f"{lr:.2e}",
+            f"{current_tokens_per_sec:.2f}",
+            f"{self.total_tokens}",
+            f"{grad_norm:.4f}" if grad_norm > 0 else "N/A",
+            timestamp
+        ])
 
         # MFU calculation (optional, requires estimate_mfu method on model)
         if hasattr(self.model, 'estimate_mfu') and self.trainer.global_step >= 5:
@@ -572,6 +635,9 @@ class LLMLightningModule(pl.LightningModule):
                 self.log('parscale/input_similarity', diversity_stats['input_similarity'], on_step=True, on_epoch=False, sync_dist=True)
                 self.log('parscale/layer_similarity', diversity_stats['layer_similarity'], on_step=True, on_epoch=False, sync_dist=True)
                 self.log('parscale/effective_streams', diversity_stats['effective_streams'], on_step=True, on_epoch=False, sync_dist=True)
+            
+            # Log metrics to CSV every 100 steps
+            self._log_metrics_to_csv()
             
             # cleanup_memory()
         
@@ -798,6 +864,81 @@ class LLMLightningModule(pl.LightningModule):
         # Often, targets are shifted inside the model's forward pass or loss calculation
         # Return them as they are from the dataloader for flexibility.
         return input_ids, targets
+    
+    def _init_csv_logging(self):
+        """Initialize CSV logging with a unique filename."""
+        # Build filename from model parameters
+        model_type = self.args.model_type
+        size = self.args.size
+        batch_size = self.args.batch_size
+        block_size = self.args.block_size
+        
+        # Add precision info
+        precision = "fp32"
+        if hasattr(self.args, 'use_fp8') and self.args.use_fp8:
+            precision = "fp8"
+        elif hasattr(self.args, 'dtype'):
+            if 'bfloat16' in str(self.args.dtype):
+                precision = "bf16"
+            elif 'float16' in str(self.args.dtype):
+                precision = "fp16"
+        
+        # Add compile info
+        compile_str = "compile" if hasattr(self.args, 'compile') and self.args.compile else "no-compile"
+        
+        # Add optimizer info
+        optimizer_str = getattr(self.args, 'optimizer_type', 'adamw')
+        
+        # Add dataset info if available
+        dataset_str = getattr(self.args, 'dataset', 'apollo-mini')
+        
+        # Create base filename
+        base_filename = f"{model_type}_{size}_{batch_size}_{block_size}_{precision}_{compile_str}_{optimizer_str}_{dataset_str}"
+        
+        # Create directory for logs if it doesn't exist
+        log_dir = os.path.join(getattr(self.args, 'out_dir', 'out'), 'metrics_logs')
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Find a unique filename by adding timestamp and/or counter
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_filename = f"{base_filename}_{timestamp}.csv"
+        self.csv_file_path = os.path.join(log_dir, csv_filename)
+        
+        # If file exists, add a counter
+        counter = 1
+        while os.path.exists(self.csv_file_path):
+            csv_filename = f"{base_filename}_{timestamp}_{counter}.csv"
+            self.csv_file_path = os.path.join(log_dir, csv_filename)
+            counter += 1
+        
+        # Open CSV file and write headers
+        self.csv_file = open(self.csv_file_path, 'w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow(['step', 'train_loss', 'val_loss', 'val_perplexity', 'learning_rate', 'tokens_per_sec', 'total_tokens', 'grad_norm', 'timestamp'])
+        self.csv_file.flush()
+        
+        print(f"CSV metrics logging initialized: {self.csv_file_path}")
+    
+    def _log_metrics_to_csv(self):
+        """Write buffered metrics to CSV file every 100 steps."""
+        if self.global_step % 100 != 0 or not self.csv_writer or not self.metrics_buffer:
+            return
+            
+        # Count rows before clearing
+        num_rows = len(self.metrics_buffer)
+        
+        # Write all buffered rows to CSV
+        for row in self.metrics_buffer:
+            self.csv_writer.writerow(row)
+        
+        # Flush to disk
+        self.csv_file.flush()
+        
+        # Clear buffer for next window
+        self.metrics_buffer = []
+        
+        if self.global_rank == 0:
+            print(f"Written {num_rows} rows to CSV (up to step {self.global_step})")
 
     # Optional: Add hooks for setup, cleanup, etc. if needed
     def setup(self, stage=None):
@@ -815,6 +956,12 @@ class LLMLightningModule(pl.LightningModule):
          if stage == 'fit' or stage is None:
              # Code to run after training finishes
              cleanup_memory()
+             
+             # Close CSV file
+             if self.csv_file:
+                 self.csv_file.close()
+                 print(f"CSV logging closed: {self.csv_file_path}")
+             
              if self.global_rank == 0:
                  print("Training finished. Final memory stats:")
                  print_memory_stats("Teardown")

@@ -189,33 +189,41 @@ def configure_optimizer_for_gpt(
     
     # Use Lion if requested
     if optimizer_type == "lion" and device_type == 'cuda':
-        try:
-            # First try to use torch_optimizer's Lion
-            if TORCH_OPTIMIZER_AVAILABLE and hasattr(extra_optim, 'Lion'):
+        lion_available = False
+        lion_source = None
+        
+        # Check for torch_optimizer's Lion
+        if TORCH_OPTIMIZER_AVAILABLE and hasattr(extra_optim, 'Lion'):
+            lion_available = True
+            lion_source = "torch_optimizer"
+        else:
+            # Check for lion-pytorch
+            try:
+                from lion_pytorch import Lion
+                lion_available = True
+                lion_source = "lion-pytorch"
+            except ImportError:
+                pass
+        
+        if lion_available:
+            if lion_source == "torch_optimizer":
                 optimizer = extra_optim.Lion(
                     optimizer_groups,
                     lr=learning_rate,
                     betas=betas
                 )
                 print("Using Lion optimizer from torch_optimizer for GPT model")
-                return optimizer
-            # Then try lion-pytorch
-            else:
-                try:
-                    from lion_pytorch import Lion
-                    optimizer = Lion(
-                        optimizer_groups,
-                        lr=learning_rate,
-                        betas=betas
-                    )
-                    print("Using Lion optimizer from lion-pytorch for GPT model")
-                    return optimizer
-                except ImportError:
-                    # Fall back to AdamW
-                    raise ImportError("Lion optimizer requested but not available")
-        except ImportError:
+            else:  # lion-pytorch
+                optimizer = Lion(
+                    optimizer_groups,
+                    lr=learning_rate,
+                    betas=betas
+                )
+                print("Using Lion optimizer from lion-pytorch for GPT model")
+            return optimizer
+        else:
             print("Lion optimizer requested but not available. Falling back to AdamW.")
-            optimizer_type = "adamw"  # Fall back to AdamW
+            optimizer_type = "adamw"
     
     # Default to AdamW
     # Create optimizer based on device type
@@ -308,29 +316,38 @@ def configure_optimizer_for_moe(
     # Choose optimizer based on device type and availability
     if device_type == 'cuda':
         if optimizer_type == "lion":
-            try:
-                # First try to use torch_optimizer's Lion
-                if TORCH_OPTIMIZER_AVAILABLE and hasattr(extra_optim, 'Lion'):
+            lion_available = False
+            lion_source = None
+            
+            # Check for torch_optimizer's Lion
+            if TORCH_OPTIMIZER_AVAILABLE and hasattr(extra_optim, 'Lion'):
+                lion_available = True
+                lion_source = "torch_optimizer"
+            else:
+                # Check for lion-pytorch
+                try:
+                    from lion_pytorch import Lion
+                    lion_available = True
+                    lion_source = "lion-pytorch"
+                except ImportError:
+                    pass
+            
+            if lion_available:
+                if lion_source == "torch_optimizer":
                     optimizer = extra_optim.Lion(
                         optimizer_groups,
                         lr=learning_rate,
                         betas=betas
                     )
                     print("Using Lion optimizer from torch_optimizer for MoE model")
-                # Then try lion-pytorch
-                else:
-                    try:
-                        from lion_pytorch import Lion
-                        optimizer = Lion(
-                            optimizer_groups,
-                            lr=learning_rate,
-                            betas=betas
-                        )
-                        print("Using Lion optimizer from lion-pytorch for MoE model")
-                    except ImportError:
-                        # Fall back to AdamW
-                        raise ImportError("Lion optimizer requested but not available")
-            except ImportError:
+                else:  # lion-pytorch
+                    optimizer = Lion(
+                        optimizer_groups,
+                        lr=learning_rate,
+                        betas=betas
+                    )
+                    print("Using Lion optimizer from lion-pytorch for MoE model")
+            else:
                 print("Lion optimizer requested but not available. Falling back to AdamW.")
                 optimizer = torch.optim.AdamW(
                     optimizer_groups,
@@ -433,49 +450,29 @@ def configure_optimizer_for_llada(
     # Choose optimizer based on device type and availability
     if device_type == 'cuda':
         if optimizer_type == "lion":
+            # Note: Lion optimizer can cause double backward issues with LLaDA models
+            # Always fall back to AdamW for stability
+            print("Lion optimizer may cause double backward issues with LLaDA. Using AdamW instead.")
+            optimizer_type = "adamw"
+        
+        if optimizer_type == "adamw":
+            # Try 8-bit AdamW first for memory efficiency
             try:
-                # First try to use torch_optimizer's Lion
-                if TORCH_OPTIMIZER_AVAILABLE and hasattr(extra_optim, 'Lion'):
-                    optimizer = extra_optim.Lion(
-                        optimizer_groups,
-                        lr=learning_rate,
-                        betas=betas,
-                        weight_decay=0.0  # We apply weight decay in param groups
-                    )
-                    print("Using Lion optimizer from torch_optimizer for LLaDA model")
-                # Then try lion-pytorch
-                else:
-                    try:
-                        from lion_pytorch import Lion
-                        # Use AdamW instead of Lion to avoid double backward issues
-                        optimizer = torch.optim.AdamW(
-                            optimizer_groups,
-                            lr=learning_rate,
-                            betas=betas
-                        )
-                        print("Using AdamW optimizer for LLaDA model (Lion causes double backward)")
-                    except ImportError:
-                        # Fall back to AdamW
-                        raise ImportError("Lion optimizer requested but not available")
+                import bitsandbytes as bnb
+                optimizer = bnb.optim.AdamW8bit(
+                    optimizer_groups,
+                    lr=learning_rate,
+                    betas=betas
+                )
+                print("Using 8-bit AdamW for LLaDA model")
             except ImportError:
-                print("Lion optimizer requested but not available. Falling back to AdamW.")
-                # Fall back to AdamW
-                try:
-                    import bitsandbytes as bnb
-                    optimizer = bnb.optim.AdamW8bit(
-                        optimizer_groups,
-                        lr=learning_rate,
-                        betas=betas
-                    )
-                    print("Using 8-bit AdamW for LLaDA model")
-                except ImportError:
-                    optimizer = torch.optim.AdamW(
-                        optimizer_groups,
-                        lr=learning_rate,
-                        betas=betas,
-                        fused=True
-                    )
-                    print("Using AdamW for LLaDA model")
+                optimizer = torch.optim.AdamW(
+                    optimizer_groups,
+                    lr=learning_rate,
+                    betas=betas,
+                    fused=True
+                )
+                print("Using AdamW for LLaDA model")
         else:
             # AdamW with 8-bit precision if available
             try:

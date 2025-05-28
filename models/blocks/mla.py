@@ -7,27 +7,6 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 from .positional_encoding import RoPE
 
-
-try:
-    from flash_attn import flash_attn_func
-    FLASH_ATTENTION_AVAILABLE = True
-except ImportError:
-    FLASH_ATTENTION_AVAILABLE = False
-
-try:
-    import xformers.ops as xops
-    XFORMERS_AVAILABLE = True
-except ImportError:
-    XFORMERS_AVAILABLE = False
-
-# Attention backends available
-ATTENTION_BACKENDS = {
-    'flash_attn_2': FLASH_ATTENTION_AVAILABLE,
-    'xformers': XFORMERS_AVAILABLE,
-    'sdpa': hasattr(F, 'scaled_dot_product_attention'),
-    'standard': True
-}
-
 class MLA(nn.Module):
     """
     Multi-Head Latent Attention (MLA) Layer.
@@ -299,7 +278,10 @@ class MLA(nn.Module):
             
             # For keys, we need to reconstruct from low-rank space
             k_nope_full = torch.einsum("btc,hdc->bthd", kv_to_use, wkv_b[:, :self.qk_nope_head_dim])
-            k_full = torch.cat([k_nope_full, pe_to_use.unsqueeze(2).expand(-1, -1, self.n_heads, -1)], dim=-1)
+            # Properly expand pe_to_use from [B, T, D] to [B, T, H, D] where each head gets the same RoPE
+            # This ensures consistent rotary positional encoding across all attention heads
+            pe_expanded = pe_to_use.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
+            k_full = torch.cat([k_nope_full, pe_expanded], dim=-1)
             k_sdpa = k_full.transpose(1, 2)  # [B, H, T, D]
             v_sdpa = v.transpose(1, 2)  # [B, H, T, D]
             

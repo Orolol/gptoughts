@@ -80,37 +80,8 @@ class MLAModelConfig:
         if self.n_inner is None:
             self.n_inner = 4 * self.n_embd
 
-class FP8Module(nn.Module):
-    """Module wrapper that manages FP8 precision for specific parameters."""
-    def __init__(self, module, exclude_patterns=None):
-        super().__init__()
-        self.module = module
-        self.exclude_patterns = exclude_patterns or []
-        
-        # Convert eligible parameters to FP8
-        self._convert_params_to_fp8()
-    
-    def _convert_params_to_fp8(self):
-        for name, param in self.module.named_parameters():
-            should_exclude = any(pattern in name for pattern in self.exclude_patterns)
-            
-            if not should_exclude and hasattr(torch, 'float8_e4m3fn'):
-                # Convert to FP8 precision if supported
-                param.data = param.data.to(torch.float8_e4m3fn)
-                print(f"Converted {name} to FP8 precision")
-    
-    def forward(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
-    
-    def to(self, device_or_dtype):
-        # Special handling for converting to device or dtype
-        if isinstance(device_or_dtype, torch.dtype):
-            # Don't change dtype of FP8 parameters
-            # This is a no-op for FP8 parameters
-            pass
-        return super().to(device_or_dtype)
-
-# MoE removed - using only dense model
+# FP8Module removed - FP8 will only be used during computation, not for parameter storage
+# This ensures compatibility with standard optimizers like Adam/AdamW
 
 class MLAModelBlock(nn.Module):
     """
@@ -234,13 +205,17 @@ class MLAModel(nn.Module):
         # Initialize weights
         self.apply(self._init_weights)
         
-        # Note: FP8 parameter storage is not compatible with optimizers like Adam
-        # Instead, FP8 should be used only during forward pass computations
-        # We'll rely on mixed precision training (fp16/bf16) for memory savings
+        # FP8 configuration handling
         if config.fp8_params:
-            print("Warning: FP8 parameter storage is not compatible with most optimizers.")
-            print("Using BFloat16 mixed precision training instead for memory efficiency.")
-            print("FP8 can be used in forward pass computations with transformer_engine if available.")
+            print("Note: FP8 parameter storage requested but is not compatible with most optimizers.")
+            print("FP8 will be used only during forward pass computations if transformer_engine is available.")
+            print("Model parameters will remain in BFloat16/Float32 for optimizer compatibility.")
+            # Set flag to use FP8 in forward pass but not for parameter storage
+            self.use_fp8_compute = True
+            # Disable fp8_params to prevent parameter conversion
+            config.fp8_params = False
+        else:
+            self.use_fp8_compute = False
         
         # Parameter count
         self.param_count = sum(p.numel() for p in self.parameters())

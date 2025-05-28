@@ -1063,7 +1063,16 @@ def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8, top_
                 # output_text_from_generate remains None here as generate_original_llada doesn't return decoded text
             else:
                 # Check which parameters the model's generate method accepts
-                if model.__class__.__name__ == 'MLAModel':
+                # Handle OptimizedModule wrapper from torch.compile
+                model_class_name = model.__class__.__name__
+                if hasattr(model, '_orig_mod'):
+                    # This is a compiled model, check the original module
+                    model_class_name = model._orig_mod.__class__.__name__
+                elif hasattr(model, 'module'):
+                    # This might be a DDP wrapped model
+                    model_class_name = model.module.__class__.__name__
+                
+                if model_class_name == 'MLAModel' or 'MLA' in model_class_name:
                     # MLAModel expects 'idx' as the primary parameter
                     output_tokens, _ = model.generate(
                         idx=encoder_input,

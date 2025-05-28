@@ -244,21 +244,10 @@ def main():
             logger=logger,
             callbacks=callbacks,
             enable_checkpointing=True,
-            # compile=args.compile, # torch.compile integration - enable if needed
             # deterministic=False, # For performance
             benchmark=True, # Enable cudnn benchmarking
             limit_val_batches=50, # Limit validation batches to reduce validation time
         )
-    
-        # Compile model if requested (do it after Trainer setup for FSDP compatibility)
-        if args.compile:
-            print("Compiling model with torch.compile...")
-            try:
-                model = torch.compile(model, mode="max-autotune") # or reduce-overhead
-                print("Model compiled successfully.")
-            except Exception as e:
-                print(f"Model compilation failed: {e}")
-                print("Proceeding without compilation.")
     
         # --- Start Training with Lightning ---
         if args.eval_only:

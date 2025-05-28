@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## IMPORTANT RULES
+
+Don't try to go around issues if can fix them. Don't by pass errors, fix bugs.
+When it's possible, try to factorize code to make it more readable and maintainable.
+
 ## Repository Overview
 
 GPToughts is a framework for training and fine-tuning Large Language Models (LLMs), with a focus on GPU optimizations for hobby-scale training. The repository supports multiple model architectures including GPT-style autoregressive models, DeepSeek models, and LLaDA (Large Language Diffusion with mAsking) models which use a diffusion-based approach.
