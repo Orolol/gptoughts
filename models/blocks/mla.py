@@ -88,12 +88,18 @@ class MLA(nn.Module):
         self.max_seq_len = getattr(config, 'max_seq_len', 4096)
         self.attn_impl = getattr(config, 'attn_impl', "absorb")
         
-                # Initialize RoPE before anything else
+        # Initialize RoPE before anything else
         self.rope = RoPE(self.qk_rope_head_dim, self.max_seq_len)
         
         # Only create caches for inference, not for training
         # This prevents memory leaks during training
         self.inference_mode = False
+        
+        # Initialize cache attributes to None to prevent attribute errors
+        self.k_cache = None
+        self.v_cache = None
+        self.kv_cache = None
+        self.pe_cache = None
         
     def set_inference_mode(self, mode=True):
         """
@@ -140,10 +146,6 @@ class MLA(nn.Module):
         
 
 
-        # No need to create caches here now that we have set_inference_mode
-        # If this is an inference context, initialize the caches
-        if not self.training:
-            self.set_inference_mode(True)
     
 
     
@@ -160,6 +162,10 @@ class MLA(nn.Module):
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
+        # IMPORTANT: Always use training mode during training to prevent cache memory leaks
+        if self.training and self.inference_mode:
+            self.set_inference_mode(False)
+        
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
         
@@ -314,3 +320,13 @@ class MLA(nn.Module):
         x = self.resid_dropout(x)
         
         return x
+    
+    def clear_cache(self):
+        """Explicitly clear all caches - useful for memory management during training"""
+        self.k_cache = None
+        self.v_cache = None
+        self.kv_cache = None
+        self.pe_cache = None
+        # Force garbage collection of any remaining references
+        if hasattr(self, '_cache_tensors'):
+            del self._cache_tensors

@@ -8,6 +8,7 @@ BATCH_SIZE=${2:-8}
 BLOCK_SIZE=${3:-2048}
 OUTPUT_DIR=${4:-out_mla_selective}
 USE_FP8=${5:-0}
+RESUME=${6:-false}
 
 echo "Training MLA model with Selective Attention..."
 echo "Model size: $MODEL_SIZE"
@@ -15,10 +16,18 @@ echo "Batch size: $BATCH_SIZE"
 echo "Block size: $BLOCK_SIZE"
 echo "Output dir: $OUTPUT_DIR"
 echo "Use FP8: $USE_FP8"
+echo "Resume: $RESUME"
 echo ""
 echo "Note: Selective attention is enabled by default in MLASelective model"
 echo "This provides 16-47x memory reduction with optimal performance"
 echo "Uses PyTorch FlexAttention for efficient custom attention patterns"
+
+# Set resume options
+RESUME_ARGS=""
+if [ "$RESUME" = "true" ] || [ "$RESUME" = "1" ]; then
+    RESUME_ARGS="--init_from resume"
+    echo "Will attempt to resume from last checkpoint in $OUTPUT_DIR"
+fi
 
 # Set FP8 flag
 FP8_FLAG=""
@@ -47,7 +56,8 @@ python run_train.py \
     --gradient_accumulation_steps 1 \
     --use_dyt \
     --compile \
-    $FP8_FLAG
+    $FP8_FLAG \
+    $RESUME_ARGS
 
 # Usage examples:
 # ./train_mla_selective.sh small 16 2048 out_mla_selective 0    # Small model without FP8

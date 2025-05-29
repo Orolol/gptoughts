@@ -8,6 +8,7 @@ BATCH_SIZE=${2:-8}
 BLOCK_SIZE=${3:-2048}
 OPTIMIZER=${4:-adamw}  # Options: adamw, lion, apollo, apollo-mini, galore, galore-8bit
 OUTPUT_DIR=${5:-out_mla_${OPTIMIZER}}
+RESUME=${6:-false}
 
 echo "Training MLA model with ${OPTIMIZER} optimizer..."
 echo "Model size: $MODEL_SIZE"
@@ -15,6 +16,14 @@ echo "Batch size: $BATCH_SIZE"
 echo "Block size: $BLOCK_SIZE"
 echo "Optimizer: $OPTIMIZER"
 echo "Output dir: $OUTPUT_DIR"
+echo "Resume: $RESUME"
+
+# Set resume options
+RESUME_ARGS=""
+if [ "$RESUME" = "true" ] || [ "$RESUME" = "1" ]; then
+    RESUME_ARGS="--init_from resume"
+    echo "Will attempt to resume from last checkpoint in $OUTPUT_DIR"
+fi
 
 # Run training with specified optimizer
 python run_train.py \
@@ -34,7 +43,8 @@ python run_train.py \
     --max_iters 10000 \
     --eval_interval_steps 500 \
     --log_interval_steps 10 \
-    --gradient_accumulation_steps 1
+    --gradient_accumulation_steps 1 \
+    $RESUME_ARGS
 
 # Usage examples:
 # ./train_mla_with_optimizer.sh small 8 2048 adamw       # Use AdamW (default, most stable)

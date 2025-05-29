@@ -17,13 +17,9 @@ def prevent_backward_reuse():
         with prevent_backward_reuse():
             # Your model forward pass code here
     """
-    prev_grad_enabled = torch.is_grad_enabled()
-    try:
-        # Yield control back to the caller
-        yield
-    finally:
-        # Restore previous grad state
-        torch.set_grad_enabled(prev_grad_enabled)
+    # Simply yield - the context manager serves as documentation
+    # and a placeholder for future memory management improvements
+    yield
 
 def isolate_tensor(tensor):
     """

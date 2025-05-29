@@ -646,6 +646,10 @@ class LLMLightningModule(pl.LightningModule):
         #     print(f"TEXT INPUT: {self.args.tokenizer.decode(input_ids[0])}")
         #     print(f"TEXT TARGET: {self.args.tokenizer.decode(targets[0])}")
 
+        # Clear MLA caches after each training step to prevent memory accumulation
+        if hasattr(self.model, 'clear_cache') and self.args.model_type.lower() in ['mla', 'parscale_mla', 'mla_selective']:
+            self.model.clear_cache()
+        
         return combined_loss
 
     def validation_step(self, batch, batch_idx):
@@ -739,14 +743,19 @@ class LLMLightningModule(pl.LightningModule):
 
         # Learning rate scheduler
         if self.args.decay_lr:
-            lr_scheduler = {
-                'scheduler': LambdaLR(optimizer, lr_lambda=self._lr_lambda),
-                'interval': 'step', # Call scheduler every step
-                'frequency': 1,
-                'name': 'learning_rate_scheduler'
-            }
-            print("Using learning rate decay scheduler.")
-            return [optimizer], [lr_scheduler]
+            # Check if optimizer is MultiOptimizer - if so, skip scheduler
+            if hasattr(optimizer, '__class__') and optimizer.__class__.__name__ == 'MultiOptimizer':
+                print("MultiOptimizer detected - skipping LR scheduler (each sub-optimizer manages its own LR)")
+                return optimizer
+            else:
+                lr_scheduler = {
+                    'scheduler': LambdaLR(optimizer, lr_lambda=self._lr_lambda),
+                    'interval': 'step', # Call scheduler every step
+                    'frequency': 1,
+                    'name': 'learning_rate_scheduler'
+                }
+                print("Using learning rate decay scheduler.")
+                return [optimizer], [lr_scheduler]
         else:
             print("Using constant learning rate.")
             return optimizer

@@ -9,6 +9,7 @@ BLOCK_SIZE=${3:-2048}
 USE_8BIT=${4:-1}  # 0 for standard GaLore, 1 for 8-bit GaLore (default)
 GALORE_RANK=${5:-128}  # Low-rank dimension (lower = more memory efficient, but less expressive)
 OUTPUT_DIR=${6:-out_mla_galore}
+RESUME=${7:-false}
 
 # Set optimizer type based on 8-bit flag
 if [ "$USE_8BIT" = "1" ]; then
@@ -25,6 +26,14 @@ echo "Batch size: $BATCH_SIZE"
 echo "Block size: $BLOCK_SIZE"
 echo "GaLore rank: $GALORE_RANK"
 echo "Output dir: $OUTPUT_DIR"
+echo "Resume: $RESUME"
+
+# Set resume options
+RESUME_ARGS=""
+if [ "$RESUME" = "true" ] || [ "$RESUME" = "1" ]; then
+    RESUME_ARGS="--init_from resume"
+    echo "Will attempt to resume from last checkpoint in $OUTPUT_DIR"
+fi
 
 # Run training with GaLore
 python run_train.py \
@@ -50,7 +59,8 @@ python run_train.py \
     --log_interval_steps 10 \
     --gradient_accumulation_steps 1 \
     --use_dyt \
-    --use_fp8   
+    --use_fp8 \
+    $RESUME_ARGS
 
 # Usage examples:
 # ./train_mla_galore.sh small 16 2048 1 128    # Small model, 8-bit GaLore, rank 128

@@ -8,6 +8,7 @@ BATCH_SIZE=${2:-8}
 BLOCK_SIZE=${3:-2048}
 OUTPUT_DIR=${4:-out_mla_dyt}
 USE_FP8=${5:-0}
+RESUME=${6:-false}
 
 echo "Training MLA model with Dynamic Tanh (DyT) normalization..."
 echo "Model size: $MODEL_SIZE"
@@ -15,6 +16,14 @@ echo "Batch size: $BATCH_SIZE"
 echo "Block size: $BLOCK_SIZE"
 echo "Output dir: $OUTPUT_DIR"
 echo "Use FP8: $USE_FP8"
+echo "Resume: $RESUME"
+
+# Set resume options
+RESUME_ARGS=""
+if [ "$RESUME" = "true" ] || [ "$RESUME" = "1" ]; then
+    RESUME_ARGS="--init_from resume"
+    echo "Will attempt to resume from last checkpoint in $OUTPUT_DIR"
+fi
 
 # Base training command with DyT enabled
 TRAIN_CMD="python run_train.py \
@@ -36,7 +45,8 @@ TRAIN_CMD="python run_train.py \
     --eval_interval_steps 1000 \
     --log_interval_steps 10 \
     --gradient_accumulation_steps 1 \
-    --optimizer_type lion"
+    --optimizer_type lion \
+    $RESUME_ARGS"
 
 # Add FP8 flag if requested
 if [ "$USE_FP8" -eq 1 ]; then

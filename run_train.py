@@ -25,6 +25,16 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Import datasets helper
 from data.datasets import get_datasets
 
+
+print(f"PyTorch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"CUDA version: {torch.version.cuda}")
+
+# Vérifier le support de Flash Attention dans PyTorch
+print(f"Flash Attention backend: {torch.backends.cuda.flash_sdp_enabled()}")
+print(f"Memory efficient attention: {torch.backends.cuda.mem_efficient_sdp_enabled()}")
+print(f"Math attention: {torch.backends.cuda.math_sdp_enabled()}")
+
 # --- Argument Parsing ---
 def parse_args():
     parser = argparse.ArgumentParser(description='Train LLM models with PyTorch Lightning')
@@ -38,7 +48,7 @@ def parse_args():
     parser.add_argument('--output_dir', type=str, default='out_lightning', help='Output directory for checkpoints and logs')
     parser.add_argument('--init_from', type=str, default='scratch', choices=['scratch', 'resume'], help='Initialize from scratch or resume training')
     parser.add_argument('--resume_ckpt_path', type=str, default=None, help='Specific checkpoint path to resume from (overrides searching in output_dir)')
-    parser.add_argument('--keep_checkpoints', type=int, default=3, help='Number of checkpoints to keep (-1 for all)')
+    parser.add_argument('--keep_checkpoints', type=int, default=3, help='Number of checkpoints to keep (-1 for all, 0 to disable checkpointing)')
 
     # Data Parameters
     parser.add_argument('--batch_size', type=int, default=12, help='Batch size per device')
@@ -182,19 +192,27 @@ def main():
         print("LightningModule initialized.")
     
         # --- Callbacks ---
-        checkpoint_callback = ModelCheckpoint(
-            dirpath=args.output_dir,
-            filename='{epoch}-{step}-{val/loss:.2f}',
-            save_top_k=args.keep_checkpoints,
-            monitor='val/loss',
-            mode='min',
-            save_last=True, # Always save the last checkpoint
-            every_n_train_steps=args.eval_interval_steps # Save checkpoint after validation
-        )
+        callbacks = []
+        
+        # Only add checkpoint callback if checkpointing is enabled
+        if args.keep_checkpoints != 0:
+            checkpoint_callback = ModelCheckpoint(
+                dirpath=args.output_dir,
+                filename='{epoch}-{step}-{val/loss:.2f}',
+                save_top_k=args.keep_checkpoints,
+                monitor='val/loss',
+                mode='min',
+                save_last=True, # Always save the last checkpoint
+                every_n_train_steps=args.eval_interval_steps # Save checkpoint after validation
+            )
+            callbacks.append(checkpoint_callback)
+        else:
+            print("Checkpointing disabled (keep_checkpoints=0)")
+        
         lr_monitor = LearningRateMonitor(logging_interval='step')
         progress_bar = TQDMProgressBar(refresh_rate=10) # Adjust refresh rate as needed
-    
-        callbacks = [checkpoint_callback, lr_monitor, progress_bar]
+        
+        callbacks.extend([lr_monitor, progress_bar])
     
         # --- Logger ---
         if args.wandb_project:
@@ -240,10 +258,10 @@ def main():
             check_val_every_n_epoch=None, # Disable epoch-based validation checking
             log_every_n_steps=args.log_interval_steps,
             accumulate_grad_batches=args.gradient_accumulation_steps,
-            gradient_clip_val=args.grad_clip if args.grad_clip > 0 else None,
+            gradient_clip_val=args.grad_clip if args.grad_clip > 0 else 0,
             logger=logger,
             callbacks=callbacks,
-            enable_checkpointing=True,
+            enable_checkpointing=(args.keep_checkpoints != 0),
             # deterministic=False, # For performance
             benchmark=True, # Enable cudnn benchmarking
             limit_val_batches=50, # Limit validation batches to reduce validation time

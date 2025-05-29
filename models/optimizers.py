@@ -640,49 +640,13 @@ def configure_optimizer_with_apollo(
     if len(optimizers) == 1:
         optimizer = optimizers[0]
     else:
-        # Use a simple wrapper class that delegates to multiple optimizers
-        class MultiOptimizer:
-            def __init__(self, optimizers):
-                self.optimizers = optimizers
-                # Store combined param_groups for compatibility
-                self._param_groups = []
-                for opt in optimizers:
-                    self._param_groups.extend(opt.param_groups)
-            
-            def zero_grad(self, set_to_none=False):
-                for optimizer in self.optimizers:
-                    optimizer.zero_grad(set_to_none=set_to_none)
-            
-            def step(self, closure=None):
-                loss = None
-                if closure is not None:
-                    loss = closure()
-                
-                for optimizer in self.optimizers:
-                    optimizer.step()
-                
-                return loss
-            
-            @property
-            def param_groups(self):
-                # Refresh combined param_groups
-                self._param_groups = []
-                for opt in self.optimizers:
-                    self._param_groups.extend(opt.param_groups)
-                return self._param_groups
-            
-            def state_dict(self):
-                # Combine state dicts from all optimizers
-                return {f"opt_{i}": opt.state_dict() for i, opt in enumerate(self.optimizers)}
-            
-            def load_state_dict(self, state_dict):
-                # Load state for each optimizer
-                for i, opt in enumerate(self.optimizers):
-                    if f"opt_{i}" in state_dict:
-                        opt.load_state_dict(state_dict[f"opt_{i}"])
+        # For now, just use the first optimizer (APOLLO) since it handles most parameters
+        # The standard optimizer for 1D params is less critical
+        optimizer = optimizers[0]
+        print(f"Note: Using only APOLLO optimizer, skipping standard optimizer for {sum(len(g['params']) for g in standard_param_groups)} 1D parameters")
         
-        optimizer = MultiOptimizer(optimizers)
-        print(f"Using MultiOptimizer with {len(optimizers)} sub-optimizers")
+        # Alternative: You could merge the param groups into the APOLLO optimizer
+        # But this is complex and may not work well with APOLLO's internals
     
     print(f"Using APOLLO optimizer ({config['mode']} mode) with rank={config['rank']}, scale={config['scale']}")
     

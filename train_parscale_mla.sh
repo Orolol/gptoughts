@@ -9,6 +9,7 @@ OUTPUT_DIR=${4:-out_parscale}
 PARALLEL_STREAMS=${5:-8}
 STAGE=${6:-1}  # 1 for base training, 2 for ParScale training
 BASE_CHECKPOINT=${7:-""}  # Path to base model checkpoint for stage 2
+RESUME=${8:-false}  # Resume from last checkpoint
 
 echo "Training ParScale-MLA model"
 echo "Size: $SIZE"
@@ -17,6 +18,7 @@ echo "Block size: $BLOCK_SIZE"
 echo "Output dir: $OUTPUT_DIR"
 echo "Parallel streams: $PARALLEL_STREAMS"
 echo "Training stage: $STAGE"
+echo "Resume: $RESUME"
 
 # Determine model type based on stage
 if [ "$STAGE" -eq 1 ]; then
@@ -73,9 +75,17 @@ if [ "$STAGE" -eq 2 ]; then
         --resume_ckpt_path $BASE_CHECKPOINT
     "
 else
-    PARSCALE_PARAMS="
-        --init_from scratch
-    "
+    # Stage 1 - check for resume
+    if [ "$RESUME" = "true" ] || [ "$RESUME" = "1" ]; then
+        PARSCALE_PARAMS="
+            --init_from resume
+        "
+        echo "Will attempt to resume from last checkpoint in $OUTPUT_DIR"
+    else
+        PARSCALE_PARAMS="
+            --init_from scratch
+        "
+    fi
 fi
 
 # Create output directory

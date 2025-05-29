@@ -13,6 +13,7 @@ CONTEXT_SIZE=1024       # Taille du contexte (en tokens)
 GRAD_ACCUM=4            # Étapes d'accumulation de gradient
 MAX_ITERS=100000        # Nombre maximal d'iterations
 OUTPUT_DIR="out/deepseek_mtp"
+RESUME=${1:-false}      # Resume from last checkpoint
 
 # Paramètres d'optimisation
 OPTIMIZER="lion"        # adamw, lion, apollo, apollo-mini
@@ -29,6 +30,14 @@ mkdir -p $OUTPUT_DIR
 
 echo "Lancement de l'entraînement DeepSeek avec MTP..."
 echo "Configuration MTP: $NUM_MTP_MODULES modules, $LAYERS_PER_MTP couches/module, facteur de perte $MTP_LOSS_FACTOR"
+echo "Resume: $RESUME"
+
+# Set resume options
+RESUME_ARGS=""
+if [ "$RESUME" = "true" ] || [ "$RESUME" = "1" ]; then
+    RESUME_ARGS="--init_from resume"
+    echo "Will attempt to resume from last checkpoint in $OUTPUT_DIR"
+fi
 
 python run_train.py \
     --model_type deepseek \
@@ -50,4 +59,5 @@ python run_train.py \
     $OPTIMIZE_ATTENTION \
     --eval_interval 500 \
     --log_interval 10 \
-    --keep_checkpoints 5
+    --keep_checkpoints 5 \
+    $RESUME_ARGS

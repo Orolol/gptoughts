@@ -275,39 +275,35 @@ class MLAModel(nn.Module):
         return n_params
 
     def forward(self, idx, targets=None):
-        # Always ensure we're in training mode when doing a forward pass
+        # Always ensure we're in training mode when doing a forward pass during training
         # This prevents KV caching which causes memory leaks
         if self.training:
             self._set_inference_mode(False)
         
-        # Completely isolate input tensors to ensure no connections to previous computation graphs
-        with torch.no_grad():
-            idx = idx.detach().clone().requires_grad_(False)
-            if targets is not None:
-                targets = targets.detach().clone().requires_grad_(False)
-
+        # Don't isolate inputs - we need gradient flow!
+        # The previous implementation was breaking gradient computation
+        
         # Use the context manager to prevent backward reuse
         with prevent_backward_reuse():
             device = idx.device
             b, t = idx.size()
             assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
             
-            # Generate position indices - no grad needed
-            with torch.no_grad():
-                pos = torch.arange(0, t, dtype=torch.long, device=device)
+            # Generate position indices
+            pos = torch.arange(0, t, dtype=torch.long, device=device)
             
             # Forward the MLA model
             tok_emb = self.transformer.wte(idx)
             x = self.transformer.drop(tok_emb)
             
-            # Prepare attention mask if needed (for causal attention) - no grad needed
-            with torch.no_grad():
-                mask = None
-                if t > 1:
-                    mask = torch.full((t, t), float("-inf"), device=device).triu_(1)
-                
-                # Extract rotary embeddings for this sequence length
-                freqs_cis = self.freqs_cis[:t].detach().clone()
+            # Prepare attention mask if needed (for causal attention)
+            mask = None
+            if t > 1:
+                # Create mask without requiring gradients
+                mask = torch.full((t, t), float("-inf"), device=device, requires_grad=False).triu_(1)
+            
+            # Extract rotary embeddings for this sequence length (no gradient needed)
+            freqs_cis = self.freqs_cis[:t].detach()
             
             # Process through layers while maintaining gradient flow
             for i, block in enumerate(self.transformer.h):
@@ -361,25 +357,8 @@ class MLAModel(nn.Module):
                 logits = self.lm_head(x[:, [-1], :])
                 loss = None
         
-        # Create fresh tensor outputs with no connections to the previous graph
-        # Create copies that properly preserve gradient flow
-        if loss is not None:
-            final_loss = loss.clone()  # Keep the gradient connection
-        else:
-            final_loss = None
-            
-        final_logits = logits.clone()  # Keep the gradient connection
-        
-        # Clean up intermediate tensors to prevent memory leaks
-        del x, logits
-        if loss is not None:
-            del loss
-        
-        # REMOVED: torch.cuda.empty_cache() at end of forward pass
-        # PyTorch's memory allocator handles this more efficiently
-        # Manual calls were causing performance issues and VRAM fluctuations
-        
-        return final_logits, final_loss
+        # Return outputs directly - no need to clone as we're not breaking gradient flow
+        return logits, loss
     
     def _set_inference_mode(self, use_inference=True):
         """Set the MLA blocks to inference mode for KV caching"""
@@ -400,6 +379,18 @@ class MLAModel(nn.Module):
         except Exception as e:
             print(f"Error setting inference mode: {e}")
             # Continue without failing if there's an issue
+    
+    def clear_cache(self):
+        """Clear all KV caches in MLA attention layers to free memory"""
+        for name, module in self.named_modules():
+            if isinstance(module, MLA):
+                # Force clear any existing caches
+                module.set_inference_mode(False)
+                # Ensure cache attributes exist but are None
+                module.k_cache = None
+                module.v_cache = None
+                module.kv_cache = None
+                module.pe_cache = None
     
     @torch.no_grad()
     def generate(self, idx, max_new_tokens=None, temperature=1.0, top_k=None, prompt=None, gen_length=None):

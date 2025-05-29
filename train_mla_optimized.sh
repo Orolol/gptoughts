@@ -8,12 +8,21 @@ MODEL_SIZE=${1:-small}
 BATCH_SIZE=${2:-8}
 BLOCK_SIZE=${3:-2048}
 OUTPUT_DIR=${4:-out_mla_optimized}
+RESUME=${5:-false}
 
 echo "Training MLA model with optimized memory settings..."
 echo "Model size: $MODEL_SIZE"
 echo "Batch size: $BATCH_SIZE"
 echo "Block size: $BLOCK_SIZE"
 echo "Output dir: $OUTPUT_DIR"
+echo "Resume: $RESUME"
+
+# Set resume options
+RESUME_ARGS=""
+if [ "$RESUME" = "true" ] || [ "$RESUME" = "1" ]; then
+    RESUME_ARGS="--init_from resume"
+    echo "Will attempt to resume from last checkpoint in $OUTPUT_DIR"
+fi
 
 # Run training with specific optimizations
 python run_train.py \
@@ -36,7 +45,8 @@ python run_train.py \
     --gradient_accumulation_steps 1 \
     --use_dyt \
     --use_fp8 \
-    --compile
+    --compile \
+    $RESUME_ARGS
 
 
 # Note: To disable gradient checkpointing, you would need to modify the model config
