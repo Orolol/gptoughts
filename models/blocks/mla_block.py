@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 
-from .normalization import RMSNorm
+from .normalization import RMSNorm, DynamicTanh
 from .mla import MLA
 from .mlp import MLP
 from .tensor_utils import isolate_tensor, prevent_backward_reuse
@@ -30,8 +30,12 @@ class MLABlock(nn.Module):
         self.layer_id = layer_id
         
         # RMSNorm for attention and feed-forward
-        self.attn_norm = RMSNorm(config.n_embd if hasattr(config, 'n_embd') else config.dim)
-        self.ffn_norm = RMSNorm(config.n_embd if hasattr(config, 'n_embd') else config.dim)
+        if config.use_dyt:
+            self.attn_norm = DynamicTanh(config.n_embd, alpha_init=config.dyt_alpha_init)
+            self.ffn_norm = DynamicTanh(config.n_embd, alpha_init=config.dyt_alpha_init)
+        else:
+            self.attn_norm = RMSNorm(config.n_embd)
+            self.ffn_norm = RMSNorm(config.n_embd)
         
         # MLA attention
         self.attn = MLA(config)

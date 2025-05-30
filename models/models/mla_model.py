@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 # Import components from blocks
 from models.blocks.mla import MLA
+from models.blocks.mla_fp8 import MLA_FP8
 from models.blocks.mla_block import MLABlock
 from models.blocks.normalization import RMSNorm, DynamicTanh
 from models.blocks.positional_encoding import RoPE
@@ -61,6 +62,8 @@ class MLAModelConfig:
     # Précision
     fp8_params: bool = True
     fp8_mla_params: bool = False  # Gardez MLA en FP16 pour la stabilité numérique
+    use_fp8: bool = False  # Master switch for FP8 usage
+    fp8_tile_size: int = 128  # Tile size for FP8 quantization
     
     # Dropout et régularisation
     dropout: float = 0.0
@@ -101,7 +104,13 @@ class MLAModelBlock(nn.Module):
             self.norm2 = RMSNorm(config.n_embd)
         
         # Multi-head Latent Attention
-        self.attn = MLA(config)
+        # Use FP8 MLA if use_fp8 is enabled (regardless of fp8_mla_params which controls the linear layer type)
+        if getattr(config, 'use_fp8', False):
+            print("Using FP8 MLA")
+            self.attn = MLA_FP8(config)
+        else:
+            print("Using standard MLA")
+            self.attn = MLA(config)
         
         # Regular MLP (all layers are dense)
         self.ffn = MLP(config)

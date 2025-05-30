@@ -24,6 +24,7 @@ from train.train_utils import (
 from optimization.memory_optim import cleanup_memory, print_memory_stats, preallocate_cuda_memory
 from optimization.cuda_optim import setup_cuda_optimizations, print_gpu_stats
 from optimization.training_optim import enable_torch_compile
+from optimization.fp8_deepseek_trainer import FP8AdamW, FP8MixedPrecisionTrainer
 
 
 class LLMLightningModule(pl.LightningModule):
@@ -227,6 +228,8 @@ class LLMLightningModule(pl.LightningModule):
             # Precision
             fp8_params=getattr(self.args, 'use_fp8', False),
             fp8_mla_params=getattr(self.args, 'fp8_mla_params', False),
+            use_fp8=getattr(self.args, 'use_fp8', False),
+            fp8_tile_size=getattr(self.args, 'fp8_tile_size', 128),
             
             # Other parameters
             dropout=self.args.dropout,
@@ -707,8 +710,53 @@ class LLMLightningModule(pl.LightningModule):
 
     def configure_optimizers(self):
         """Sets up the optimizer and learning rate scheduler."""
-        # Check if the model has configure_optimizers method
-        if hasattr(self.model, 'configure_optimizers'):
+        # Check if we should use FP8-optimized optimizer
+        use_fp8_optimizer = (
+            getattr(self.args, 'use_fp8', False) and 
+            getattr(self.args, 'optimizer_type', 'adamw') == 'adamw'
+        )
+        
+        if use_fp8_optimizer:
+            # Use FP8AdamW with low-precision moments
+            print("Using FP8AdamW optimizer with BF16 moments")
+            
+            # Separate parameters by precision requirements
+            high_precision_params = []
+            standard_params = []
+            
+            for name, param in self.model.named_parameters():
+                if param.requires_grad:
+                    if any(keep in name.lower() for keep in ['embed', 'norm', 'head', 'rope']):
+                        high_precision_params.append(param)
+                    else:
+                        standard_params.append(param)
+            
+            # Create parameter groups
+            param_groups = []
+            
+            if high_precision_params:
+                param_groups.append({
+                    'params': high_precision_params,
+                    'lr': self.args.learning_rate,
+                    'name': 'high_precision'
+                })
+            
+            if standard_params:
+                param_groups.append({
+                    'params': standard_params,
+                    'lr': self.args.learning_rate,
+                    'name': 'standard'
+                })
+            
+            # Create FP8AdamW optimizer
+            optimizer = FP8AdamW(
+                param_groups,
+                lr=self.args.learning_rate,
+                betas=(self.args.beta1, self.args.beta2),
+                weight_decay=self.args.weight_decay,
+                use_low_precision_moments=True
+            )
+        elif hasattr(self.model, 'configure_optimizers'):
             # Prepare kwargs for optimizer configuration
             optimizer_kwargs = {}
             

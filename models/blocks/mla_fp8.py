@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 from .positional_encoding import RoPE
-from ...optimization.fp8_mla import FP8Quantizer, FP8LinearMLA
+from optimization.fp8_mla import FP8Quantizer, FP8LinearMLA
 
 
 class MLA_FP8(nn.Module):

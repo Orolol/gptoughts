@@ -85,6 +85,7 @@ def parse_args():
     # FP8 requires specific setup, handled separately if needed via transformer_engine integration within the module
     parser.add_argument('--use_fp8', action='store_true', help='Use FP8 precision for models that support it (requires H100/H200 GPU)')
     parser.add_argument('--fp8_mla_params', action='store_true', help='Use FP8 precision for MLA params (default is FP16 for stability)')
+    parser.add_argument('--fp8_tile_size', type=int, default=128, help='Tile size for FP8 quantization (default: 128)')
 
     # Distributed Parameters (for Lightning Trainer)
     parser.add_argument('--strategy', type=str, default='ddp', help='Distributed strategy (e.g., ddp, fsdp)')
