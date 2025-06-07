@@ -1064,20 +1064,15 @@ def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8, top_
 
             # Check if it's the LLaDA model and call the appropriate generate method
             if LLaDAModel is not None and isinstance(model.module if hasattr(model, 'module') else model, LLaDAModel):
-                # Call the original LLaDA generation method
-                # Ensure arguments match generate_original_llada signature
-                # Note: generate_original_llada might return (tokens, None) or (tokens, error)
-                output_tokens, error_info = model.generate_original_llada(
+                # Use the new BD3-based generation method
+                # The new generate method returns (tokens, None)
+                output_tokens, _ = model.generate(
                     prompt=encoder_input,
-                    steps=32,  # Keep original steps argument if needed by this method
                     gen_length=max_new_tokens,
-                    block_length=max_new_tokens, # Or a different block length if appropriate
                     temperature=temperature,
-                    tokenizer=tokenizer,
-                    remasking='low_confidence' 
+                    top_k=top_k
                 )
-                if error_info is not None: print(f"Original LLaDA generation returned error: {error_info}")
-                # output_text_from_generate remains None here as generate_original_llada doesn't return decoded text
+                # output_text_from_generate remains None here as generate doesn't return decoded text
             else:
                 # Check which parameters the model's generate method accepts
                 # Handle OptimizedModule wrapper from torch.compile

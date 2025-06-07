@@ -42,7 +42,9 @@ class LLaDAModel(nn.Module):
         
         # Token and position embeddings
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
-        self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
+        # Increase position embedding size to handle longer sequences during generation
+        max_pos_emb = max(config.block_size * 2, 2048)  # At least 2x block size or 2048
+        self.pos_emb = nn.Embedding(max_pos_emb, config.n_embd)
         
         # Transformer blocks
         self.blocks = nn.ModuleList([LLaDABlock(config) for _ in range(config.n_layer)])
@@ -276,34 +278,24 @@ class LLaDAModel(nn.Module):
             x = self.tok_emb(combined_input_ids)
             
             # 5. Position Embeddings for combined length
-            # Need to handle position embeddings for length 2*seq_len
-            # Simple approach: repeat standard pos embeddings twice? Or extend?
-            # Let's reuse the existing padding logic but for 2*seq_len
-            pos = torch.arange(0, min(current_seq_len, self.config.block_size), device=device).unsqueeze(0)
-            if current_seq_len <= self.config.block_size:
-                # Ensure pos has the correct length for the combined sequence
-                pos_emb_lookup = self.pos_emb(pos[:, :current_seq_len])
+            # Position embeddings for combined length
+            max_pos_len = self.pos_emb.weight.shape[0]
+            if current_seq_len <= max_pos_len:
+                # We have enough position embeddings
+                pos = torch.arange(0, current_seq_len, device=device).unsqueeze(0)
+                pos_emb_lookup = self.pos_emb(pos)
                 x = x + pos_emb_lookup
             else:
-                # Pad position embeddings
+                # Need to handle sequences longer than max position embeddings
                 if LLaDAModel._pos_warning_counter < LLaDAModel._pos_warning_max:
-                    print(f"Warning: BD3 combined length {current_seq_len} exceeds block size {self.config.block_size}. Padding pos emb.")
+                    print(f"Warning: BD3 combined length {current_seq_len} exceeds max pos embeddings {max_pos_len}. Using cyclic embeddings.")
                     LLaDAModel._pos_warning_counter += 1
                     if LLaDAModel._pos_warning_counter == LLaDAModel._pos_warning_max: print("Note: Suppressing further pos emb warnings.")
                 
-                # Get embeddings for the max block size
-                pos_indices_max = torch.arange(0, self.config.block_size, device=device).unsqueeze(0)
-                pos_emb_available = self.pos_emb(pos_indices_max)
-                
-                # Create padded position embeddings tensor
-                pos_emb = torch.zeros((1, current_seq_len, self.config.n_embd), device=device, dtype=x.dtype)
-                
-                # Fill the available part
-                pos_emb[:, :self.config.block_size] = pos_emb_available
-                
-                # Fill the rest by repeating the last embedding
-                pos_emb[:, self.config.block_size:] = pos_emb_available[:, -1:].expand(-1, current_seq_len - self.config.block_size, -1)
-                x = x + pos_emb
+                # Use cyclic position embeddings for very long sequences
+                pos_indices = torch.arange(0, current_seq_len, device=device) % max_pos_len
+                pos_emb_lookup = self.pos_emb(pos_indices.unsqueeze(0))
+                x = x + pos_emb_lookup
                 
         else:
             # --- Original LLaDA Path ---
@@ -319,24 +311,24 @@ class LLaDAModel(nn.Module):
             # Embeddings
             x = self.tok_emb(noisy_batch)
             
-            # Position embeddings (original logic)
-            pos = torch.arange(0, min(current_seq_len, self.config.block_size), device=device).unsqueeze(0)
-            if current_seq_len <= self.config.block_size:
-                pos_emb_lookup = self.pos_emb(pos[:, :current_seq_len])
+            # Position embeddings
+            max_pos_len = self.pos_emb.weight.shape[0]
+            if current_seq_len <= max_pos_len:
+                # Standard position embeddings
+                pos = torch.arange(0, current_seq_len, device=device).unsqueeze(0)
+                pos_emb_lookup = self.pos_emb(pos)
                 x = x + pos_emb_lookup
             else:
-                # Pad position embeddings (original warning logic)
+                # Handle sequences longer than max position embeddings
                 if LLaDAModel._pos_warning_counter < LLaDAModel._pos_warning_max:
-                    print(f"Warning: Sequence length {current_seq_len} exceeds block size {self.config.block_size}. Padding pos emb.")
+                    print(f"Warning: Sequence length {current_seq_len} exceeds max pos embeddings {max_pos_len}. Using cyclic embeddings.")
                     LLaDAModel._pos_warning_counter += 1
                     if LLaDAModel._pos_warning_counter == LLaDAModel._pos_warning_max: print("Note: Suppressing further pos emb warnings.")
                 
-                pos_indices_max = torch.arange(0, self.config.block_size, device=device).unsqueeze(0)
-                pos_emb_available = self.pos_emb(pos_indices_max)
-                pos_emb = torch.zeros((1, current_seq_len, self.config.n_embd), device=device, dtype=x.dtype)
-                pos_emb[:, :self.config.block_size] = pos_emb_available
-                pos_emb[:, self.config.block_size:] = pos_emb_available[:, -1:].expand(-1, current_seq_len - self.config.block_size, -1)
-                x = x + pos_emb
+                # Use cyclic position embeddings
+                pos_indices = torch.arange(0, current_seq_len, device=device) % max_pos_len
+                pos_emb_lookup = self.pos_emb(pos_indices.unsqueeze(0))
+                x = x + pos_emb_lookup
         
         # Apply dropout (common to both paths)
         x = self.drop(x)
@@ -580,7 +572,7 @@ class LLaDAModel(nn.Module):
             return prompt, e 
 
     # Placeholder for the diffusion sampler for a single block
-    def _sample_block_diffusion(self, model_fn, conditioning_kv=None, block_shape=None, device=None, steps=10):
+    def _sample_block_diffusion(self, model_fn, conditioning_kv=None, block_shape=None, device=None, steps=10, prev_tokens=None, repetition_penalty=1.2):
         """
         Samples a single block using a discrete diffusion process.
         Implements a simplified iterative denoising approach for LLaDA.
@@ -592,6 +584,8 @@ class LLaDAModel(nn.Module):
             block_shape: Tuple (batch_size, block_length).
             device: Torch device.
             steps: Number of diffusion steps for sampling this block.
+            prev_tokens: Previously generated tokens for repetition penalty.
+            repetition_penalty: Penalty factor for repeated tokens.
 
         Returns:
             sampled_block: Tensor of shape block_shape with sampled token IDs.
@@ -653,6 +647,16 @@ class LLaDAModel(nn.Module):
                 
                 # Sample tokens for these positions
                 selected_probs = probs[b][positions_to_unmask]
+                
+                # Apply repetition penalty if previous tokens provided
+                if prev_tokens is not None and repetition_penalty != 1.0:
+                    # Get unique tokens from previous context
+                    prev_unique = torch.unique(prev_tokens[b])
+                    # Apply penalty to probabilities of repeated tokens
+                    selected_probs[:, prev_unique] = selected_probs[:, prev_unique] / repetition_penalty
+                    # Renormalize
+                    selected_probs = selected_probs / selected_probs.sum(dim=-1, keepdim=True)
+                
                 sampled_tokens = torch.multinomial(selected_probs, 1).squeeze(-1)
                 
                 # Update the sequence
@@ -667,6 +671,13 @@ class LLaDAModel(nn.Module):
                 logits = model_fn(current_tokens)
             
             probs = torch.softmax(logits, dim=-1)
+            # Apply repetition penalty for final sampling
+            if prev_tokens is not None and repetition_penalty != 1.0:
+                for b in range(batch_size):
+                    prev_unique = torch.unique(prev_tokens[b])
+                    probs[b, :, prev_unique] = probs[b, :, prev_unique] / repetition_penalty
+                    probs[b] = probs[b] / probs[b].sum(dim=-1, keepdim=True)
+            
             # Sample from distribution for remaining masked positions
             final_tokens = torch.multinomial(probs.view(-1, probs.size(-1)), 1).squeeze(-1)
             final_tokens = final_tokens.view(batch_size, block_length)
@@ -705,15 +716,10 @@ class LLaDAModel(nn.Module):
         full_seq[:, :prompt_length] = prompt
 
         # --- KV Caching Setup ---
-        # We need to manage KV cache block by block.
-        # Let's store K and V caches for each layer separately.
-        # Cache structure: List[Tuple(Tensor, Tensor)] per layer -> List[List[Tuple(Tensor, Tensor)]]
-        # Outer list: layers, Inner list: blocks processed so far
-        # Tuple: (K_cache, V_cache)
-        # Shape of K/V cache per block/layer: [batch_size, n_head, block_length, head_size]
-        
-        # Store the cache for all blocks generated so far
-        past_key_values = [[] for _ in range(self.config.n_layer)] 
+        # Store accumulated KV cache for each layer
+        # Structure: List of (K, V) tuples, one per layer
+        # K/V shape: [batch_size, n_head, accumulated_seq_len, head_size]
+        accumulated_kv_cache = None 
 
         # --- Block-by-Block Generation ---
         for b in range(num_gen_blocks):
@@ -750,59 +756,77 @@ class LLaDAModel(nn.Module):
             
             # --- Model function for diffusion sampling ---
             def model_fn(noisy_block_input, past_kv=None):
-                # Create a full sequence with the noisy block
-                block_seq = torch.zeros(batch_size, self.config.block_size, dtype=torch.long, device=device)
+                # For BD3 generation, we only process the current block
+                # The past context is maintained through KV cache
                 
-                # Place the prompt in the beginning if this is the first block
-                if b == 0:
-                    block_seq[:, :prompt_length] = prompt
-                    block_seq[:, prompt_length:prompt_length + block_length] = noisy_block_input
-                else:
-                    # For subsequent blocks, we'd need the previous generated content
-                    # For now, just place the noisy block at the start
-                    block_seq[:, :block_length] = noisy_block_input
-                
-                # Run forward pass to get logits
+                # Run forward pass on just the noisy block
                 with torch.no_grad():
-                    logits, _, _ = self.forward(
-                        input_ids=block_seq,
+                    # Enable KV cache for generation
+                    self.enable_kv_cache()
+                    
+                    # Forward pass with past KV cache
+                    logits, _, _, present_kv = self.forward(
+                        input_ids=noisy_block_input,
                         targets=None,
                         apply_masking=False,  # Don't apply training masking
-                        past_key_values=past_kv if past_kv is not None else None
+                        past_key_values=past_kv,
+                        return_kv_cache=True
                     )
+                    
+                    # Disable KV cache after use
+                    self.disable_kv_cache()
                 
-                # Extract logits for the block region
-                if b == 0:
-                    block_logits = logits[:, prompt_length:prompt_length + block_length, :]
-                else:
-                    block_logits = logits[:, :block_length, :]
-                
-                return block_logits
+                # Return logits for the current block
+                return logits
 
             # --- Sample the current block ---
+            # Get previously generated tokens for repetition penalty
+            prev_tokens = None
+            if start_idx > 0:
+                # Include prompt and all previously generated tokens
+                prev_tokens = full_seq[:, :start_idx]
+            
             sampled_block = self._sample_block_diffusion(
-                model_fn=model_fn, # Pass the actual model prediction function
-                conditioning_kv=past_key_values, # Pass KV cache from previous blocks
+                model_fn=model_fn,
+                conditioning_kv=accumulated_kv_cache,
                 block_shape=(batch_size, block_length),
                 device=device,
-                steps=10 # Example diffusion steps per block
+                steps=10, # Example diffusion steps per block
+                prev_tokens=prev_tokens,
+                repetition_penalty=1.2  # Apply repetition penalty
             )
 
             # Place the sampled block into the full sequence
             full_seq[:, start_idx:end_idx] = sampled_block
 
             # --- Update KV Cache ---
-            # After sampling x^b, run a forward pass on the *clean* sampled block x^b
-            # to get its KV cache (K^b, V^b) to be used for the *next* block.
-            # This requires a forward pass that returns KV state.
-            
-            # TODO: Modify forward/block/attention to return KV state when needed.
-            # For now, we skip updating past_key_values.
-            print("Warning: KV cache update step not implemented.")
-            # Example structure (if forward returned KV):
-            # _, _, block_kv_cache = self.forward(sampled_block, use_bd3_generation=True, past_key_values=past_key_values)
-            # for layer_idx in range(self.config.n_layer):
-            #    past_key_values[layer_idx].append(block_kv_cache[layer_idx])
+            # Run a forward pass on the clean sampled block to get its KV cache
+            with torch.no_grad():
+                # Process the prompt for the first block to initialize KV cache
+                if b == 0 and prompt_length > 0:
+                    # First, process the prompt to get initial KV cache
+                    self.enable_kv_cache()
+                    _, _, _, prompt_kv = self.forward(
+                        input_ids=prompt,
+                        targets=None,
+                        apply_masking=False,
+                        return_kv_cache=True
+                    )
+                    accumulated_kv_cache = prompt_kv
+                    self.disable_kv_cache()
+                
+                # Now process the sampled block and update KV cache
+                self.enable_kv_cache()
+                _, _, _, block_kv = self.forward(
+                    input_ids=sampled_block,
+                    targets=None,
+                    apply_masking=False,
+                    past_key_values=accumulated_kv_cache,
+                    return_kv_cache=True
+                )
+                # Update accumulated cache with new block's KV
+                accumulated_kv_cache = block_kv
+                self.disable_kv_cache()
 
 
         # Trim generated sequence to the requested gen_length
