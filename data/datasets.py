@@ -18,7 +18,7 @@ def get_datasets(block_size, batch_size, tokenizer=None, num_workers=4):
     train_dataset = FinewebDataset(
         split='train',
         max_length=block_size,
-        buffer_size=batch_size * 10, # Larger buffer for better shuffling
+        buffer_size=batch_size * 4, # Larger buffer for better shuffling
         shuffle=True,
         tokenizer=tokenizer,
         batch_size=batch_size # Dataset yields batches directly
@@ -27,7 +27,7 @@ def get_datasets(block_size, batch_size, tokenizer=None, num_workers=4):
     val_dataset = FinewebDataset(
         split='train', # Use validation split if available
         max_length=block_size,
-        buffer_size=batch_size * 2,
+        buffer_size=batch_size * 1,
         shuffle=False,
         tokenizer=tokenizer,
         batch_size=batch_size # Dataset yields batches directly

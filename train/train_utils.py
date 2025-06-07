@@ -93,7 +93,10 @@ def calculate_perplexity(loss):
     Returns:
         float: Perplexity value
     """
-    return torch.exp(torch.tensor(loss)).item()
+    if isinstance(loss, torch.Tensor):
+        return torch.exp(loss).item()
+    else:
+        return math.exp(loss)
 
 def get_lr(current_iter, warmup_iters, lr_decay_iters, learning_rate, min_lr):
     """
@@ -528,15 +531,26 @@ def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8, top_
                     if error_info is not None: print(f"Original LLaDA generation returned error: {error_info}")
                     # output_text_from_generate remains None here as generate_original_llada doesn't return decoded text
                 else:
-                    # Standard generate call for other models (e.g., GPT) OR LLaDA if isinstance fails
-                    # Assuming they have a generate method compatible with these args
-                    # The new LLaDA generate returns (tokens, None)
-                    output_tokens, _ = model.generate( # Use _ to ignore the second return value
-                        prompt=encoder_input, # Use 'prompt' as it's expected by new LLaDA generate
-                        gen_length=max_new_tokens, # Match new LLaDA generate signature
-                        temperature=temperature,
-                        top_k=top_k
-                    )
+                    # Check if it's MLA-LLaDA model
+                    model_instance = model.module if hasattr(model, 'module') else model
+                    if hasattr(model_instance, 'generation_forward'):
+                        # MLA-LLaDA model with diffusion-based generation
+                        output = model_instance.generation_forward(
+                            input_ids=encoder_input,
+                            attention_mask=None,
+                            num_diffusion_steps=25  # Reasonable default
+                        )
+                        output_tokens = output.get('generated_ids')
+                    else:
+                        # Standard generate call for other models (e.g., GPT) OR LLaDA if isinstance fails
+                        # Assuming they have a generate method compatible with these args
+                        # The new LLaDA generate returns (tokens, None)
+                        output_tokens, _ = model.generate( # Use _ to ignore the second return value
+                            prompt=encoder_input, # Use 'prompt' as it's expected by new LLaDA generate
+                            gen_length=max_new_tokens, # Match new LLaDA generate signature
+                            temperature=temperature,
+                            top_k=top_k
+                        )
     
     except Exception as e:
         print(f"Error during text generation: {e}")
@@ -646,7 +660,10 @@ def calculate_perplexity(loss):
     Returns:
         float: Perplexity value
     """
-    return torch.exp(torch.tensor(loss)).item()
+    if isinstance(loss, torch.Tensor):
+        return torch.exp(loss).item()
+    else:
+        return math.exp(loss)
 
 def get_lr(current_iter, warmup_iters, lr_decay_iters, learning_rate, min_lr):
     """
@@ -1072,7 +1089,24 @@ def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8, top_
                     # This might be a DDP wrapped model
                     model_class_name = model.module.__class__.__name__
                 
-                if model_class_name == 'MLAModel' or 'MLA' in model_class_name:
+                if model_class_name == 'MLALLaDAModel':
+                    # Use simple autoregressive generation for MLA-LLaDA during training
+                    if hasattr(model, 'generate_simple'):
+                        output_tokens = model.generate_simple(
+                            idx=encoder_input,
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature,
+                            top_k=top_k
+                        )
+                    else:
+                        # Fallback to standard generate
+                        output_tokens, _ = model.generate(
+                            idx=encoder_input,
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature,
+                            top_k=top_k
+                        )
+                elif model_class_name == 'MLAModel' or 'MLA' in model_class_name:
                     # MLAModel expects 'idx' as the primary parameter
                     output_tokens, _ = model.generate(
                         idx=encoder_input,

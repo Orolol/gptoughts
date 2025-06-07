@@ -40,7 +40,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train LLM models with PyTorch Lightning')
 
     # Model Parameters
-    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'gpt', 'mla', 'mla_selective', 'parscale_mla'], default='gpt', help='Type of model to train')
+    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'gpt', 'mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'mdm'], default='gpt', help='Type of model to train')
     parser.add_argument('--size', type=str, choices=['small', 'medium', 'large', 'xl'], default='small', help='Size of the model')
     parser.add_argument('--use_lightning', action='store_true', default=True, help='Use PyTorch Lightning for training')
 
@@ -135,6 +135,12 @@ def parse_args():
     parser.add_argument('--selection_ratio', type=float, default=0.5, help='Ratio of tokens to select (0.0 to 1.0)')
     parser.add_argument('--selection_method', type=str, default='top_k', choices=['top_k', 'threshold', 'gumbel'], help='Method for token selection')
     parser.add_argument('--selection_temperature', type=float, default=1.0, help='Temperature for Gumbel selection')
+    
+    # MLA-LLaDA Parameters
+    parser.add_argument('--remasking_strategy', type=str, default='low_confidence', choices=['low_confidence', 'random'], help='Remasking strategy for LLaDA diffusion')
+    parser.add_argument('--num_diffusion_steps', type=int, default=None, help='Number of diffusion steps for generation (None for adaptive)')
+    parser.add_argument('--mask_ratio_min', type=float, default=0.15, help='Minimum masking ratio for training')
+    parser.add_argument('--mask_ratio_max', type=float, default=0.85, help='Maximum masking ratio for training')
 
     args = parser.parse_args()
     return args

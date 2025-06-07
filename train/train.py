@@ -230,6 +230,13 @@ class Trainer:
             # Create config based on model size
             config = self.create_mla_config()
             self.model = MLAModel(config)
+            
+        elif model_type == 'mla_llada':
+            from models.models.mla_llada import MLALLaDAModel, MLALLaDAConfig, create_mla_llada_model
+            # Create config based on model size
+            config = self.create_mla_llada_config()
+            self.model = MLALLaDAModel(config)
+            
         else:
             from models.models.model import GPT, GPTConfig
             # Create config based on model size
@@ -540,6 +547,67 @@ class Trainer:
             bias=self.args.bias,
             attention_backend=getattr(self.args, 'attention_backend', None),
             use_gradient_checkpointing=True,
+        )
+        
+        return config
+    
+    def create_mla_llada_config(self):
+        """Crée une configuration pour le modèle MLA-LLaDA"""
+        from models.models.mla_llada import MLALLaDAConfig
+        
+        # Define key parameters based on size
+        if self.args.size == 'small':
+            n_layer = 12
+            n_embd = 768
+            intermediate_size = 2048
+        elif self.args.size == 'medium':
+            n_layer = 24
+            n_embd = 1024
+            intermediate_size = 4096
+        elif self.args.size == 'large':
+            n_layer = 32
+            n_embd = 2048
+            intermediate_size = 8192
+        else:  # xl
+            n_layer = 40
+            n_embd = 2560
+            intermediate_size = 10240
+        
+        # Create config object
+        config = MLALLaDAConfig(
+            # Model dimensions
+            hidden_size=n_embd,
+            num_layers=n_layer,
+            vocab_size=self.args.vocab_size,
+            block_size=self.args.block_size,
+            
+            # MLA specific
+            q_lora_rank=0,  # Full rank
+            kv_lora_rank=64,  # Compressed latent dimension
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            
+            # LLaDA specific
+            mask_token_id=self.args.vocab_size - 1,  # Use last token as mask
+            max_diffusion_steps=50,
+            min_diffusion_steps=10,
+            mask_ratio_min=getattr(self.args, 'mask_ratio_min', 0.15),
+            mask_ratio_max=getattr(self.args, 'mask_ratio_max', 0.85),
+            remasking_strategy=getattr(self.args, 'remasking_strategy', 'low_confidence'),
+            
+            # FP8 configuration
+            use_fp8=getattr(self.args, 'use_fp8', False),
+            fp8_format='e4m3',
+            
+            # DynamicTanh
+            use_dyt=getattr(self.args, 'use_dyt', False),
+            dyt_init_alpha=getattr(self.args, 'dyt_alpha_init', 0.5),
+            
+            # Training
+            intermediate_size=intermediate_size,
+            dropout=self.args.dropout,
+            gradient_checkpointing=True,
         )
         
         return config

@@ -110,4 +110,43 @@ class ModelArgs:
     mscale: float = 1.
     # Dynamic Tanh (DyT) options
     use_dyt: bool = False  # Whether to use Dynamic Tanh (DyT) instead of RMSNorm
-    dyt_alpha_init: float = 0.5  # Initial value for DyT alpha parameter 
+    dyt_alpha_init: float = 0.5  # Initial value for DyT alpha parameter
+
+@dataclass
+class MDMConfig:
+    """Configuration class for Masked Diffusion Model (MDM) hyperparameters."""
+    
+    # Model architecture
+    block_size: int = 2048      # Maximum sequence length (fixed at 2048 as per paper)
+    vocab_size: int = 50304     # Using same vocab size as other models
+    n_layer: int = 12           # Number of transformer layers
+    n_head: int = 12            # Number of attention heads
+    n_embd: int = 768           # Embedding dimension
+    dropout: float = 0.0        # Dropout probability
+    bias: bool = False          # Whether to use bias (False for better performance)
+    
+    # MDM-specific parameters
+    mask_token_id: int = 50303  # Special token ID for [MASK] (vocab_size - 1)
+    diffusion_steps: int = 1000 # Number of diffusion steps
+    noise_schedule: Literal["linear", "cosine", "sqrt"] = "cosine"  # Noise schedule type
+    beta_start: float = 0.0001  # Starting beta for noise schedule
+    beta_end: float = 0.02      # Ending beta for noise schedule
+    prediction_type: Literal["x0", "noise"] = "x0"  # What to predict: original tokens or noise
+    
+    # Training parameters
+    label_smoothing: float = 0.0  # Label smoothing (0 for MDM)
+    masking_ratio_min: float = 0.1  # Minimum masking ratio during training
+    masking_ratio_max: float = 1.0  # Maximum masking ratio during training
+    
+    # Inference parameters
+    sampling_method: Literal["greedy", "probabilistic"] = "greedy"  # Sampling method
+    temperature: float = 1.0     # Temperature for probabilistic sampling
+    cfg_scale: float = 1.0       # Classifier-free guidance scale
+    
+    # Optimization
+    use_gradient_checkpointing: bool = False  # Memory optimization
+    attention_backend: Optional[str] = None   # Attention backend (auto-select)
+    
+    # Advanced features (for later)
+    use_mla: bool = False       # Whether to replace attention with MLA
+    use_fp8: bool = False       # Whether to use FP8 precision 

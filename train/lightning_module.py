@@ -17,6 +17,8 @@ from models.models.model import GPT
 from models.models.mla_model import MLAModel, MLAModelConfig
 from models.models.parscale_mla import ParScaleMLA, ParScaleMLAConfig, create_parscale_mla
 from models.models.mla_selective_model import MLASelectiveModel, MLASelectiveModelConfig
+from models.mdm.model import MDMModel
+from models.config import MDMConfig
 from train.train_utils import (
     get_lr, calculate_perplexity, ensure_model_dtype,
     AveragedTimingStats, generate_text, estimate_loss
@@ -61,26 +63,30 @@ class LLMLightningModule(pl.LightningModule):
         
         # Compile model if requested
         if hasattr(self.args, 'compile') and self.args.compile:
-            # For MLA-selective model, disable gradient checkpointing before compilation
-            if self.args.model_type.lower() == 'mla_selective':
-                print("Disabling gradient checkpointing for MLA-selective model compilation...")
-                for module in self.model.modules():
-                    if hasattr(module, 'use_checkpoint'):
-                        module.use_checkpoint = False
-            
-            print("Compiling model with torch.compile...")
-            try:
-                # Use reduce-overhead mode for models with complex attention patterns
-                compile_mode = 'max-autotune'
-                self.model = enable_torch_compile(
-                    self.model,
-                    mode=compile_mode,
-                    backend='inductor'
-                )
-                print(f"Model compilation successful with mode: {compile_mode}!")
-            except Exception as e:
-                print(f"Model compilation failed: {e}")
-                print("Continuing without compilation...")
+            # Skip compilation for mla_llada models due to torch.compile compatibility issues
+            if self.args.model_type.lower() == 'mla_llada':
+                print("Skipping model compilation for mla_llada model (torch.compile compatibility issues)")
+            else:
+                # For MLA-selective model, disable gradient checkpointing before compilation
+                if self.args.model_type.lower() == 'mla_selective':
+                    print("Disabling gradient checkpointing for MLA-selective model compilation...")
+                    for module in self.model.modules():
+                        if hasattr(module, 'use_checkpoint'):
+                            module.use_checkpoint = False
+                
+                print("Compiling model with torch.compile...")
+                try:
+                    # Use reduce-overhead mode for models with complex attention patterns
+                    compile_mode = 'max-autotune'
+                    self.model = enable_torch_compile(
+                        self.model,
+                        mode=compile_mode,
+                        backend='inductor'
+                    )
+                    print(f"Model compilation successful with mode: {compile_mode}!")
+                except Exception as e:
+                    print(f"Model compilation failed: {e}")
+                    print("Continuing without compilation...")
 
         # Print model size
         param_count = sum(p.numel() for p in self.model.parameters()) / 1e6
@@ -119,6 +125,12 @@ class LLMLightningModule(pl.LightningModule):
         elif model_type == 'parscale_mla':
             config = self._create_parscale_mla_config()
             model = self._create_parscale_mla_model(config)
+        elif model_type == 'mla_llada':
+            config = self._create_mla_llada_config()
+            model = self._create_mla_llada_model(config)
+        elif model_type == 'mdm':
+            config = self._create_mdm_config()
+            model = self._create_mdm_model(config)
         else: # gpt
             config = self._create_gpt_config()
             model = GPT(config)
@@ -349,6 +361,81 @@ class LLMLightningModule(pl.LightningModule):
         model.set_training_stage(getattr(self.args, 'training_stage', 1))
         
         return model
+    
+    def _create_mla_llada_config(self):
+        """Create configuration for MLA-LLaDA model."""
+        from models.models.mla_llada import MLALLaDAConfig
+        
+        # Base dimensions based on size - optimized for target parameter counts
+        # Note: With 128k vocab, embeddings+head take ~2*vocab_size*hidden_size parameters
+        if self.args.size == 'small':  # Target: ~500M parameters
+            hidden_size = 768  # Increased from 256
+            num_layers = 12   # Reduced from 20
+            intermediate_size = 3072  # Increased proportionally
+            kv_lora_rank = 64  # Increased from 32
+        elif self.args.size == 'medium':  # Target: ~1B parameters
+            hidden_size = 384
+            num_layers = 24
+            intermediate_size = 1536
+            kv_lora_rank = 48
+        elif self.args.size == 'large':  # Target: ~2B parameters
+            hidden_size = 512
+            num_layers = 32
+            intermediate_size = 2048
+            kv_lora_rank = 64
+        else:  # xl - Target: ~4B parameters
+            hidden_size = 768
+            num_layers = 40
+            intermediate_size = 2560
+            kv_lora_rank = 96
+            
+        config = MLALLaDAConfig(
+            # Base GPTConfig parameters
+            n_embd=hidden_size,
+            n_layer=num_layers,
+            vocab_size=self.args.vocab_size,
+            block_size=self.args.block_size,
+            dropout=self.args.dropout,
+            bias=self.args.bias,
+            
+            # MLA-LLaDA specific
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            
+            # MLA parameters
+            q_lora_rank=0,  # Full rank for queries
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            
+            # LLaDA parameters  
+            mask_token_id=self.args.vocab_size - 1,  # Use last valid token ID
+            max_diffusion_steps=50,
+            min_diffusion_steps=10,
+            mask_ratio_min=getattr(self.args, 'mask_ratio_min', 0.15),
+            mask_ratio_max=getattr(self.args, 'mask_ratio_max', 0.85),
+            remasking_strategy=getattr(self.args, 'remasking_strategy', 'low_confidence'),
+            
+            # FP8 configuration
+            use_fp8=getattr(self.args, 'use_fp8', False),
+            fp8_format='e4m3',
+            
+            # DynamicTanh
+            use_dyt=getattr(self.args, 'use_dyt', False),
+            dyt_alpha_init=getattr(self.args, 'dyt_alpha_init', 0.5),
+            
+            # General parameters
+            intermediate_size=intermediate_size,
+            gradient_checkpointing=getattr(self.args, 'gradient_checkpointing', True),
+        )
+        
+        return config
+    
+    def _create_mla_llada_model(self, config):
+        """Create MLA-LLaDA model instance."""
+        from models.models.mla_llada import create_mla_llada_model
+        return create_mla_llada_model(config)
 
     def _create_gpt_config(self):
         from models.models.model import GPTConfig
@@ -371,6 +458,63 @@ class LLMLightningModule(pl.LightningModule):
                 attention_backend=getattr(self.args, 'attention_backend', None)
             )
         return config
+    
+    def _create_mdm_config(self):
+        """Create configuration for Masked Diffusion Model."""
+        if self.args.size == 'small':
+            config = MDMConfig(
+                n_layer=12,
+                n_head=12,
+                n_embd=768,
+                block_size=self.args.block_size,
+                vocab_size=self.args.vocab_size,
+                dropout=self.args.dropout,
+                bias=self.args.bias,
+                mask_token_id=self.args.vocab_size - 1,
+                attention_backend=getattr(self.args, 'attention_backend', None)
+            )
+        elif self.args.size == 'medium':
+            config = MDMConfig(
+                n_layer=24,
+                n_head=16,
+                n_embd=1024,
+                block_size=self.args.block_size,
+                vocab_size=self.args.vocab_size,
+                dropout=self.args.dropout,
+                bias=self.args.bias,
+                mask_token_id=self.args.vocab_size - 1,
+                attention_backend=getattr(self.args, 'attention_backend', None)
+            )
+        elif self.args.size == 'large':
+            config = MDMConfig(
+                n_layer=32,
+                n_head=16,
+                n_embd=1536,
+                block_size=self.args.block_size,
+                vocab_size=self.args.vocab_size,
+                dropout=self.args.dropout,
+                bias=self.args.bias,
+                mask_token_id=self.args.vocab_size - 1,
+                attention_backend=getattr(self.args, 'attention_backend', None)
+            )
+        else:  # xl
+            config = MDMConfig(
+                n_layer=40,
+                n_head=20,
+                n_embd=2560,
+                block_size=self.args.block_size,
+                vocab_size=self.args.vocab_size,
+                dropout=self.args.dropout,
+                bias=self.args.bias,
+                mask_token_id=self.args.vocab_size - 1,
+                attention_backend=getattr(self.args, 'attention_backend', None)
+            )
+        return config
+    
+    def _create_mdm_model(self, config):
+        """Create MDM model instance."""
+        return MDMModel(config)
+    
     # --- End Config Creation Methods ---
 
     def forward(self, input_ids, targets=None, **kwargs):
@@ -405,6 +549,38 @@ class LLMLightningModule(pl.LightningModule):
         elif model_type == 'parscale_mla':
             # ParScale-MLA returns logits, loss directly
             logits, loss = self.model(input_ids, targets)
+            return logits, loss, None
+        elif model_type == 'mla_llada':
+            # MLA-LLaDA returns dict with loss/logits
+            try:
+                output = self.model(input_ids, labels=targets, is_training=True)
+                # Ensure we have valid outputs
+                if isinstance(output, dict):
+                    logits = output.get('logits')
+                    loss = output.get('loss')
+                    if logits is None or loss is None:
+                        raise ValueError(f"MLA-LLaDA model returned incomplete output: {output.keys()}")
+                    # Log mask ratio if available
+                    if 'mask_ratio' in output and hasattr(self, 'log'):
+                        mask_ratio = output['mask_ratio']
+                        if torch.is_tensor(mask_ratio):
+                            self.log('train/mask_ratio', float(mask_ratio.item()), on_step=True, on_epoch=False, sync_dist=True)
+                    return logits, loss, None
+                else:
+                    raise ValueError(f"MLA-LLaDA model returned unexpected output type: {type(output)}")
+            except Exception as e:
+                print(f"Error in MLA-LLaDA forward: {e}")
+                print(f"Input shapes - input_ids: {input_ids.shape}, targets: {targets.shape if targets is not None else None}")
+                raise
+        elif model_type == 'mdm':
+            # MDM returns dict with loss/logits
+            output = self.model(input_ids, labels=targets, return_dict=True)
+            logits = output['logits']
+            loss = output['loss']
+            # Log masking information if available
+            if 'mask' in output and hasattr(self, 'log'):
+                mask_ratio = output['mask'].float().mean()
+                self.log('train/mask_ratio', mask_ratio.item(), on_step=True, on_epoch=False, sync_dist=True)
             return logits, loss, None
         else: # deepseek or gpt
             model_output = self.model(input_ids, targets=targets)
@@ -444,7 +620,7 @@ class LLMLightningModule(pl.LightningModule):
                     targets = targets.detach().clone().requires_grad_(False)
                 
                 # Add special handling for MLA and ParScale-MLA models
-                if self.args.model_type.lower() in ['mla', 'mla_selective', 'parscale_mla']:
+                if self.args.model_type.lower() in ['mla', 'mla_selective', 'parscale_mla', 'mla_llada']:
                     try:
                         # Ensure the model knows we're in training mode
                         self.model.train()
@@ -652,6 +828,9 @@ class LLMLightningModule(pl.LightningModule):
         # Clear MLA caches after each training step to prevent memory accumulation
         if hasattr(self.model, 'clear_cache') and self.args.model_type.lower() in ['mla', 'parscale_mla', 'mla_selective']:
             self.model.clear_cache()
+        # Clear diffusion cache for MLA-LLaDA
+        elif self.args.model_type.lower() == 'mla_llada' and hasattr(self.model, 'cache_manager'):
+            self.model.cache_manager.clear()
         
         return combined_loss
 
@@ -664,7 +843,7 @@ class LLMLightningModule(pl.LightningModule):
             targets = targets.detach().clone().requires_grad_(False)
             
         # Forward pass with model-specific handling
-        if self.args.model_type.lower() in ['mla', 'parscale_mla']:
+        if self.args.model_type.lower() in ['mla', 'parscale_mla', 'mla_llada']:
             try:
                 # Ensure the model knows we're in eval mode
                 self.model.eval()
