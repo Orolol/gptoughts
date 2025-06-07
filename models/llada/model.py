@@ -388,44 +388,39 @@ class LLaDAModel(nn.Module):
                 # using the original targets
                 masked_indices_flat = masked_indices.view(-1) # From _bd3_noise_process call above
                 
-                if masked_indices_flat.any():
-                    # Reshape logits and targets
-                    noisy_logits_flat = noisy_logits.reshape(-1, noisy_logits.size(-1)) # [B*seq_len, V]
-                    targets_flat = targets.reshape(-1) # [B*seq_len]
-                    
-                    # Select logits and targets corresponding to masked positions
-                    selected_logits = noisy_logits_flat[masked_indices_flat]
-                    selected_targets = targets_flat[masked_indices_flat]
-                    
-                    # Simplified LBD Loss for clipped uniform schedule:
-                    # Standard Cross Entropy on masked tokens, without 1/p_mask weighting.
-                    # The weighting factor α't / (1 - αt) is approx constant and absorbed.
-                    loss = F.cross_entropy(selected_logits, selected_targets, reduction='mean')
-                else:
-                    loss = torch.tensor(0.0, device=device)
+                # Use masked computation instead of conditional branching
+                # Reshape logits and targets
+                noisy_logits_flat = noisy_logits.reshape(-1, noisy_logits.size(-1)) # [B*seq_len, V]
+                targets_flat = targets.reshape(-1) # [B*seq_len]
+                
+                # Calculate loss for all positions, then mask
+                all_losses = F.cross_entropy(noisy_logits_flat, targets_flat, reduction='none')
+                masked_losses = all_losses * masked_indices_flat.float()
+                
+                # Calculate mean only over masked positions
+                num_masked = masked_indices_flat.float().sum()
+                loss = torch.where(
+                    num_masked > 0,
+                    masked_losses.sum() / num_masked,
+                    torch.tensor(0.0, device=device)
+                )
                     
             elif apply_masking and masked_indices is not None:
                 # --- Original LLaDA Loss Calculation ---
                 # Calculate loss only on masked tokens (using p_mask weighting)
                 masked_indices_flat = masked_indices.view(-1)
-                if masked_indices_flat.any():
-                    # Extract values for masked positions only
-                    masked_logits = logits.view(-1, logits.size(-1))[masked_indices_flat]
-                    masked_targets = targets.view(-1)[masked_indices_flat]
-                    masked_p_mask = p_mask.view(-1)[masked_indices_flat] # From forward_process
-                    
-                    # Cross entropy weighted by masking probability
-                    token_loss = F.cross_entropy(
-                        masked_logits,
-                        masked_targets,
-                        reduction='none'
-                    ) / masked_p_mask
-                    
-                    # Normalize loss
-                    loss = token_loss.sum() / (batch_size * seq_len)
-                else:
-                    # No masked tokens to calculate loss on
-                    loss = torch.tensor(0.0, device=device)
+                # Use masked computation instead of conditional branching
+                logits_flat = logits.view(-1, logits.size(-1))
+                targets_flat = targets.view(-1)
+                p_mask_flat = p_mask.view(-1)
+                
+                # Calculate loss for all positions
+                all_losses = F.cross_entropy(logits_flat, targets_flat, reduction='none')
+                # Apply p_mask weighting and masked selection
+                weighted_losses = (all_losses / p_mask_flat) * masked_indices_flat.float()
+                
+                # Calculate mean over all positions (normalized by batch_size * seq_len)
+                loss = weighted_losses.sum() / (batch_size * seq_len)
             # Else: No targets or no masking, loss remains None or 0.0 if initialized
             elif loss is None: # Ensure loss is tensor if targets provided but no masking
                 loss = torch.tensor(0.0, device=device)
@@ -587,13 +582,12 @@ class LLaDAModel(nn.Module):
     # Placeholder for the diffusion sampler for a single block
     def _sample_block_diffusion(self, model_fn, conditioning_kv=None, block_shape=None, device=None, steps=10):
         """
-        Samples a single block using a discrete diffusion process (e.g., DDPM variant).
-        This corresponds to the SAMPLE function in the BD3-LM guide.
+        Samples a single block using a discrete diffusion process.
+        Implements a simplified iterative denoising approach for LLaDA.
 
         Args:
             model_fn: A function that takes noisy block input (and optionally KV cache)
-                      and returns logits for the clean block. This will likely be
-                      a partial application or wrapper around self.forward for a single block.
+                      and returns logits for the clean block.
             conditioning_kv: Tuple (K, V) from previous blocks.
             block_shape: Tuple (batch_size, block_length).
             device: Torch device.
@@ -602,15 +596,83 @@ class LLaDAModel(nn.Module):
         Returns:
             sampled_block: Tensor of shape block_shape with sampled token IDs.
         """
-        # TODO: Implement a discrete diffusion sampler (e.g., Multinomial Diffusion)
-        # This is a complex part involving iterating through noise levels,
-        # predicting the clean block using model_fn, and sampling.
-        # See papers like Multinomial Diffusion, D3PM, etc. for algorithms.
-        print("Warning: _sample_block_diffusion not implemented. Returning random block.")
         if block_shape is None or device is None:
-             raise ValueError("block_shape and device must be provided for placeholder.")
-        # Return random tokens as a placeholder
-        return torch.randint(0, self.config.vocab_size, block_shape, device=device, dtype=torch.long)
+            raise ValueError("block_shape and device must be provided.")
+        
+        batch_size, block_length = block_shape
+        
+        # Start with completely masked tokens (using mask token)
+        mask_token_id = self.config.mask_token_id
+        current_tokens = torch.full(block_shape, mask_token_id, device=device, dtype=torch.long)
+        
+        # Iterative denoising: gradually unmask tokens
+        for step in range(steps):
+            # Calculate fraction of tokens to unmask in this step
+            unmask_fraction = 1.0 - (steps - step - 1) / steps
+            
+            # Get model predictions for current state
+            if conditioning_kv is not None:
+                logits = model_fn(current_tokens, conditioning_kv)
+            else:
+                logits = model_fn(current_tokens)
+            
+            # Convert logits to probabilities
+            probs = torch.softmax(logits, dim=-1)
+            
+            # Find currently masked positions
+            masked_positions = (current_tokens == mask_token_id)
+            
+            if not masked_positions.any():
+                break  # All tokens unmasked
+            
+            # For each sequence in batch
+            for b in range(batch_size):
+                seq_masked = masked_positions[b]
+                if not seq_masked.any():
+                    continue
+                
+                # Calculate how many tokens to unmask in this step
+                total_masked = seq_masked.sum().item()
+                target_unmasked_total = int(unmask_fraction * block_length)
+                current_unmasked = block_length - total_masked
+                tokens_to_unmask = max(0, min(total_masked, target_unmasked_total - current_unmasked))
+                
+                if tokens_to_unmask == 0:
+                    continue
+                
+                # Get confidence scores for masked positions
+                seq_probs = probs[b][seq_masked]
+                confidence_scores = seq_probs.max(dim=-1).values
+                
+                # Select highest confidence positions to unmask
+                _, top_indices = confidence_scores.topk(tokens_to_unmask)
+                
+                # Get the actual positions in the sequence
+                masked_indices = torch.nonzero(seq_masked).squeeze(-1)
+                positions_to_unmask = masked_indices[top_indices]
+                
+                # Sample tokens for these positions
+                selected_probs = probs[b][positions_to_unmask]
+                sampled_tokens = torch.multinomial(selected_probs, 1).squeeze(-1)
+                
+                # Update the sequence
+                current_tokens[b, positions_to_unmask] = sampled_tokens
+        
+        # Final pass: unmask any remaining masked tokens
+        masked_positions = (current_tokens == mask_token_id)
+        if masked_positions.any():
+            if conditioning_kv is not None:
+                logits = model_fn(current_tokens, conditioning_kv)
+            else:
+                logits = model_fn(current_tokens)
+            
+            probs = torch.softmax(logits, dim=-1)
+            # Sample from distribution for remaining masked positions
+            final_tokens = torch.multinomial(probs.view(-1, probs.size(-1)), 1).squeeze(-1)
+            final_tokens = final_tokens.view(batch_size, block_length)
+            current_tokens = torch.where(masked_positions, final_tokens, current_tokens)
+        
+        return current_tokens
 
 
     @torch.no_grad()
@@ -686,20 +748,40 @@ class LLaDAModel(nn.Module):
             # This might require modifying LLaDAAttention/LLaDABlock slightly more
             # to accept and use past_key_values explicitly during generation.
             
-            # --- Placeholder model_fn ---
-            def placeholder_model_fn(noisy_block_input, past_kv):
-                 # This is highly simplified and likely incorrect structure
-                 # It needs to integrate with the actual model forward pass
-                 # and KV cache mechanism properly.
-                 print("Warning: Using placeholder model_fn in generate.")
-                 # Simulate running the model - replace with actual call
-                 # Need to handle embeddings, pos embeddings, blocks with past_kv
-                 # For now, just return random logits
-                 return torch.randn(batch_size, block_length, self.config.vocab_size, device=device)
+            # --- Model function for diffusion sampling ---
+            def model_fn(noisy_block_input, past_kv=None):
+                # Create a full sequence with the noisy block
+                block_seq = torch.zeros(batch_size, self.config.block_size, dtype=torch.long, device=device)
+                
+                # Place the prompt in the beginning if this is the first block
+                if b == 0:
+                    block_seq[:, :prompt_length] = prompt
+                    block_seq[:, prompt_length:prompt_length + block_length] = noisy_block_input
+                else:
+                    # For subsequent blocks, we'd need the previous generated content
+                    # For now, just place the noisy block at the start
+                    block_seq[:, :block_length] = noisy_block_input
+                
+                # Run forward pass to get logits
+                with torch.no_grad():
+                    logits, _, _ = self.forward(
+                        input_ids=block_seq,
+                        targets=None,
+                        apply_masking=False,  # Don't apply training masking
+                        past_key_values=past_kv if past_kv is not None else None
+                    )
+                
+                # Extract logits for the block region
+                if b == 0:
+                    block_logits = logits[:, prompt_length:prompt_length + block_length, :]
+                else:
+                    block_logits = logits[:, :block_length, :]
+                
+                return block_logits
 
             # --- Sample the current block ---
             sampled_block = self._sample_block_diffusion(
-                model_fn=placeholder_model_fn, # Pass the model prediction function
+                model_fn=model_fn, # Pass the actual model prediction function
                 conditioning_kv=past_key_values, # Pass KV cache from previous blocks
                 block_shape=(batch_size, block_length),
                 device=device,

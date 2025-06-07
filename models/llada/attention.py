@@ -71,7 +71,7 @@ class LLaDAAttention(nn.Module):
             # Handle KV caching for faster generation
             # Handle KV caching for faster generation
             # Logic priority: 1. explicit past_key_value, 2. internal cache, 3. no cache
-            if past_key_value is not None:
+            if past_key_value is not None and len(past_key_value) == 2:
                 # Use explicit past K/V passed for this block (e.g., during BD3 generation)
                 past_k, past_v = past_key_value
                 k = torch.cat([past_k, k], dim=2)

@@ -53,7 +53,7 @@ def parse_args():
     # Data Parameters
     parser.add_argument('--batch_size', type=int, default=12, help='Batch size per device')
     parser.add_argument('--block_size', type=int, default=512, help='Context size')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of dataloader workers')
+    parser.add_argument('--num_workers', type=int, default=2, help='Number of dataloader workers')
 
     # Model Config Parameters (passed to LightningModule)
     parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate')
@@ -247,7 +247,13 @@ def main():
                 print(f"Resuming from specified checkpoint: {ckpt_path}")
             else:
                 # Try to find the last checkpoint in the output directory
-                ckpt_path = find_latest_checkpoint(args.output_dir, pattern="last.ckpt") # PL saves last as 'last.ckpt'
+                # Check for PyTorch Lightning checkpoint first
+                pl_ckpt = os.path.join(args.output_dir, "last.ckpt")
+                if os.path.exists(pl_ckpt):
+                    ckpt_path = pl_ckpt
+                else:
+                    # Fallback to custom checkpoint format
+                    ckpt_path = find_latest_checkpoint(args.output_dir)
                 if ckpt_path:
                     print(f"Resuming from last checkpoint found: {ckpt_path}")
                 else:
