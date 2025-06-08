@@ -578,9 +578,8 @@ class LLaDAModel(nn.Module):
             self.reset_kv_cache()
             # Return original prompt or partial generation? Returning prompt for safety.
             return prompt, e 
-
     # Placeholder for the diffusion sampler for a single block
-    def _sample_block_diffusion(self, model_fn, conditioning_kv=None, block_shape=None, device=None, steps=10):
+    def _sample_block_diffusion(self, model_fn, conditioning_kv=None, block_shape=None, device=None, steps=10, prev_tokens=None, repetition_penalty=1.2):
         """
         Samples a single block using a discrete diffusion process.
         Implements a simplified iterative denoising approach for LLaDA.
@@ -592,6 +591,8 @@ class LLaDAModel(nn.Module):
             block_shape: Tuple (batch_size, block_length).
             device: Torch device.
             steps: Number of diffusion steps for sampling this block.
+            prev_tokens: Previously generated tokens for repetition penalty.
+            repetition_penalty: Penalty factor for repeated tokens.
 
         Returns:
             sampled_block: Tensor of shape block_shape with sampled token IDs.
@@ -653,6 +654,16 @@ class LLaDAModel(nn.Module):
                 
                 # Sample tokens for these positions
                 selected_probs = probs[b][positions_to_unmask]
+                
+                # Apply repetition penalty if previous tokens provided
+                if prev_tokens is not None and repetition_penalty != 1.0:
+                    # Get unique tokens from previous context
+                    prev_unique = torch.unique(prev_tokens[b])
+                    # Apply penalty to probabilities of repeated tokens
+                    selected_probs[:, prev_unique] = selected_probs[:, prev_unique] / repetition_penalty
+                    # Renormalize
+                    selected_probs = selected_probs / selected_probs.sum(dim=-1, keepdim=True)
+                
                 sampled_tokens = torch.multinomial(selected_probs, 1).squeeze(-1)
                 
                 # Update the sequence
@@ -667,14 +678,20 @@ class LLaDAModel(nn.Module):
                 logits = model_fn(current_tokens)
             
             probs = torch.softmax(logits, dim=-1)
+            # Apply repetition penalty for final sampling
+            if prev_tokens is not None and repetition_penalty != 1.0:
+                for b in range(batch_size):
+                    prev_unique = torch.unique(prev_tokens[b])
+                    probs[b, :, prev_unique] = probs[b, :, prev_unique] / repetition_penalty
+                    probs[b] = probs[b] / probs[b].sum(dim=-1, keepdim=True)
+            
             # Sample from distribution for remaining masked positions
             final_tokens = torch.multinomial(probs.view(-1, probs.size(-1)), 1).squeeze(-1)
             final_tokens = final_tokens.view(batch_size, block_length)
             current_tokens = torch.where(masked_positions, final_tokens, current_tokens)
         
         return current_tokens
-
-
+    
     @torch.no_grad()
     def generate(self, prompt, gen_length=128, temperature=None, top_k=None):
         """
@@ -705,15 +722,10 @@ class LLaDAModel(nn.Module):
         full_seq[:, :prompt_length] = prompt
 
         # --- KV Caching Setup ---
-        # We need to manage KV cache block by block.
-        # Let's store K and V caches for each layer separately.
-        # Cache structure: List[Tuple(Tensor, Tensor)] per layer -> List[List[Tuple(Tensor, Tensor)]]
-        # Outer list: layers, Inner list: blocks processed so far
-        # Tuple: (K_cache, V_cache)
-        # Shape of K/V cache per block/layer: [batch_size, n_head, block_length, head_size]
-        
-        # Store the cache for all blocks generated so far
-        past_key_values = [[] for _ in range(self.config.n_layer)] 
+        # Store accumulated KV cache for each layer
+        # Structure: List of (K, V) tuples, one per layer
+        # K/V shape: [batch_size, n_head, accumulated_seq_len, head_size]
+        accumulated_kv_cache = None 
 
         # --- Block-by-Block Generation ---
         for b in range(num_gen_blocks):
@@ -721,95 +733,85 @@ class LLaDAModel(nn.Module):
             start_idx = prompt_length + b * block_length
             end_idx = start_idx + block_length
             
-            # --- Prepare input for the current block generation ---
-            # The input to the *diffusion sampler* is conceptually just the shape/device,
-            # but the *model function* used by the sampler needs context.
-            # The context comes from the KV cache of previous blocks.
-
-            # --- Define the model function for the sampler ---
-            # This function will be called by _sample_block_diffusion.
-            # It needs to run the transformer for a single (noisy) block input,
-            # using the cached K/V from previous blocks as context.
-            
-            # We need a way to pass the *cumulative* KV cache from blocks 0 to b-1
-            # to the attention mechanism when processing the current block b.
-            
-            # Simplified approach: Run a forward pass on the *prompt* first to fill initial KV cache?
-            # Or does the sampler handle the conditioning implicitly?
-            # The BD3-LM paper suggests the model signature:
-            # x^b_logits, K^b, V^b <- x^b_θ(x^b_t, K_1:b-1, V_1:b-1)
-            # This implies the model itself handles the cross-attention to previous blocks' KV.
-            
-            # Let's assume our LLaDAAttention can handle past_kv.
-            # We need to adapt the forward pass slightly or create a wrapper.
-            
-            # TODO: Define model_fn properly. It should wrap self.forward or parts of it,
-            # ensuring it takes noisy input + past_kv and returns logits.
-            # This might require modifying LLaDAAttention/LLaDABlock slightly more
-            # to accept and use past_key_values explicitly during generation.
-            
             # --- Model function for diffusion sampling ---
             def model_fn(noisy_block_input, past_kv=None):
-                # Create a full sequence with the noisy block
-                block_seq = torch.zeros(batch_size, self.config.block_size, dtype=torch.long, device=device)
+                # For BD3 generation, we only process the current block
+                # The past context is maintained through KV cache
                 
-                # Place the prompt in the beginning if this is the first block
-                if b == 0:
-                    block_seq[:, :prompt_length] = prompt
-                    block_seq[:, prompt_length:prompt_length + block_length] = noisy_block_input
-                else:
-                    # For subsequent blocks, we'd need the previous generated content
-                    # For now, just place the noisy block at the start
-                    block_seq[:, :block_length] = noisy_block_input
-                
-                # Run forward pass to get logits
+                # Run forward pass on just the noisy block
                 with torch.no_grad():
-                    logits, _, _ = self.forward(
-                        input_ids=block_seq,
+                    # Enable KV cache for generation
+                    self.enable_kv_cache()
+                    
+                    # Forward pass with past KV cache
+                    logits, _, _, present_kv = self.forward(
+                        input_ids=noisy_block_input,
                         targets=None,
                         apply_masking=False,  # Don't apply training masking
-                        past_key_values=past_kv if past_kv is not None else None
+                        past_key_values=past_kv,
+                        return_kv_cache=True
                     )
+                    
+                    # Disable KV cache after use
+                    self.disable_kv_cache()
                 
-                # Extract logits for the block region
-                if b == 0:
-                    block_logits = logits[:, prompt_length:prompt_length + block_length, :]
-                else:
-                    block_logits = logits[:, :block_length, :]
-                
-                return block_logits
+                # Return logits for the current block
+                return logits
 
             # --- Sample the current block ---
+            # Get previously generated tokens for repetition penalty
+            prev_tokens = None
+            if start_idx > 0:
+                # Include prompt and all previously generated tokens
+                prev_tokens = full_seq[:, :start_idx]
+            
             sampled_block = self._sample_block_diffusion(
-                model_fn=model_fn, # Pass the actual model prediction function
-                conditioning_kv=past_key_values, # Pass KV cache from previous blocks
+                model_fn=model_fn,
+                conditioning_kv=accumulated_kv_cache,
                 block_shape=(batch_size, block_length),
                 device=device,
-                steps=10 # Example diffusion steps per block
+                steps=10, # Example diffusion steps per block
+                prev_tokens=prev_tokens,
+                repetition_penalty=1.2  # Apply repetition penalty
             )
 
             # Place the sampled block into the full sequence
             full_seq[:, start_idx:end_idx] = sampled_block
 
             # --- Update KV Cache ---
-            # After sampling x^b, run a forward pass on the *clean* sampled block x^b
-            # to get its KV cache (K^b, V^b) to be used for the *next* block.
-            # This requires a forward pass that returns KV state.
-            
-            # TODO: Modify forward/block/attention to return KV state when needed.
-            # For now, we skip updating past_key_values.
-            print("Warning: KV cache update step not implemented.")
-            # Example structure (if forward returned KV):
-            # _, _, block_kv_cache = self.forward(sampled_block, use_bd3_generation=True, past_key_values=past_key_values)
-            # for layer_idx in range(self.config.n_layer):
-            #    past_key_values[layer_idx].append(block_kv_cache[layer_idx])
+            # Run a forward pass on the clean sampled block to get its KV cache
+            with torch.no_grad():
+                # Process the prompt for the first block to initialize KV cache
+                if b == 0 and prompt_length > 0:
+                    # First, process the prompt to get initial KV cache
+                    self.enable_kv_cache()
+                    _, _, _, prompt_kv = self.forward(
+                        input_ids=prompt,
+                        targets=None,
+                        apply_masking=False,
+                        return_kv_cache=True
+                    )
+                    accumulated_kv_cache = prompt_kv
+                    self.disable_kv_cache()
+                
+                # Now process the sampled block and update KV cache
+                self.enable_kv_cache()
+                _, _, _, block_kv = self.forward(
+                    input_ids=sampled_block,
+                    targets=None,
+                    apply_masking=False,
+                    past_key_values=accumulated_kv_cache,
+                    return_kv_cache=True
+                )
+                # Update accumulated cache with new block's KV
+                accumulated_kv_cache = block_kv
+                self.disable_kv_cache()
 
 
         # Trim generated sequence to the requested gen_length
         final_generated_sequence = full_seq[:, :prompt_length + gen_length]
         
         return final_generated_sequence, None # Return None for loss/aux data
-
     def enable_kv_cache(self):
         """Enable KV caching for efficient generation"""
         for block in self.blocks:
