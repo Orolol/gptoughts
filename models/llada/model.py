@@ -286,10 +286,8 @@ class LLaDAModel(nn.Module):
                 x = x + pos_emb_lookup
             else:
                 # Pad position embeddings
-                if LLaDAModel._pos_warning_counter < LLaDAModel._pos_warning_max:
-                    print(f"Warning: BD3 combined length {current_seq_len} exceeds block size {self.config.block_size}. Padding pos emb.")
-                    LLaDAModel._pos_warning_counter += 1
-                    if LLaDAModel._pos_warning_counter == LLaDAModel._pos_warning_max: print("Note: Suppressing further pos emb warnings.")
+                # Note: Print statements removed for torch.compile compatibility
+                # Warning: BD3 combined length exceeds block size. Padding pos emb.
                 
                 # Get embeddings for the max block size
                 pos_indices_max = torch.arange(0, self.config.block_size, device=device).unsqueeze(0)
@@ -326,10 +324,8 @@ class LLaDAModel(nn.Module):
                 x = x + pos_emb_lookup
             else:
                 # Pad position embeddings (original warning logic)
-                if LLaDAModel._pos_warning_counter < LLaDAModel._pos_warning_max:
-                    print(f"Warning: Sequence length {current_seq_len} exceeds block size {self.config.block_size}. Padding pos emb.")
-                    LLaDAModel._pos_warning_counter += 1
-                    if LLaDAModel._pos_warning_counter == LLaDAModel._pos_warning_max: print("Note: Suppressing further pos emb warnings.")
+                # Note: Print statements removed for torch.compile compatibility
+                # Warning: Sequence length exceeds block size. Padding pos emb.
                 
                 pos_indices_max = torch.arange(0, self.config.block_size, device=device).unsqueeze(0)
                 pos_emb_available = self.pos_emb(pos_indices_max)
@@ -416,11 +412,29 @@ class LLaDAModel(nn.Module):
                 
                 # Calculate loss for all positions
                 all_losses = F.cross_entropy(logits_flat, targets_flat, reduction='none')
-                # Apply p_mask weighting and masked selection
-                weighted_losses = (all_losses / p_mask_flat) * masked_indices_flat.float()
+                # Apply p_mask weighting and masked selection with clipping to prevent division by very large values
+                # Clamp p_mask to prevent extreme weighting that causes mode collapse
+                weighted_losses = (all_losses / torch.clamp(p_mask_flat, min=0.1, max=1.0)) * masked_indices_flat.float()
                 
                 # Calculate mean over all positions (normalized by batch_size * seq_len)
                 loss = weighted_losses.sum() / (batch_size * seq_len)
+                
+                # Add entropy regularization to prevent mode collapse
+                # This encourages the model to produce diverse predictions
+                if self.training:  # Only apply during training
+                    # Calculate entropy on masked positions only
+                    masked_logits = logits_flat[masked_indices_flat]
+                    if masked_logits.numel() > 0:
+                        # Apply softmax to get probabilities
+                        probs = F.softmax(masked_logits, dim=-1)
+                        # Calculate entropy: -sum(p * log(p))
+                        entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
+                        # Average entropy across masked positions
+                        avg_entropy = entropy.mean()
+                        # Subtract from loss (higher entropy = lower loss)
+                        # Use a small coefficient to not overwhelm the main loss
+                        entropy_coef = 0.01
+                        loss = loss - entropy_coef * avg_entropy
             # Else: No targets or no masking, loss remains None or 0.0 if initialized
             elif loss is None: # Ensure loss is tensor if targets provided but no masking
                 loss = torch.tensor(0.0, device=device)
@@ -439,7 +453,7 @@ class LLaDAModel(nn.Module):
         """
         # ... (Keep original implementation of generate here) ...
         # ... (Ensure self.forward calls inside use apply_masking=False) ...
-        print("Warning: Using original LLaDA generation logic.")
+        # Warning: Using original LLaDA generation logic.
         
         device = prompt.device
         
@@ -573,7 +587,7 @@ class LLaDAModel(nn.Module):
             return generated, None # Return None for aux data
             
         except Exception as e:
-            print(f"Error during generation: {e}")
+            # Error during generation
             # Reset KV cache in case of error
             self.reset_kv_cache()
             # Return original prompt or partial generation? Returning prompt for safety.
@@ -603,7 +617,8 @@ class LLaDAModel(nn.Module):
         batch_size, block_length = block_shape
         
         # Start with completely masked tokens (using mask token)
-        mask_token_id = self.config.mask_token_id
+        # Ensure mask_token_id is within vocab range
+        mask_token_id = min(self.config.mask_token_id, self.config.vocab_size - 1)
         current_tokens = torch.full(block_shape, mask_token_id, device=device, dtype=torch.long)
         
         # Iterative denoising: gradually unmask tokens
@@ -686,9 +701,26 @@ class LLaDAModel(nn.Module):
                     probs[b] = probs[b] / probs[b].sum(dim=-1, keepdim=True)
             
             # Sample from distribution for remaining masked positions
-            final_tokens = torch.multinomial(probs.view(-1, probs.size(-1)), 1).squeeze(-1)
-            final_tokens = final_tokens.view(batch_size, block_length)
-            current_tokens = torch.where(masked_positions, final_tokens, current_tokens)
+            # Handle the case where probs might have an extra dimension from the model
+            if probs.dim() == 3:  # [batch_size, block_length, vocab_size]
+                # Process each position individually
+                for b in range(batch_size):
+                    for pos in range(block_length):
+                        if masked_positions[b, pos]:
+                            # Apply repetition penalty if needed
+                            pos_probs = probs[b, pos]
+                            if prev_tokens is not None and repetition_penalty != 1.0:
+                                prev_unique = torch.unique(prev_tokens[b])
+                                pos_probs[prev_unique] = pos_probs[prev_unique] / repetition_penalty
+                                pos_probs = pos_probs / pos_probs.sum()
+                            # Sample token
+                            sampled_token = torch.multinomial(pos_probs, 1).item()
+                            current_tokens[b, pos] = sampled_token
+            else:
+                # Original logic for 2D probs
+                final_tokens = torch.multinomial(probs.view(-1, probs.size(-1)), 1).squeeze(-1)
+                final_tokens = final_tokens.view(batch_size, block_length)
+                current_tokens = torch.where(masked_positions, final_tokens, current_tokens)
         
         return current_tokens
     
@@ -715,7 +747,11 @@ class LLaDAModel(nn.Module):
         num_gen_blocks = (gen_length + block_length - 1) // block_length
         total_gen_len_aligned = num_gen_blocks * block_length # Ensure generated length is multiple of block_length
 
-        print(f"BD3-LM Generation: prompt_len={prompt_length}, gen_len={gen_length}, block_len={block_length}, num_blocks={num_gen_blocks}")
+        # BD3-LM Generation info
+        
+        # Add debug info
+        safe_mask_token_id = min(self.config.mask_token_id, self.config.vocab_size - 1)
+        # Using safe mask_token_id
 
         # Initialize the full sequence tensor
         full_seq = torch.zeros((batch_size, prompt_length + total_gen_len_aligned), dtype=torch.long, device=device)
@@ -729,7 +765,7 @@ class LLaDAModel(nn.Module):
 
         # --- Block-by-Block Generation ---
         for b in range(num_gen_blocks):
-            print(f"Generating block {b+1}/{num_gen_blocks}...")
+            # Generating block...
             start_idx = prompt_length + b * block_length
             end_idx = start_idx + block_length
             

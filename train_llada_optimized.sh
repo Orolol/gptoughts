@@ -47,6 +47,7 @@ python run_train.py \
     --use_dyt \
     --use_fp8 \
     --compile \
+    --use_bd3_training \
     $RESUME_ARGS
 
 

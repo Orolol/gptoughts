@@ -107,7 +107,7 @@ class LLaDARouter(Router):
                 return routing_weights.detach(), dispatch_mask, router_loss
                 
             except Exception as e:
-                print(f"Router failed with error: {e}")
+                # Router failed with error
                 # Fallback to uniform routing in case of error
                 fallback_weights = torch.ones((batch_size * seq_len, self.num_experts), 
                                            device=x.device) / self.num_experts
