@@ -1064,15 +1064,15 @@ def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8, top_
 
             # Check if it's the LLaDA model and use its generate method
             if LLaDAModel is not None and isinstance(model.module if hasattr(model, 'module') else model, LLaDAModel):
-                # Use the BD3-LM generation method (default generate)
-                # The LLaDA generate method returns (tokens, None)
+                # Use the new BD3-based generation method
+                # The new generate method returns (tokens, None)
                 output_tokens, _ = model.generate(
                     prompt=encoder_input,
                     gen_length=max_new_tokens,
                     temperature=temperature,
                     top_k=top_k
                 )
-                # Note: BD3-LM generation is the default and should work well
+                # output_text_from_generate remains None here as generate doesn't return decoded text
             else:
                 # Check which parameters the model's generate method accepts
                 # Handle OptimizedModule wrapper from torch.compile

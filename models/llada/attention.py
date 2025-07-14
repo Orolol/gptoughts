@@ -83,8 +83,8 @@ class LLaDAAttention(nn.Module):
                  
             # Update internal cache if enabled (for original LLaDA generation)
             if use_kv_cache and self.kv_cache_enabled:
-                 self._cached_k = k
-                 self._cached_v = v
+                self._cached_k = k.detach()  # Detach to avoid memory issues
+                self._cached_v = v.detach()
             
             # Use PyTorch's SDPA with no causal mask (KEY DIFFERENCE FROM GPT)
             # Modified to accept an optional attention mask for BD3-LM

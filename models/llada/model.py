@@ -42,7 +42,9 @@ class LLaDAModel(nn.Module):
         
         # Token and position embeddings
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
-        self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
+        # Increase position embedding size to handle longer sequences during generation
+        max_pos_emb = max(config.block_size * 2, 2048)  # At least 2x block size or 2048
+        self.pos_emb = nn.Embedding(max_pos_emb, config.n_embd)
         
         # Transformer blocks
         self.blocks = nn.ModuleList([LLaDABlock(config) for _ in range(config.n_layer)])
@@ -276,32 +278,30 @@ class LLaDAModel(nn.Module):
             x = self.tok_emb(combined_input_ids)
             
             # 5. Position Embeddings for combined length
-            # Need to handle position embeddings for length 2*seq_len
-            # Simple approach: repeat standard pos embeddings twice? Or extend?
-            # Let's reuse the existing padding logic but for 2*seq_len
-            pos = torch.arange(0, min(current_seq_len, self.config.block_size), device=device).unsqueeze(0)
-            if current_seq_len <= self.config.block_size:
-                # Ensure pos has the correct length for the combined sequence
-                pos_emb_lookup = self.pos_emb(pos[:, :current_seq_len])
+            # Position embeddings for combined length
+            max_pos_len = self.pos_emb.weight.shape[0]
+            if current_seq_len <= max_pos_len:
+                # We have enough position embeddings
+                pos = torch.arange(0, current_seq_len, device=device).unsqueeze(0)
+                pos_emb_lookup = self.pos_emb(pos)
                 x = x + pos_emb_lookup
             else:
+<<<<<<< HEAD
                 # Pad position embeddings
                 # Note: Print statements removed for torch.compile compatibility
                 # Warning: BD3 combined length exceeds block size. Padding pos emb.
+=======
+                # Need to handle sequences longer than max position embeddings
+                if LLaDAModel._pos_warning_counter < LLaDAModel._pos_warning_max:
+                    print(f"Warning: BD3 combined length {current_seq_len} exceeds max pos embeddings {max_pos_len}. Using cyclic embeddings.")
+                    LLaDAModel._pos_warning_counter += 1
+                    if LLaDAModel._pos_warning_counter == LLaDAModel._pos_warning_max: print("Note: Suppressing further pos emb warnings.")
+>>>>>>> ae8b5b0682432ece5d62e777f68ca40423ee3d13
                 
-                # Get embeddings for the max block size
-                pos_indices_max = torch.arange(0, self.config.block_size, device=device).unsqueeze(0)
-                pos_emb_available = self.pos_emb(pos_indices_max)
-                
-                # Create padded position embeddings tensor
-                pos_emb = torch.zeros((1, current_seq_len, self.config.n_embd), device=device, dtype=x.dtype)
-                
-                # Fill the available part
-                pos_emb[:, :self.config.block_size] = pos_emb_available
-                
-                # Fill the rest by repeating the last embedding
-                pos_emb[:, self.config.block_size:] = pos_emb_available[:, -1:].expand(-1, current_seq_len - self.config.block_size, -1)
-                x = x + pos_emb
+                # Use cyclic position embeddings for very long sequences
+                pos_indices = torch.arange(0, current_seq_len, device=device) % max_pos_len
+                pos_emb_lookup = self.pos_emb(pos_indices.unsqueeze(0))
+                x = x + pos_emb_lookup
                 
         else:
             # --- Original LLaDA Path ---
@@ -317,22 +317,30 @@ class LLaDAModel(nn.Module):
             # Embeddings
             x = self.tok_emb(noisy_batch)
             
-            # Position embeddings (original logic)
-            pos = torch.arange(0, min(current_seq_len, self.config.block_size), device=device).unsqueeze(0)
-            if current_seq_len <= self.config.block_size:
-                pos_emb_lookup = self.pos_emb(pos[:, :current_seq_len])
+            # Position embeddings
+            max_pos_len = self.pos_emb.weight.shape[0]
+            if current_seq_len <= max_pos_len:
+                # Standard position embeddings
+                pos = torch.arange(0, current_seq_len, device=device).unsqueeze(0)
+                pos_emb_lookup = self.pos_emb(pos)
                 x = x + pos_emb_lookup
             else:
+<<<<<<< HEAD
                 # Pad position embeddings (original warning logic)
                 # Note: Print statements removed for torch.compile compatibility
                 # Warning: Sequence length exceeds block size. Padding pos emb.
+=======
+                # Handle sequences longer than max position embeddings
+                if LLaDAModel._pos_warning_counter < LLaDAModel._pos_warning_max:
+                    print(f"Warning: Sequence length {current_seq_len} exceeds max pos embeddings {max_pos_len}. Using cyclic embeddings.")
+                    LLaDAModel._pos_warning_counter += 1
+                    if LLaDAModel._pos_warning_counter == LLaDAModel._pos_warning_max: print("Note: Suppressing further pos emb warnings.")
+>>>>>>> ae8b5b0682432ece5d62e777f68ca40423ee3d13
                 
-                pos_indices_max = torch.arange(0, self.config.block_size, device=device).unsqueeze(0)
-                pos_emb_available = self.pos_emb(pos_indices_max)
-                pos_emb = torch.zeros((1, current_seq_len, self.config.n_embd), device=device, dtype=x.dtype)
-                pos_emb[:, :self.config.block_size] = pos_emb_available
-                pos_emb[:, self.config.block_size:] = pos_emb_available[:, -1:].expand(-1, current_seq_len - self.config.block_size, -1)
-                x = x + pos_emb
+                # Use cyclic position embeddings
+                pos_indices = torch.arange(0, current_seq_len, device=device) % max_pos_len
+                pos_emb_lookup = self.pos_emb(pos_indices.unsqueeze(0))
+                x = x + pos_emb_lookup
         
         # Apply dropout (common to both paths)
         x = self.drop(x)
