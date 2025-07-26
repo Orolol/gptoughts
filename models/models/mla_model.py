@@ -488,13 +488,16 @@ class MLAModel(nn.Module):
         
         # Extract GaLore configuration from kwargs if present
         galore_config = None
-        if optimizer_type in ["galore", "galore-8bit"]:
+        galore_quantize_proj = None
+        if optimizer_type in ["galore", "galore-8bit", "galore2"]:
             galore_config = {
                 "rank": kwargs.get("galore_rank", 128),
                 "update_proj_gap": kwargs.get("galore_update_proj_gap", 200),
                 "scale": kwargs.get("galore_scale", 0.25),
                 "proj_type": kwargs.get("galore_proj_type", "std")
             }
+            if optimizer_type == "galore2":
+                galore_quantize_proj = kwargs.get("galore_quantize_proj", None)
         
         # Use the GPT optimizer configuration which supports multiple optimizers
         # MLA models work well with the same optimizer configurations as GPT models
@@ -505,7 +508,8 @@ class MLAModel(nn.Module):
             betas=betas,
             device_type=device_type,
             optimizer_type=optimizer_type,
-            galore_config=galore_config
+            galore_config=galore_config,
+            galore_quantize_proj=galore_quantize_proj
         )
         
         print(f"Configured {optimizer_type} optimizer for MLA model")

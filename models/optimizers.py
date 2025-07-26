@@ -21,6 +21,12 @@ try:
 except ImportError:
     GALORE_AVAILABLE = False
 
+try:
+    from models.galore2_fixed import GaLore2AdamW
+    GALORE2_AVAILABLE = True
+except ImportError:
+    GALORE2_AVAILABLE = False
+
 def get_grouped_params(
     model: torch.nn.Module,
     weight_decay: float,
@@ -120,7 +126,8 @@ def configure_optimizer_for_gpt(
     device_type: str,
     optimizer_type: str = "adamw",
     apollo_config: Optional[Dict[str, Any]] = None,
-    galore_config: Optional[Dict[str, Any]] = None
+    galore_config: Optional[Dict[str, Any]] = None,
+    galore_quantize_proj: Optional[int] = None
 ) -> torch.optim.Optimizer:
     """
     Configure optimizer for GPT-style models.
@@ -131,9 +138,10 @@ def configure_optimizer_for_gpt(
         learning_rate: Learning rate
         betas: Adam beta parameters
         device_type: Device type ('cuda' or 'cpu')
-        optimizer_type: Type of optimizer to use ('adamw', 'lion', 'apollo', 'apollo-mini', 'galore', 'galore-8bit')
+        optimizer_type: Type of optimizer to use ('adamw', 'lion', 'apollo', 'apollo-mini', 'galore', 'galore-8bit', 'galore2')
         apollo_config: Configuration for APOLLO optimizer if used
         galore_config: Configuration for GaLore optimizer if used
+        galore_quantize_proj: Quantization bits for GaLore2 projections (1, 2, or None)
         
     Returns:
         Configured optimizer
@@ -141,6 +149,11 @@ def configure_optimizer_for_gpt(
     # Check if GaLore is requested but not available
     if optimizer_type in ["galore", "galore-8bit"] and not GALORE_AVAILABLE:
         print(f"Warning: {optimizer_type} requested but not available. Falling back to AdamW.")
+        optimizer_type = "adamw"
+    
+    # Check if GaLore2 is requested but not available
+    if optimizer_type == "galore2" and not GALORE2_AVAILABLE:
+        print(f"Warning: GaLore2 requested but not available. Falling back to AdamW.")
         optimizer_type = "adamw"
     
     # Check if APOLLO is requested but not available
@@ -159,6 +172,18 @@ def configure_optimizer_for_gpt(
             device_type=device_type,
             galore_config=galore_config,
             use_8bit=use_8bit
+        )
+    
+    # Use GaLore2 if requested and available
+    if optimizer_type == "galore2" and GALORE2_AVAILABLE:
+        return configure_optimizer_with_galore2(
+            model=model,
+            weight_decay=weight_decay,
+            learning_rate=learning_rate,
+            betas=betas,
+            device_type=device_type,
+            galore_config=galore_config,
+            quantize_proj=galore_quantize_proj
         )
     
     # Use APOLLO if requested and available
@@ -760,6 +785,133 @@ def configure_optimizer_with_galore(
               f"update_proj_gap={config['update_proj_gap']}, scale={config['scale']}")
     
     print(f"GaLore applied to {len(galore_params)} parameters, "
+          f"standard AdamW for {len(non_galore_params)} parameters")
+    
+    return optimizer
+
+
+def configure_optimizer_with_galore2(
+    model: torch.nn.Module,
+    weight_decay: float,
+    learning_rate: float,
+    betas: Tuple[float, float],
+    device_type: str,
+    galore_config: Dict[str, Any] = None,
+    quantize_proj: Optional[int] = None
+) -> torch.optim.Optimizer:
+    """
+    Configure optimizer using GaLore2 (fast randomized SVD version).
+    
+    Args:
+        model: The model to optimize
+        weight_decay: Weight decay coefficient
+        learning_rate: Learning rate
+        betas: Adam beta parameters
+        device_type: Device type ('cuda' or 'cpu')
+        galore_config: Configuration for GaLore optimizer
+            - rank: Low-rank dimension (default: 128)
+            - update_proj_gap: How often to update projection matrices (default: 200)
+            - scale: Scaling factor (default: 0.25)
+            - proj_type: Projection type (default: 'std', options: 'std', 'random', '1bit', '2bit')
+        quantize_proj: Quantization bits for projections (1, 2, or None)
+            
+    Returns:
+        Configured GaLore2 optimizer
+    """
+    if not GALORE2_AVAILABLE:
+        raise ImportError(
+            "GaLore2 optimizer is not available. Check models/galore2.py"
+        )
+    
+    # Default configuration
+    default_config = {
+        'rank': 128,
+        'update_proj_gap': 200,
+        'scale': 0.25,
+        'proj_type': 'std'
+    }
+    
+    # Merge with provided configuration
+    config = default_config.copy()
+    if galore_config:
+        config.update(galore_config)
+    
+    print(f"Configuring GaLore2 optimizer with config: {config}")
+    if quantize_proj:
+        print(f"Using {quantize_proj}-bit projection quantization")
+    
+    # Identify parameters for GaLore projection
+    # Apply to weight matrices only, not biases, norms, or embeddings
+    galore_params = []
+    non_galore_params = []
+    
+    # Patterns for parameters that should NOT use GaLore
+    no_galore_patterns = [
+        '.bias',
+        'LayerNorm', 'ln_', 'norm',
+        'embeddings', 'embed_tokens', 'wte', 'wpe',
+        'lm_head', 'output_projection',
+        'positional', 'pos_emb'
+    ]
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        
+        # Check if this is a parameter that should not use GaLore
+        is_no_galore = any(pattern in name for pattern in no_galore_patterns)
+        
+        # Also check if it's a 2D weight matrix (required for GaLore)
+        is_weight_matrix = len(param.shape) == 2 and param.shape[0] > 256 and param.shape[1] > 256
+        
+        if is_weight_matrix and not is_no_galore:
+            galore_params.append(param)
+            print(f"  GaLore2 will be applied to: {name} (shape: {param.shape})")
+        else:
+            non_galore_params.append(param)
+    
+    # Create parameter groups
+    param_groups = []
+    
+    # Non-GaLore parameters
+    if non_galore_params:
+        param_groups.append({
+            'params': non_galore_params,
+            'weight_decay': weight_decay,
+            'lr': learning_rate
+        })
+    
+    # GaLore parameters with projection config
+    if galore_params:
+        param_groups.append({
+            'params': galore_params,
+            'weight_decay': weight_decay,
+            'lr': learning_rate,
+            'rank': config['rank'],
+            'update_proj_gap': config['update_proj_gap'],
+            'scale': config['scale'],
+            'proj_type': config['proj_type'],
+            'quantize_proj': quantize_proj
+        })
+    
+    # Create GaLore2 optimizer
+    optimizer = GaLore2AdamW(
+        param_groups,
+        lr=learning_rate,
+        betas=betas,
+        eps=1e-8,
+        weight_decay=weight_decay,
+        rank=config['rank'],
+        update_proj_gap=config['update_proj_gap'],
+        scale=config['scale'],
+        proj_type=config['proj_type'],
+        quantize_proj=quantize_proj
+    )
+    
+    print(f"Using GaLore2 optimizer with rank={config['rank']}, "
+          f"update_proj_gap={config['update_proj_gap']}, scale={config['scale']}, "
+          f"proj_type={config['proj_type']}, quantize_proj={quantize_proj}")
+    print(f"GaLore2 applied to {len(galore_params)} parameters, "
           f"standard AdamW for {len(non_galore_params)} parameters")
     
     return optimizer

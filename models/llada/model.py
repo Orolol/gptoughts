@@ -286,17 +286,11 @@ class LLaDAModel(nn.Module):
                 pos_emb_lookup = self.pos_emb(pos)
                 x = x + pos_emb_lookup
             else:
-<<<<<<< HEAD
-                # Pad position embeddings
-                # Note: Print statements removed for torch.compile compatibility
-                # Warning: BD3 combined length exceeds block size. Padding pos emb.
-=======
                 # Need to handle sequences longer than max position embeddings
                 if LLaDAModel._pos_warning_counter < LLaDAModel._pos_warning_max:
                     print(f"Warning: BD3 combined length {current_seq_len} exceeds max pos embeddings {max_pos_len}. Using cyclic embeddings.")
                     LLaDAModel._pos_warning_counter += 1
                     if LLaDAModel._pos_warning_counter == LLaDAModel._pos_warning_max: print("Note: Suppressing further pos emb warnings.")
->>>>>>> ae8b5b0682432ece5d62e777f68ca40423ee3d13
                 
                 # Use cyclic position embeddings for very long sequences
                 pos_indices = torch.arange(0, current_seq_len, device=device) % max_pos_len
@@ -325,17 +319,11 @@ class LLaDAModel(nn.Module):
                 pos_emb_lookup = self.pos_emb(pos)
                 x = x + pos_emb_lookup
             else:
-<<<<<<< HEAD
-                # Pad position embeddings (original warning logic)
-                # Note: Print statements removed for torch.compile compatibility
-                # Warning: Sequence length exceeds block size. Padding pos emb.
-=======
                 # Handle sequences longer than max position embeddings
                 if LLaDAModel._pos_warning_counter < LLaDAModel._pos_warning_max:
                     print(f"Warning: Sequence length {current_seq_len} exceeds max pos embeddings {max_pos_len}. Using cyclic embeddings.")
                     LLaDAModel._pos_warning_counter += 1
                     if LLaDAModel._pos_warning_counter == LLaDAModel._pos_warning_max: print("Note: Suppressing further pos emb warnings.")
->>>>>>> ae8b5b0682432ece5d62e777f68ca40423ee3d13
                 
                 # Use cyclic position embeddings
                 pos_indices = torch.arange(0, current_seq_len, device=device) % max_pos_len

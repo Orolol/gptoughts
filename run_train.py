@@ -40,7 +40,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train LLM models with PyTorch Lightning')
 
     # Model Parameters
-    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'gpt', 'mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'mdm'], default='gpt', help='Type of model to train')
+    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'gpt', 'mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'mdm', 'moe_mla'], default='gpt', help='Type of model to train')
     parser.add_argument('--size', type=str, choices=['small', 'medium', 'large', 'xl'], default='small', help='Size of the model')
     parser.add_argument('--use_lightning', action='store_true', default=True, help='Use PyTorch Lightning for training')
 
@@ -61,7 +61,7 @@ def parse_args():
     parser.add_argument('--attention_backend', type=str, default=None, help='Attention backend (e.g., flash)')
 
     # Optimizer Parameters (passed to LightningModule)
-    parser.add_argument('--optimizer_type', type=str, default=None, choices=['adamw', 'lion', 'apollo', 'apollo-mini', 'galore', 'galore-8bit'], help='Optimizer type')
+    parser.add_argument('--optimizer_type', type=str, default=None, choices=['adamw', 'lion', 'apollo', 'apollo-mini', 'galore', 'galore-8bit', 'galore2'], help='Optimizer type')
     parser.add_argument('--learning_rate', type=float, default=5e-5, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.1, help='Weight decay')
     parser.add_argument('--beta1', type=float, default=0.9, help='Adam beta1')
@@ -94,6 +94,9 @@ def parse_args():
 
     # MoE Parameters (passed to LightningModule)
     parser.add_argument('--router_z_loss_coef', type=float, default=0.001, help='Router loss coefficient')
+    parser.add_argument('--num_experts', type=int, default=8, help='Number of experts in MoE models')
+    parser.add_argument('--experts_per_token', type=int, default=2, help='Number of experts selected per token (top-k routing)')
+    parser.add_argument('--shared_weight_ratio', type=float, default=0.75, help='Ratio of weights shared between experts (0.0 to 1.0)')
 
     # BD3-LM Specific Args (passed to LightningModule)
     parser.add_argument('--use_bd3_training', action='store_true', help='Enable BD3-LM vectorized training path for LLaDA model')
@@ -130,6 +133,7 @@ def parse_args():
     parser.add_argument('--galore_update_proj_gap', type=int, default=200, help='GaLore projection update interval')
     parser.add_argument('--galore_scale', type=float, default=0.25, help='GaLore scaling factor')
     parser.add_argument('--galore_proj_type', type=str, default='std', help='GaLore projection type')
+    parser.add_argument('--galore_quantize_proj', type=int, default=None, help='GaLore2 projection quantization (1 or 2 bits)')
     
     # Selective Attention Parameters (for MLA-Selective model)
     parser.add_argument('--selection_ratio', type=float, default=0.5, help='Ratio of tokens to select (0.0 to 1.0)')

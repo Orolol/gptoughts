@@ -76,5 +76,3 @@ python run_train.py \
     --eval_interval 1000 \
     --save_interval 5000 \
     --log_interval_steps 100 \
-    --wandb_project "llada-dyntanh" \
-    --wandb_run_name "llada_${SIZE}_dyt_b${BATCH_SIZE}_s${BLOCK_SIZE}"

@@ -54,7 +54,7 @@ python run_train.py \
     --learning_rate 5e-5 \
     --weight_decay 0.1 \
     --warmup_iters 200 \
-    --max_iters 10000 \
+    --max_iters 1000000 \
     --eval_interval_steps 1000 \
     --log_interval_steps 10 \
     --gradient_accumulation_steps 1 \

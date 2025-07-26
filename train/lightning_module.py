@@ -17,6 +17,7 @@ from models.models.model import GPT
 from models.models.mla_model import MLAModel, MLAModelConfig
 from models.models.parscale_mla import ParScaleMLA, ParScaleMLAConfig, create_parscale_mla
 from models.models.mla_selective_model import MLASelectiveModel, MLASelectiveModelConfig
+from models.models.moe_mla_model import MOEMLA, MOEMLAConfig
 from models.mdm.model import MDMModel
 from models.config import MDMConfig
 from train.train_utils import (
@@ -27,6 +28,7 @@ from optimization.memory_optim import cleanup_memory, print_memory_stats, preall
 from optimization.cuda_optim import setup_cuda_optimizations, print_gpu_stats
 from optimization.training_optim import enable_torch_compile
 from optimization.fp8_deepseek_trainer import FP8AdamW, FP8MixedPrecisionTrainer
+from models.galore2_fixed import GaLore2AdamW
 
 
 class LLMLightningModule(pl.LightningModule):
@@ -63,9 +65,10 @@ class LLMLightningModule(pl.LightningModule):
         
         # Compile model if requested
         if hasattr(self.args, 'compile') and self.args.compile:
-            # Skip compilation for mla_llada models due to torch.compile compatibility issues
-            if self.args.model_type.lower() == 'mla_llada':
-                print("Skipping model compilation for mla_llada model (torch.compile compatibility issues)")
+            # Skip compilation for models with known torch.compile compatibility issues
+            skip_compile_models = ['mla_llada']
+            if self.args.model_type.lower() in skip_compile_models:
+                print(f"Skipping model compilation for {self.args.model_type} model (torch.compile compatibility issues with gradient checkpointing)")
             else:
                 # For MLA-selective model, disable gradient checkpointing before compilation
                 if self.args.model_type.lower() == 'mla_selective':
@@ -131,6 +134,9 @@ class LLMLightningModule(pl.LightningModule):
         elif model_type == 'mdm':
             config = self._create_mdm_config()
             model = self._create_mdm_model(config)
+        elif model_type == 'moe_mla':
+            config = self._create_moe_mla_config()
+            model = self._create_moe_mla_model(config)
         else: # gpt
             config = self._create_gpt_config()
             model = GPT(config)
@@ -205,11 +211,11 @@ class LLMLightningModule(pl.LightningModule):
         elif self.args.size == 'medium':
             n_layer = 24
             n_embd = 1024
-            n_head = 16
+            n_head = 24
         elif self.args.size == 'large':
             n_layer = 32
             n_embd = 2048
-            n_head = 16
+            n_head = 32
         else:  # xl
             n_layer = 40
             n_embd = 2560
@@ -515,6 +521,50 @@ class LLMLightningModule(pl.LightningModule):
         """Create MDM model instance."""
         return MDMModel(config)
     
+    def _create_moe_mla_config(self):
+        """Create configuration for MOE-MLA model."""
+        # Start with base MLA config dimensions
+        base_config = self._create_mla_config()
+        
+        # Create MOE-MLA config
+        config = MOEMLAConfig(
+            # Copy base MLA parameters
+            n_layer=base_config.n_layer,
+            n_embd=base_config.n_embd,
+            n_head=base_config.n_head,
+            vocab_size=base_config.vocab_size,
+            block_size=base_config.block_size,
+            q_lora_rank=base_config.q_lora_rank,
+            kv_lora_rank=base_config.kv_lora_rank,
+            qk_nope_head_dim=base_config.qk_nope_head_dim,
+            qk_rope_head_dim=base_config.qk_rope_head_dim,
+            v_head_dim=base_config.v_head_dim,
+            rope_theta=base_config.rope_theta,
+            dropout=base_config.dropout,
+            bias=base_config.bias,
+            attention_backend=base_config.attention_backend,
+            use_gradient_checkpointing=base_config.use_gradient_checkpointing,
+            
+            # MOE-specific parameters
+            num_experts=getattr(self.args, 'num_experts', 8),
+            experts_per_token=getattr(self.args, 'experts_per_token', 2),
+            shared_weight_ratio=getattr(self.args, 'shared_weight_ratio', 0.75),
+            
+            # FP8 settings
+            use_fp8=getattr(self.args, 'use_fp8', False),
+            fp8_tile_size=getattr(self.args, 'fp8_tile_size', 128),
+            
+            # DyT settings
+            use_dyt=getattr(self.args, 'use_dyt', False),
+            dyt_alpha_init=getattr(self.args, 'dyt_alpha_init', 0.5),
+        )
+        
+        return config
+    
+    def _create_moe_mla_model(self, config):
+        """Create MOE-MLA model instance."""
+        return MOEMLA(config)
+    
     # --- End Config Creation Methods ---
 
     def forward(self, input_ids, targets=None, **kwargs):
@@ -582,6 +632,11 @@ class LLMLightningModule(pl.LightningModule):
                 mask_ratio = output['mask'].float().mean()
                 self.log('train/mask_ratio', mask_ratio.item(), on_step=True, on_epoch=False, sync_dist=True)
             return logits, loss, None
+        elif model_type == 'moe_mla':
+            # MOE-MLA returns logits, loss directly with router loss incorporated
+            logits, loss = self.model(input_ids, targets)
+            # Router loss is already included in the loss
+            return logits, loss, None
         else: # deepseek or gpt
             model_output = self.model(input_ids, targets=targets)
 
@@ -620,7 +675,7 @@ class LLMLightningModule(pl.LightningModule):
                     targets = targets.detach().clone().requires_grad_(False)
                 
                 # Add special handling for MLA and ParScale-MLA models
-                if self.args.model_type.lower() in ['mla', 'mla_selective', 'parscale_mla', 'mla_llada']:
+                if self.args.model_type.lower() in ['mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'moe_mla']:
                     try:
                         # Ensure the model knows we're in training mode
                         self.model.train()
@@ -670,10 +725,10 @@ class LLMLightningModule(pl.LightningModule):
                     print(f"WARNING: NaN/Inf detected in router_loss at step {self.global_step}. Setting to zero.")
                     router_loss = torch.zeros_like(router_loss)
 
-                # For MLA and ParScale-MLA models, router loss is already incorporated internally
+                # For MLA, ParScale-MLA, and MOE-MLA models, router loss is already incorporated internally
                 model_type = getattr(self.args, 'model_type', 'gpt')
                 
-                if model_type in ['mla', 'parscale_mla']:
+                if model_type in ['mla', 'parscale_mla', 'moe_mla']:
                     # Don't add router loss to prevent double counting
                     combined_loss = loss
                     # Still log the router loss for monitoring
@@ -761,6 +816,14 @@ class LLMLightningModule(pl.LightningModule):
         self.log('tokens_per_sec_avg', avg_tokens_per_sec, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
         self.log('total_tokens', float(self.total_tokens), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True) # Log as float for logger compatibility
         
+        # Calculate tokens per second per million parameters
+        param_count_millions = sum(p.numel() for p in self.model.parameters()) / 1e6
+        if param_count_millions > 0:
+            tokens_per_sec_per_M_params = current_tokens_per_sec / param_count_millions
+            avg_tokens_per_sec_per_M_params = avg_tokens_per_sec / param_count_millions
+            self.log('tokens_per_sec_per_M_params', tokens_per_sec_per_M_params, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False)
+            self.log('tokens_per_sec_per_M_params_avg', avg_tokens_per_sec_per_M_params, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        
         # Store metrics in buffer for CSV logging
         lr = self.trainer.optimizers[0].param_groups[0]['lr']
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -779,6 +842,10 @@ class LLMLightningModule(pl.LightningModule):
         val_loss = self.last_val_loss
         val_perplexity = self.last_val_perplexity
         
+        # Calculate tokens per second per million parameters for CSV
+        param_count_millions = sum(p.numel() for p in self.model.parameters()) / 1e6
+        tokens_per_sec_per_M_params = current_tokens_per_sec / param_count_millions if param_count_millions > 0 else 0
+        
         self.metrics_buffer.append([
             self.global_step,
             f"{loss_value:.6f}",
@@ -786,6 +853,7 @@ class LLMLightningModule(pl.LightningModule):
             f"{val_perplexity:.6f}" if val_perplexity is not None else "N/A",
             f"{lr:.2e}",
             f"{current_tokens_per_sec:.2f}",
+            f"{tokens_per_sec_per_M_params:.2f}",
             f"{self.total_tokens}",
             f"{grad_norm:.4f}" if grad_norm > 0 else "N/A",
             timestamp
@@ -826,7 +894,7 @@ class LLMLightningModule(pl.LightningModule):
         #     print(f"TEXT TARGET: {self.args.tokenizer.decode(targets[0])}")
 
         # Clear MLA caches after each training step to prevent memory accumulation
-        if hasattr(self.model, 'clear_cache') and self.args.model_type.lower() in ['mla', 'parscale_mla', 'mla_selective']:
+        if hasattr(self.model, 'clear_cache') and self.args.model_type.lower() in ['mla', 'parscale_mla', 'mla_selective', 'moe_mla']:
             self.model.clear_cache()
         # Clear diffusion cache for MLA-LLaDA
         elif self.args.model_type.lower() == 'mla_llada' and hasattr(self.model, 'cache_manager'):
@@ -843,7 +911,7 @@ class LLMLightningModule(pl.LightningModule):
             targets = targets.detach().clone().requires_grad_(False)
             
         # Forward pass with model-specific handling
-        if self.args.model_type.lower() in ['mla', 'parscale_mla', 'mla_llada']:
+        if self.args.model_type.lower() in ['mla', 'parscale_mla', 'mla_llada', 'moe_mla']:
             try:
                 # Ensure the model knows we're in eval mode
                 self.model.eval()
@@ -940,13 +1008,16 @@ class LLMLightningModule(pl.LightningModule):
             optimizer_kwargs = {}
             
             # Add GaLore-specific parameters if using GaLore
-            if hasattr(self.args, 'optimizer_type') and self.args.optimizer_type in ['galore', 'galore-8bit']:
+            if hasattr(self.args, 'optimizer_type') and self.args.optimizer_type in ['galore', 'galore-8bit', 'galore2']:
                 optimizer_kwargs.update({
                     'galore_rank': getattr(self.args, 'galore_rank', 128),
                     'galore_update_proj_gap': getattr(self.args, 'galore_update_proj_gap', 200),
                     'galore_scale': getattr(self.args, 'galore_scale', 0.25),
                     'galore_proj_type': getattr(self.args, 'galore_proj_type', 'std')
                 })
+                # Add GaLore2-specific parameters
+                if self.args.optimizer_type == 'galore2':
+                    optimizer_kwargs['galore_quantize_proj'] = getattr(self.args, 'galore_quantize_proj', None)
             
             # For models with configure_optimizers method, use it
             optimizer = self.model.configure_optimizers(
@@ -1150,7 +1221,7 @@ class LLMLightningModule(pl.LightningModule):
         # Open CSV file and write headers
         self.csv_file = open(self.csv_file_path, 'w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
-        self.csv_writer.writerow(['step', 'train_loss', 'val_loss', 'val_perplexity', 'learning_rate', 'tokens_per_sec', 'total_tokens', 'grad_norm', 'timestamp'])
+        self.csv_writer.writerow(['step', 'train_loss', 'val_loss', 'val_perplexity', 'learning_rate', 'tokens_per_sec', 'tokens_per_sec_per_M_params', 'total_tokens', 'grad_norm', 'timestamp'])
         self.csv_file.flush()
         
         print(f"CSV metrics logging initialized: {self.csv_file_path}")
