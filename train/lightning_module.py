@@ -208,18 +208,40 @@ class LLMLightningModule(pl.LightningModule):
             n_layer = 12
             n_embd = 768
             n_head = 12
+            q_lora_rank = 0
+            kv_lora_rank = 256
+            qk_nope_head_dim = 128
+            qk_rope_head_dim = 64
+            v_head_dim = 128
         elif self.args.size == 'medium':
-            n_layer = 24
+            n_layer = 16
             n_embd = 1024
-            n_head = 24
+            n_head = 16
+            q_lora_rank = 0
+            kv_lora_rank = 512
+            qk_nope_head_dim = 128
+            qk_rope_head_dim = 64
+            v_head_dim = 128
         elif self.args.size == 'large':
             n_layer = 32
             n_embd = 2048
             n_head = 32
+            q_lora_rank = 0
+            kv_lora_rank = 512
+            qk_nope_head_dim = 192
+            qk_rope_head_dim = 96
+            v_head_dim = 192
         else:  # xl
             n_layer = 40
             n_embd = 2560
             n_head = 20
+            q_lora_rank = 0
+            kv_lora_rank = 1024
+            qk_nope_head_dim = 384
+            qk_rope_head_dim = 192
+            v_head_dim = 384
+            
+            
         
         # Create config object
         config = MLAModelConfig(
@@ -231,11 +253,11 @@ class LLMLightningModule(pl.LightningModule):
             block_size=self.args.block_size,
             
             # MLA parameters
-            q_lora_rank=0,
-            kv_lora_rank=512,
-            qk_nope_head_dim=128,
-            qk_rope_head_dim=64,
-            v_head_dim=128,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
             
             # MoE parameters
             use_moe=False,  # Set to False for dense model
