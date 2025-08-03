@@ -7,6 +7,7 @@ from .mla_model import MLAModel, MLAModelConfig, create_mla_model
 from .parscale_mla import ParScaleMLA, ParScaleMLAConfig, create_parscale_mla
 from .mla_selective_model import MLASelectiveModel, MLASelectiveModelConfig, create_mla_selective_model
 from .mla_llada import MLALLaDAModel, MLALLaDAConfig, create_mla_llada_model
+from .nsa_model import NSAModel, NSAModelConfig, create_nsa_model
 from ..mdm.model import MDMModel
 
 __all__ = [
@@ -26,5 +27,8 @@ __all__ = [
     'MLALLaDAModel',
     'MLALLaDAConfig',
     'create_mla_llada_model',
+    'NSAModel',
+    'NSAModelConfig',
+    'create_nsa_model',
     'MDMModel',
 ]

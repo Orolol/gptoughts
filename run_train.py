@@ -40,7 +40,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train LLM models with PyTorch Lightning')
 
     # Model Parameters
-    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'gpt', 'mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'mdm', 'moe_mla'], default='gpt', help='Type of model to train')
+    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'gpt', 'mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'mdm', 'moe_mla', 'nsa'], default='gpt', help='Type of model to train')
     parser.add_argument('--size', type=str, choices=['small', 'medium', 'large', 'xl'], default='small', help='Size of the model')
     parser.add_argument('--use_lightning', action='store_true', default=True, help='Use PyTorch Lightning for training')
 
@@ -111,6 +111,10 @@ def parse_args():
     # Advanced Optimizations (passed to LightningModule)
     parser.add_argument('--optimize_attention', action='store_true', help='Enable attention optimizations (if available)')
     parser.add_argument('--preallocate_memory', action='store_true', help='Preallocate CUDA memory (if available)')
+    
+    # Profiling Parameters
+    parser.add_argument('--profile', action='store_true', help='Enable profiling for NSA model')
+    parser.add_argument('--profile_interval', type=int, default=100, help='Steps between profiling summaries')
     
     # Dynamic Tanh (DyT) Parameters
     parser.add_argument('--use_dyt', action='store_true', help='Use Dynamic Tanh (DyT) instead of RMSNorm for ~8% speedup')

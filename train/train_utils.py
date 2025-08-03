@@ -1109,6 +1109,14 @@ def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8, top_
                         temperature=temperature,
                         top_k=top_k
                     )
+                elif model_class_name == 'NSAModel' or 'NSA' in model_class_name:
+                    # NSAModel expects 'idx' as the primary parameter
+                    output_tokens, _ = model.generate(
+                        idx=encoder_input,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_k=top_k
+                    )
                 else:
                     # Standard generate call for other models (e.g., GPT) OR LLaDA if isinstance fails
                     # Assuming they have a generate method compatible with these args

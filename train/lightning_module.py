@@ -18,6 +18,7 @@ from models.models.mla_model import MLAModel, MLAModelConfig
 from models.models.parscale_mla import ParScaleMLA, ParScaleMLAConfig, create_parscale_mla
 from models.models.mla_selective_model import MLASelectiveModel, MLASelectiveModelConfig
 from models.models.moe_mla_model import MOEMLA, MOEMLAConfig
+from models.models.nsa_model import NSAModel, NSAModelConfig
 from models.mdm.model import MDMModel
 from models.config import MDMConfig
 from train.train_utils import (
@@ -54,7 +55,7 @@ class LLMLightningModule(pl.LightningModule):
         # Keep track of last validation metrics
         self.last_val_loss = None
         self.last_val_perplexity = None
-
+        
         # Apply CUDA optimizations if available and requested
         if torch.cuda.is_available():
             setup_cuda_optimizations()
@@ -137,6 +138,9 @@ class LLMLightningModule(pl.LightningModule):
         elif model_type == 'moe_mla':
             config = self._create_moe_mla_config()
             model = self._create_moe_mla_model(config)
+        elif model_type == 'nsa':
+            config = self._create_nsa_config()
+            model = self._create_nsa_model(config)
         else: # gpt
             config = self._create_gpt_config()
             model = GPT(config)
@@ -587,6 +591,83 @@ class LLMLightningModule(pl.LightningModule):
         """Create MOE-MLA model instance."""
         return MOEMLA(config)
     
+    def _create_nsa_config(self):
+        """Create configuration for NSA Model."""
+        # Define key parameters based on size
+        if self.args.size == 'small':
+            n_layer = 12
+            n_embd = 768
+            n_head = 12
+            compress_block_size = 16
+            compress_stride = 8
+            selection_block_size = 32
+            num_selected_blocks = 8
+            sliding_window_size = 256
+        elif self.args.size == 'medium':
+            n_layer = 24
+            n_embd = 1024
+            n_head = 16
+            compress_block_size = 32
+            compress_stride = 16
+            selection_block_size = 64
+            num_selected_blocks = 12
+            sliding_window_size = 384
+        elif self.args.size == 'large':
+            n_layer = 32
+            n_embd = 2048
+            n_head = 16
+            compress_block_size = 32
+            compress_stride = 16
+            selection_block_size = 64
+            num_selected_blocks = 16
+            sliding_window_size = 512
+        else:  # xl
+            n_layer = 40
+            n_embd = 2560
+            n_head = 20
+            compress_block_size = 64
+            compress_stride = 32
+            selection_block_size = 128
+            num_selected_blocks = 20
+            sliding_window_size = 640
+        
+        # Create config object
+        config = NSAModelConfig(
+            # Architecture
+            n_layer=n_layer,
+            n_embd=n_embd,
+            n_head=n_head,
+            vocab_size=self.args.vocab_size,
+            block_size=self.args.block_size,
+            
+            # NSA specific parameters
+            compress_block_size=compress_block_size,
+            compress_stride=compress_stride,
+            selection_block_size=selection_block_size,
+            num_selected_blocks=num_selected_blocks,
+            sliding_window_size=sliding_window_size,
+            
+            # Common training parameters
+            dropout=self.args.dropout,
+            bias=self.args.bias,
+            use_gradient_checkpointing=getattr(self.args, 'gradient_checkpointing', True),
+            use_fp8=self.args.use_fp8,
+            fp8_tile_size=getattr(self.args, 'fp8_tile_size', 128),
+            
+            # DyT options
+            use_dyt=getattr(self.args, 'use_dyt', False),
+            dyt_alpha_init=getattr(self.args, 'dyt_alpha_init', 0.5),
+            
+            # Label smoothing
+            label_smoothing=getattr(self.args, 'label_smoothing', 0.0),
+        )
+        
+        return config
+    
+    def _create_nsa_model(self, config):
+        """Create NSA model instance."""
+        return NSAModel(config)
+    
     # --- End Config Creation Methods ---
 
     def forward(self, input_ids, targets=None, **kwargs):
@@ -894,8 +975,8 @@ class LLMLightningModule(pl.LightningModule):
         self.timing_stats.step()
         if self.timing_stats.should_print() and self.global_rank == 0:
             self.timing_stats.print_stats()
-
-        elif self.global_step % 100 == 0:
+        
+        if self.global_step % 100 == 0:
             self.generate_sample_text()
             
             # Log ParScale-specific metrics if applicable
