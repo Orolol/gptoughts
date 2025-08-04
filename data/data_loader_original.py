@@ -131,7 +131,9 @@ class FinewebDataset(IterableDataset):
         # labels[i] should be input_ids[i+1]
         labels = input_ids.clone()
         labels[:, :-1] = input_ids[:, 1:]
-        labels[:, -1] = -1  # Set last position to -1 (will be ignored by loss)
+        labels[:, -1] = self.tokenizer.pad_token_id
+        
+        labels[input_ids == self.tokenizer.pad_token_id] = -100
         
         # For consistency with the interface, keep decoder_input_ids same as input_ids
         tokenized['decoder_input_ids'] = input_ids.clone()
