@@ -48,7 +48,7 @@ CMD="python run_train.py \
     --batch_size $BATCH_SIZE \
     --block_size $BLOCK_SIZE \
     --output_dir $OUTPUT_DIR \
-    --num_workers 1 \
+    --num_workers 2 \
     --gradient_accumulation_steps 1 \
     --learning_rate 5e-4 \
     --min_lr 3e-5 \

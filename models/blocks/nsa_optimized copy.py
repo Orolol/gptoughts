@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, Any
 from dataclasses import dataclass
-from .positional_encoding import apply_rope
+from .positional_encoding import RoPE
 
 
 @dataclass
@@ -18,7 +18,6 @@ class NSAConfig:
     n_groups: int = 4  # For GQA
     head_dim: int = 192
     value_dim: int = 128
-    qk_rope_head_dim: int = 64
     
     # NSA parameters
     compress_block_size: int = 32      # l
@@ -247,7 +246,6 @@ class NSAAttention(nn.Module):
     def compressed_attention(
         self, 
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -283,11 +281,6 @@ class NSAAttention(nn.Module):
         q = q.view(B, T, self.n_heads, 2 * self.head_dim + self.value_dim)
         q = q.transpose(1, 2)[..., :self.head_dim]  # [B, n_heads, T, head_dim]
         
-        # Apply RoPE to query
-        q_rope = q[..., :self.config.qk_rope_head_dim]
-        q_rope = apply_rope(q_rope, freqs_cis)
-        q = torch.cat((q_rope, q[..., self.config.qk_rope_head_dim:]), dim=-1)
-        
         # Attention scores
         scores = torch.matmul(q, k_compressed.transpose(-2, -1)) / self.scale
         
@@ -312,7 +305,6 @@ class NSAAttention(nn.Module):
     def selected_attention(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
         attn_scores_compressed: torch.Tensor,
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -339,16 +331,6 @@ class NSAAttention(nn.Module):
             [self.head_dim, self.head_dim, self.value_dim],
             dim=-1
         ) # q, k, v: [B, H, T, dim]
-
-        # Apply RoPE to query and key
-        q_rope = q[..., :self.config.qk_rope_head_dim]
-        q_rope = apply_rope(q_rope, freqs_cis)
-        q = torch.cat((q_rope, q[..., self.config.qk_rope_head_dim:]), dim=-1)
-
-        k_rope = k[..., :self.config.qk_rope_head_dim]
-        k_rope = apply_rope(k_rope, freqs_cis)
-        k = torch.cat((k_rope, k[..., self.config.qk_rope_head_dim:]), dim=-1)
-
 
         # Compute importance scores for block selection
         k_compressed_dummy = k.mean(dim=2, keepdim=True)
@@ -429,7 +411,6 @@ class NSAAttention(nn.Module):
     def window_attention(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
@@ -453,15 +434,6 @@ class NSAAttention(nn.Module):
             [self.head_dim, self.head_dim, self.value_dim],
             dim=-1
         )
-
-        # Apply RoPE to query and key
-        q_rope = q[..., :self.config.qk_rope_head_dim]
-        q_rope = apply_rope(q_rope, freqs_cis)
-        q = torch.cat((q_rope, q[..., self.config.qk_rope_head_dim:]), dim=-1)
-
-        k_rope = k[..., :self.config.qk_rope_head_dim]
-        k_rope = apply_rope(k_rope, freqs_cis)
-        k = torch.cat((k_rope, k[..., self.config.qk_rope_head_dim:]), dim=-1)
         
         # Create sliding window mask (vectorized)
         q_indices = torch.arange(T, device=x.device)[:, None]
@@ -593,7 +565,6 @@ class NSAAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
@@ -613,11 +584,11 @@ class NSAAttention(nn.Module):
         gates = gates.expand(B, T, 3)
         
         # Three parallel attention branches
-        attn_compressed, scores_compressed = self.compressed_attention(x, freqs_cis, mask)
+        attn_compressed, scores_compressed = self.compressed_attention(x, mask)
         
-        attn_selected = self.selected_attention(x, freqs_cis, scores_compressed, mask)
+        attn_selected = self.selected_attention(x, scores_compressed, mask)
         
-        attn_window = self.window_attention(x, freqs_cis, mask)
+        attn_window = self.window_attention(x, mask)
         
         # Weighted fusion
         output = (

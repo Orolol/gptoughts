@@ -20,6 +20,7 @@ from models.blocks.nsa_optimized import NSAConfig
 from models.blocks.nsa_block import NSABlock
 from models.blocks.normalization import RMSNorm, DynamicTanh
 from models.blocks.tensor_utils import prevent_backward_reuse
+from models.blocks.positional_encoding import precompute_freqs_cis, apply_rope
 
 # Import utility functions
 from train.train_utils import estimate_mfu as utils_estimate_mfu
@@ -46,8 +47,14 @@ class NSAModelConfig:
     num_selected_blocks: int = 16
     sliding_window_size: int = 512
     
+    # RoPE
+    qk_rope_head_dim: int = 64
+    rope_theta: float = 10000.0
+    rope_scaling: Optional[Dict[str, Any]] = None
+    original_max_seq_len: int = 4096
+    
     # Precision
-    use_fp8: bool = False
+    use_fp8: bool = True
     use_fp4_inference: bool = False
     fp8_tile_size: int = 128
     enable_microscaling: bool = False
@@ -62,7 +69,7 @@ class NSAModelConfig:
     label_smoothing: float = 0.0
     
     # Dynamic Tanh (DyT) options
-    use_dyt: bool = False
+    use_dyt: bool = True
     dyt_alpha_init: float = 0.5
     
     def __post_init__(self):
@@ -82,6 +89,7 @@ class NSAModelConfig:
             n_groups=self.n_groups,
             head_dim=self.head_dim,
             value_dim=self.value_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
             compress_block_size=self.compress_block_size,
             compress_stride=self.compress_stride,
             selection_block_size=self.selection_block_size,
@@ -126,11 +134,24 @@ class NSAModel(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight = self.transformer.wte.weight
         
+        # Precompute RoPE frequencies
+        self.freqs_cis = precompute_freqs_cis(
+            config.qk_rope_head_dim, config.block_size, config.rope_theta
+        )
+        
         # Timing stats for MFU estimation
         self.timing_stats = None
         
         # Initialize weights
         self.apply(self._init_weights)
+        
+        # FP8 configuration handling
+        if config.use_fp8:
+            print("Note: FP8 training is enabled. This will use FP8 for computations where possible,")
+            print("but model parameters will remain in BFloat16/Float32 for optimizer compatibility.")
+            self.use_fp8_compute = True
+        else:
+            self.use_fp8_compute = False
         
         # Parameter count
         self.param_count = sum(p.numel() for p in self.parameters())
@@ -217,9 +238,12 @@ class NSAModel(nn.Module):
                 # NSA handles causality internally, so we just pass a simple mask
                 # indicating which positions are valid
             
+            # Prepare RoPE frequencies
+            freqs_cis = self.freqs_cis[:t].to(device)
+
             # Process through transformer layers
             for i, block in enumerate(self.transformer.h):
-                x = block(x, mask=mask)
+                x = block(x, freqs_cis=freqs_cis, mask=mask)
             
             # Final layer norm
             x = self.transformer.ln_f(x)
