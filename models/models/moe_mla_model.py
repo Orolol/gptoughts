@@ -481,7 +481,7 @@ class MOEMLA(nn.Module):
                     mask = (targets != -1).float()
                 loss = (loss * mask.view(-1)).sum() / mask.sum()
             else:
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
             
             # Add router loss for load balancing
             router_loss = self.get_router_loss()

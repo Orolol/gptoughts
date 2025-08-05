@@ -381,7 +381,7 @@ class MLASelectiveModel(nn.Module):
                     loss = (loss * mask.view(-1)).sum() / mask.sum()
                 else:
                     # Standard loss without label smoothing
-                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
                 
             else:
                 # Inference-time optimization: only compute logits for last position

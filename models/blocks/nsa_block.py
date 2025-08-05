@@ -52,11 +52,11 @@ class NSABlock(nn.Module):
     def _attn_block(
         self, 
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        rope: nn.Module,
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Attention sub-block with normalization."""
-        return self.attn(self.norm1(x), freqs_cis, mask)
+        return self.attn(self.norm1(x), rope, mask)
     
     def _ffn_block(self, x: torch.Tensor) -> torch.Tensor:
         """Feed-forward sub-block with normalization."""
@@ -65,7 +65,7 @@ class NSABlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        rope: nn.Module,
         mask: Optional[torch.Tensor] = None,
         **kwargs  # For compatibility with other blocks that might pass additional args
     ) -> torch.Tensor:
@@ -84,11 +84,11 @@ class NSABlock(nn.Module):
         # Attention with residual
         if self.use_checkpoint and self.training:
             attn_output = checkpoint.checkpoint(
-                self._attn_block, x, freqs_cis, mask,
+                self._attn_block, x, rope, mask,
                 use_reentrant=False
             )
         else:
-            attn_output = self._attn_block(x, freqs_cis, mask)
+            attn_output = self._attn_block(x, rope, mask)
         
         # Handle potential dtype conversion for residual
         if attn_output.dtype != x.dtype:

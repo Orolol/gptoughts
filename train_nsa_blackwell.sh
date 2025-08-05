@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Training script for NSA model with Blackwell optimizations
-# Usage: ./train_nsa_blackwell.sh [size] [batch_size] [block_size] [output_dir] [use_blackwell] [profile]
+# Usage: ./train_nsa_blackwell.sh [size] [batch_size] [block_size] [output_dir] [use_blackwell] [profile] [resume]
 
 # Default parameters
 SIZE=${1:-"medium"}
@@ -10,6 +10,7 @@ BLOCK_SIZE=${3:-4096}
 OUTPUT_DIR=${4:-"out_nsa_blackwell"}
 USE_BLACKWELL=${5:-1}  # 1 to enable Blackwell optimizations, 0 to disable
 PROFILE=${6:-0}  # 1 to enable profiling, 0 to disable
+RESUME=${7:-false}
 
 # Set environment variables for optimal performance
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
@@ -24,6 +25,7 @@ echo "Batch size: $BATCH_SIZE"
 echo "Block size: $BLOCK_SIZE"
 echo "Output directory: $OUTPUT_DIR"
 echo "Blackwell optimizations: $USE_BLACKWELL"
+echo "Resume: $RESUME"
 echo "============================================"
 
 # Check if we're on a Blackwell GPU
@@ -40,6 +42,13 @@ if torch.cuda.is_available():
     else:
         print('⚠ Older GPU - some optimizations may not be available')
 "
+
+# Set resume options
+RESUME_ARGS=""
+if [ "$RESUME" = "true" ] || [ "$RESUME" = "1" ]; then
+    RESUME_ARGS="--init_from resume"
+    echo "Will attempt to resume from last checkpoint in $OUTPUT_DIR"
+fi
 
 # Build the command
 CMD="python run_train.py \
@@ -58,7 +67,8 @@ CMD="python run_train.py \
     --eval_interval_steps 2000 \
     --log_interval_steps 10 \
     --grad_clip 0 \
-    --weight_decay 0.1"
+    --weight_decay 0.1 \
+    $RESUME_ARGS"
 
 # Add Blackwell-specific optimizations if enabled
 if [ "$USE_BLACKWELL" -eq 1 ]; then
@@ -66,14 +76,6 @@ if [ "$USE_BLACKWELL" -eq 1 ]; then
         --use_fp8 \
         --precision bf16-mixed \
         --compile"
-    
-    # Add additional args that need to be passed through to the model
-    echo ""
-    echo "Note: To fully enable Blackwell optimizations, ensure your model config includes:"
-    echo "  - use_blackwell_optimizations: True"
-    echo "  - blackwell_gpu_model: 'RTX_5090' (or your GPU model)"
-    echo "  - enable_async_pipeline: True"
-    echo "  - use_triton_kernels: True"
 fi
 
 # Create output directory

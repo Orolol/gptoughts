@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, Any
 from dataclasses import dataclass
-from .positional_encoding import apply_rope
+
 
 
 @dataclass
@@ -247,7 +247,7 @@ class NSAAttention(nn.Module):
     def compressed_attention(
         self, 
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        rope: nn.Module,
         mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -285,11 +285,19 @@ class NSAAttention(nn.Module):
         
         # Apply RoPE to query
         q_rope = q[..., :self.config.qk_rope_head_dim]
-        q_rope = apply_rope(q_rope, freqs_cis)
+        q_rope = rope(q_rope)
         q = torch.cat((q_rope, q[..., self.config.qk_rope_head_dim:]), dim=-1)
         
         # Attention scores
         scores = torch.matmul(q, k_compressed.transpose(-2, -1)) / self.scale
+        
+        # --- Causal Masking ---
+        # A query at position `t` can only attend to compressed blocks that were generated
+        # entirely from tokens in the past. The end of a block must be <= t.
+        q_indices = torch.arange(T, device=x.device).view(1, 1, T, 1)
+        block_end_indices = (torch.arange(num_blocks, device=x.device) * self.config.compress_stride + self.config.compress_block_size).view(1, 1, 1, num_blocks)
+        causal_mask = q_indices >= block_end_indices
+        scores = scores.masked_fill(~causal_mask, torch.finfo(scores.dtype).min)
         
         # Apply mask if provided
         if mask is not None:
@@ -312,15 +320,16 @@ class NSAAttention(nn.Module):
     def selected_attention(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        rope: nn.Module,
         attn_scores_compressed: torch.Tensor,
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Perform attention on selected blocks (Optimized, vectorized version).
+        Perform attention on selected blocks with causal masking, using a group-wise approach for clarity and stability.
         
         Args:
             x: Input tensor [B, T, D]
+            rope: RoPE module
             attn_scores_compressed: Attention scores from compression branch
             mask: Optional attention mask
             
@@ -329,107 +338,80 @@ class NSAAttention(nn.Module):
         """
         B, T, D = x.shape
         H, G = self.n_heads, self.n_groups
+        heads_per_group = H // G
         l_prime, n_selected = self.config.selection_block_size, self.config.num_selected_blocks
-        
+
         # QKV projection
         qkv = self.qkv_selected(x)
         qkv = qkv.view(B, T, H, 2 * self.head_dim + self.value_dim)
-        q, k, v = torch.split(
-            qkv.transpose(1, 2),
-            [self.head_dim, self.head_dim, self.value_dim],
-            dim=-1
-        ) # q, k, v: [B, H, T, dim]
+        q, k, v = torch.split(qkv, [self.head_dim, self.head_dim, self.value_dim], dim=-1)
+        
+        # Reshape and apply RoPE
+        q = q.transpose(1, 2) # [B, H, T, head_dim]
+        k = k.transpose(1, 2) # [B, H, T, head_dim]
+        v = v.transpose(1, 2) # [B, H, T, value_dim]
 
-        # Apply RoPE to query and key
-        q_rope = q[..., :self.config.qk_rope_head_dim]
-        q_rope = apply_rope(q_rope, freqs_cis)
+        q_rope = rope(q[..., :self.config.qk_rope_head_dim])
         q = torch.cat((q_rope, q[..., self.config.qk_rope_head_dim:]), dim=-1)
-
-        k_rope = k[..., :self.config.qk_rope_head_dim]
-        k_rope = apply_rope(k_rope, freqs_cis)
+        k_rope = rope(k[..., :self.config.qk_rope_head_dim])
         k = torch.cat((k_rope, k[..., self.config.qk_rope_head_dim:]), dim=-1)
 
-
-        # Compute importance scores for block selection
+        # Compute importance and select top blocks for each group
         k_compressed_dummy = k.mean(dim=2, keepdim=True)
-        importance = self.block_selection.compute_importance_scores(
-            q, k_compressed_dummy, attn_scores_compressed
-        )
-        
-        # Select top blocks
-        selected_indices = self.block_selection.select_top_blocks(
-            importance, n_selected
-        )  # [B, G, n_selected]
+        importance = self.block_selection.compute_importance_scores(q, k_compressed_dummy, attn_scores_compressed)
+        selected_block_indices = self.block_selection.select_top_blocks(importance, n_selected) # [B, G, n_selected]
 
-        # --- Vectorized Block Gathering and Attention ---
-        heads_per_group = H // G
-        
-        # 1. Calculate the starting token index for each selected block
-        # [B, G, n_selected] -> [B, G * n_selected]
-        start_indices_flat = (selected_indices * self.config.compress_stride).view(B, -1)
-        
-        # 2. Create offsets for all tokens within each block
-        # [l_prime]
-        block_offsets = torch.arange(l_prime, device=x.device)
-        
-        # 3. Combine start indices with block offsets to get all token indices
-        # [B, G * n_selected, l_prime]
-        gathered_indices = start_indices_flat.unsqueeze(-1) + block_offsets
-        gathered_indices = torch.clamp(gathered_indices, 0, T - 1)
-
-        # 4. Gather Keys and Values
-        # k and v have shape [B, H, T, dim]. We gather along the sequence dim (T).
-        # We need to expand gathered_indices to match the head dimension.
-        # Index shape: [B, H, G * n_selected * l_prime]
-        expanded_indices = gathered_indices.reshape(B, 1, -1).expand(-1, H, -1)
-        
-        # k_gathered: [B, H, G * n_selected * l_prime]
-        k_gathered = torch.gather(k, 2, expanded_indices.reshape(B, H, -1, 1).expand(-1, -1, -1, self.head_dim)).view(B, H, G * n_selected, l_prime, self.head_dim)
-        v_gathered = torch.gather(v, 2, expanded_indices.reshape(B, H, -1, 1).expand(-1, -1, -1, self.value_dim)).view(B, H, G * n_selected, l_prime, self.value_dim)
-        
-        # 5. Reshape for Grouped Attention
-        # Queries: [B, G, H/G, T, head_dim]
-        q_grouped = q.view(B, G, heads_per_group, T, self.head_dim)
-        
-        # Keys/Values: [B, G, H/G, n_selected, l_prime, dim]
-        k_gathered = k_gathered.view(B, G, heads_per_group, G * n_selected, l_prime, self.head_dim)
-        v_gathered = v_gathered.view(B, G, heads_per_group, G * n_selected, l_prime, self.value_dim)
-        
-        # Now we perform attention per group. The logic here is still complex to fully vectorize
-        # without a custom kernel. The batched approach below is a major improvement over looping.
-        
-        # Reshape for torch.bmm:
-        # q: [B*G*H/G, T, head_dim]
-        q_bmm = q_grouped.permute(0, 1, 3, 2, 4).reshape(B * G * heads_per_group, T, self.head_dim)
-
-        # k/v: [B*G*H/G, n_selected * l_prime, dim]
-        # We need to select the right blocks for each group. This remains a challenge for full vectorization.
-        # For now, we simplify and let each group attend to all gathered blocks.
-        k_bmm = k_gathered.permute(0, 1, 2, 3, 4, 5).reshape(B * G * heads_per_group, G * n_selected * l_prime, self.head_dim)
-        v_bmm = v_gathered.permute(0, 1, 2, 3, 4, 5).reshape(B * G * heads_per_group, G * n_selected * l_prime, self.value_dim)
-        
-        # 6. Batched Attention Calculation
-        scores = torch.bmm(q_bmm, k_bmm.transpose(-2, -1)) / self.scale
-        
-        # Masking (simplified for now, a proper implementation would be more complex)
-        if mask is not None and mask.dim() == 4:
-                # This is a placeholder for a more complex masking logic needed here
-                pass
-        
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        
-        # 7. Apply attention and reshape back
-        output = torch.bmm(attn_weights, v_bmm) # [B*G*H/G, T, value_dim]
-        output = output.view(B, G, heads_per_group, T, self.value_dim)
-        output = output.permute(0, 3, 1, 2, 4).reshape(B, T, H * self.value_dim)
+        # Process group by group to ensure correctness
+        output_groups = []
+        for g in range(G):
+            # Q for this group: [B, H/G, T, head_dim]
+            q_group = q.view(B, G, heads_per_group, T, self.head_dim)[:, g, ...]
             
+            # Get K and V for this group's selected blocks
+            group_block_indices = selected_block_indices[:, g, :] # [B, n_selected]
+            
+            # Convert block indices to token indices
+            start_indices = (group_block_indices * self.config.compress_stride) # [B, n_selected]
+            block_offsets = torch.arange(l_prime, device=x.device) # [l_prime]
+            token_indices = start_indices.unsqueeze(-1) + block_offsets # [B, n_selected, l_prime]
+            token_indices = torch.clamp(token_indices.view(B, -1), 0, T - 1) # [B, n_selected * l_prime]
+            
+            # Gather K and V for the group
+            k_group = k.view(B, G, heads_per_group, T, self.head_dim)[:, g, ...] # [B, H/G, T, head_dim]
+            v_group = v.view(B, G, heads_per_group, T, self.value_dim)[:, g, ...] # [B, H/G, T, value_dim]
+            
+            # Expand indices for gathering: [B, 1, n_sel*l', 1] -> [B, H/G, n_sel*l', dim]
+            token_indices_expanded_k = token_indices.view(B, 1, -1, 1).expand(-1, heads_per_group, -1, self.head_dim)
+            k_gathered = torch.gather(k_group, 2, token_indices_expanded_k) # [B, H/G, n_sel*l', head_dim]
+
+            token_indices_expanded_v = token_indices.view(B, 1, -1, 1).expand(-1, heads_per_group, -1, self.value_dim)
+            v_gathered = torch.gather(v_group, 2, token_indices_expanded_v) # [B, H/G, n_sel*l', value_dim]
+
+            # Attention scores: [B, H/G, T, n_sel*l']
+            scores = torch.matmul(q_group, k_gathered.transpose(-2, -1)) / self.scale
+
+            # --- Causal Masking ---
+            # Query at `t` can only see keys at or before `t`.
+            q_indices = torch.arange(T, device=x.device).view(1, 1, T, 1)
+            k_indices_gathered = token_indices.view(B, 1, 1, -1)
+            causal_mask = q_indices >= k_indices_gathered # Broadcasts to [B, 1, T, n_sel*l']
+            scores = scores.masked_fill(~causal_mask, torch.finfo(scores.dtype).min)
+
+            # Softmax and attention
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            output_group = torch.matmul(attn_weights, v_gathered) # [B, H/G, T, value_dim]
+            output_groups.append(output_group)
+
+        # Concatenate group outputs and project
+        output = torch.cat(output_groups, dim=1) # [B, H, T, value_dim]
+        output = output.transpose(1, 2).contiguous().view(B, T, H * self.value_dim)
         return output
     
     def window_attention(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        rope: nn.Module,
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
@@ -456,11 +438,11 @@ class NSAAttention(nn.Module):
 
         # Apply RoPE to query and key
         q_rope = q[..., :self.config.qk_rope_head_dim]
-        q_rope = apply_rope(q_rope, freqs_cis)
+        q_rope = rope(q_rope)
         q = torch.cat((q_rope, q[..., self.config.qk_rope_head_dim:]), dim=-1)
 
         k_rope = k[..., :self.config.qk_rope_head_dim]
-        k_rope = apply_rope(k_rope, freqs_cis)
+        k_rope = rope(k_rope)
         k = torch.cat((k_rope, k[..., self.config.qk_rope_head_dim:]), dim=-1)
         
         # Create sliding window mask (vectorized)
@@ -473,7 +455,7 @@ class NSAAttention(nn.Module):
         scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale
         
         # Apply window mask
-        scores = scores.masked_fill(~window_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        scores = scores.masked_fill(~window_mask.unsqueeze(0).unsqueeze(0), torch.finfo(scores.dtype).min)
         
         # Try to use Flash Attention if available and appropriate
         if hasattr(F, 'scaled_dot_product_attention') and mask is None and T <= 2048:
@@ -593,7 +575,7 @@ class NSAAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
+        rope: nn.Module,
         mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
@@ -613,11 +595,11 @@ class NSAAttention(nn.Module):
         gates = gates.expand(B, T, 3)
         
         # Three parallel attention branches
-        attn_compressed, scores_compressed = self.compressed_attention(x, freqs_cis, mask)
+        attn_compressed, scores_compressed = self.compressed_attention(x, rope, mask)
         
-        attn_selected = self.selected_attention(x, freqs_cis, scores_compressed, mask)
+        attn_selected = self.selected_attention(x, rope, scores_compressed, mask)
         
-        attn_window = self.window_attention(x, freqs_cis, mask)
+        attn_window = self.window_attention(x, rope, mask)
         
         # Weighted fusion
         output = (

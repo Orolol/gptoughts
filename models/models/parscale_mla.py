@@ -316,7 +316,7 @@ class ParScaleMLA(nn.Module):
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), 
                 targets.view(-1), 
-                ignore_index=-1
+                ignore_index=-100
             )
             
             # Add diversity regularization in stage 2

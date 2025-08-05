@@ -95,7 +95,7 @@ class TrainableTransformer(Transformer):
             loss = F.cross_entropy(
                 shift_logits.reshape(-1, shift_logits.size(-1)),
                 shift_targets.reshape(-1),
-                ignore_index=-1  # Ignore padding tokens
+                ignore_index=-100  # Ignore padding tokens
             )
             
             # Handle NaN loss - set to high value without breaking backward pass

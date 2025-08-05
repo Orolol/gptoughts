@@ -94,6 +94,7 @@ class FinewebDataset(IterableDataset):
         # Gestionnaire du thread de préchargement
         self.prefetch_thread = None
         self.should_stop = threading.Event()
+        self.prefetch_exception = None
         
         # Compteurs pour le debugging
         self.batches_prepared = 0
@@ -109,6 +110,8 @@ class FinewebDataset(IterableDataset):
         timeout = 30  # secondes maximum à attendre
         start_time = time.time()
         while len(self.batch_buffer) == 0 and time.time() - start_time < timeout:
+            if self.prefetch_exception:
+                raise self.prefetch_exception
             time.sleep(0.1)
         print(f"Data loader initialized, buffer has {len(self.batch_buffer)} batch groups ready")
 
@@ -150,9 +153,9 @@ class FinewebDataset(IterableDataset):
             dataset_iter = iter(self.dataset)
             
             while not self.should_stop.is_set():
+                batch_group = []
                 try:
                     # Prépare un groupe complet de batches pour une itération d'accumulation
-                    batch_group = []
                     
                     # Accumule autant de batches que nécessaire pour une étape complète
                     for _ in range(self.gradient_accumulation_steps):
@@ -194,18 +197,21 @@ class FinewebDataset(IterableDataset):
                 
                 except Exception as e:
                     print(f"Exception in prefetch thread: {e}")
+                    self.prefetch_exception = e
                     # En cas d'erreur, on signale la fin
                     self.batch_buffer.close()
                     break
                     
         except Exception as e:
             print(f"Fatal error in prefetch thread: {e}")
+            self.prefetch_exception = e
             self.batch_buffer.close()
 
     def _start_prefetching(self):
         """Start the prefetching thread"""
         if self.prefetch_thread is None or not self.prefetch_thread.is_alive():
             self.should_stop.clear()
+            self.prefetch_exception = None
             self.prefetch_thread = threading.Thread(
                 target=self._prefetch_data, 
                 daemon=True,
@@ -223,6 +229,11 @@ class FinewebDataset(IterableDataset):
         return self
     
     def __next__(self):
+        # Vérifie si une exception a eu lieu dans le thread de préchargement
+        if self.prefetch_exception:
+            # Fait remonter l'erreur pour arrêter l'entraînement proprement
+            raise self.prefetch_exception
+            
         # Si nous avons un groupe de batches et qu'il reste des batches dedans, on utilise le suivant
         if self.current_batch_group is not None and self.current_batch_index < len(self.current_batch_group):
             batch = self.current_batch_group[self.current_batch_index]
@@ -233,8 +244,10 @@ class FinewebDataset(IterableDataset):
         # Sinon, on récupère un nouveau groupe de batches
         self.current_batch_group = self.batch_buffer.get()
         
-        # Si None, c'est la fin du dataset
+        # Si None, c'est la fin du dataset ou une erreur
         if self.current_batch_group is None:
+            if self.prefetch_exception:
+                raise self.prefetch_exception
             self.should_stop.set()
             raise StopIteration
         
@@ -245,15 +258,24 @@ class FinewebDataset(IterableDataset):
 
     def __del__(self):
         # Clean shutdown
-        if hasattr(self, 'should_stop'):
-            self.should_stop.set()
+        self.close()
+
+    def close(self):
+        """Termine proprement le thread de pré-chargement."""
+        if not hasattr(self, 'should_stop') or self.should_stop.is_set():
+            return
+            
+        print("Closing data loader...")
+        self.should_stop.set()
         
         if hasattr(self, 'batch_buffer'):
             self.batch_buffer.close()
             
         # Wait for thread to finish (with timeout)
         if hasattr(self, 'prefetch_thread') and self.prefetch_thread is not None:
-            self.prefetch_thread.join(timeout=0.5)
+            self.prefetch_thread.join(timeout=1.0)
+        print("Data loader closed.")
+
 
 def async_iterator_to_generator(ait):
     async def wrapper():

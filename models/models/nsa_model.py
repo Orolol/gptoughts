@@ -20,7 +20,7 @@ from models.blocks.nsa_optimized import NSAConfig
 from models.blocks.nsa_block import NSABlock
 from models.blocks.normalization import RMSNorm, DynamicTanh
 from models.blocks.tensor_utils import prevent_backward_reuse
-from models.blocks.positional_encoding import precompute_freqs_cis, apply_rope
+from models.blocks.positional_encoding import RoPE
 
 # Import utility functions
 from train.train_utils import estimate_mfu as utils_estimate_mfu
@@ -134,9 +134,11 @@ class NSAModel(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight = self.transformer.wte.weight
         
-        # Precompute RoPE frequencies
-        self.freqs_cis = precompute_freqs_cis(
-            config.qk_rope_head_dim, config.block_size, config.rope_theta
+        # RoPE module
+        self.rope = RoPE(
+            dim=config.qk_rope_head_dim, 
+            max_seq_len=config.block_size, 
+            base=int(config.rope_theta)
         )
         
         # Timing stats for MFU estimation
@@ -238,12 +240,9 @@ class NSAModel(nn.Module):
                 # NSA handles causality internally, so we just pass a simple mask
                 # indicating which positions are valid
             
-            # Prepare RoPE frequencies
-            freqs_cis = self.freqs_cis[:t].to(device)
-
             # Process through transformer layers
             for i, block in enumerate(self.transformer.h):
-                x = block(x, freqs_cis=freqs_cis, mask=mask)
+                x = block(x, rope=self.rope, mask=mask)
             
             # Final layer norm
             x = self.transformer.ln_f(x)
@@ -278,15 +277,15 @@ class NSAModel(nn.Module):
                     
                     # Mask padding positions
                     with torch.no_grad():
-                        mask = (targets != -1).float()
+                        mask = (targets != -100).float()
                     loss = (loss * mask.view(-1)).sum() / mask.sum()
-                else:
-                    # Standard cross-entropy loss
-                    loss = F.cross_entropy(
-                        logits.view(-1, logits.size(-1)),
-                        targets.view(-1),
-                        ignore_index=-1
-                    )
+                # Standard cross-entropy loss
+                # loss = F.cross_entropy(
+                #     logits.view(-1, logits.size(-1)),
+                #     targets.view(-1),
+                #     ignore_index=-100
+                # )
+                loss = None
             else:
                 # Inference mode: only compute logits for last position
                 logits = self.lm_head(x[:, [-1], :])

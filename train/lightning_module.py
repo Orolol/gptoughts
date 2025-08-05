@@ -671,236 +671,141 @@ class LLMLightningModule(pl.LightningModule):
     # --- End Config Creation Methods ---
 
     def forward(self, input_ids, targets=None, **kwargs):
-        # Delegate forward pass to the underlying model
-        # Handle different model signatures and potential extra outputs (like router_loss)
+        """
+        Unified forward pass that harmonizes outputs from different models
+        into a standard dictionary format: {'logits': ..., 'loss': ..., 'router_loss': ...}.
+        """
         model_type = self.args.model_type.lower()
-
-        if model_type == 'llada':
-            forward_args = {'input_ids': input_ids, 'targets': targets}
-            if getattr(self.args, 'use_bd3_training', False):
-                forward_args['use_bd3_training'] = True
-            try:
-                # LLaDA might return logits, loss, router_loss
-                return self.model(**forward_args)
-            except Exception as e:
-                 print(f"Error during LLaDA forward pass: {e}")
-                 if hasattr(self.model, 'forward_simple') and callable(getattr(self.model, 'forward_simple')):
-                     logits, loss = self.model.forward_simple(input_ids, targets)
-                     print("Used simplified forward pass to avoid NaN")
-                     return logits, loss, None # Return None for router_loss
-                 else:
-                     raise
-        elif model_type == 'mla':
-            # MLA-Model returns logits, loss directly (no router loss in dense version)
-            logits, loss = self.model(input_ids, targets)
-            # No router loss in dense model
-            return logits, loss, None
-        elif model_type == 'mla_selective':
-            # MLA-Selective Model returns logits, loss directly
-            logits, loss = self.model(input_ids, targets)
-            return logits, loss, None
-        elif model_type == 'parscale_mla':
-            # ParScale-MLA returns logits, loss directly
-            logits, loss = self.model(input_ids, targets)
-            return logits, loss, None
-        elif model_type == 'mla_llada':
-            # MLA-LLaDA returns dict with loss/logits
-            try:
-                output = self.model(input_ids, labels=targets, is_training=True)
-                # Ensure we have valid outputs
-                if isinstance(output, dict):
-                    logits = output.get('logits')
-                    loss = output.get('loss')
-                    if logits is None or loss is None:
-                        raise ValueError(f"MLA-LLaDA model returned incomplete output: {output.keys()}")
-                    # Log mask ratio if available
-                    if 'mask_ratio' in output and hasattr(self, 'log'):
-                        mask_ratio = output['mask_ratio']
-                        if torch.is_tensor(mask_ratio):
-                            self.log('train/mask_ratio', float(mask_ratio.item()), on_step=True, on_epoch=False, sync_dist=True)
-                    return logits, loss, None
-                else:
-                    raise ValueError(f"MLA-LLaDA model returned unexpected output type: {type(output)}")
-            except Exception as e:
-                print(f"Error in MLA-LLaDA forward: {e}")
-                print(f"Input shapes - input_ids: {input_ids.shape}, targets: {targets.shape if targets is not None else None}")
-                raise
-        elif model_type == 'mdm':
-            # MDM returns dict with loss/logits
-            output = self.model(input_ids, labels=targets, return_dict=True)
-            logits = output['logits']
-            loss = output['loss']
-            # Log masking information if available
-            if 'mask' in output and hasattr(self, 'log'):
-                mask_ratio = output['mask'].float().mean()
-                self.log('train/mask_ratio', mask_ratio.item(), on_step=True, on_epoch=False, sync_dist=True)
-            return logits, loss, None
-        elif model_type == 'moe_mla':
-            # MOE-MLA returns logits, loss directly with router loss incorporated
-            logits, loss = self.model(input_ids, targets)
-            # Router loss is already included in the loss
-            return logits, loss, None
-        else: # deepseek or gpt
-            model_output = self.model(input_ids, targets=targets)
-
-            if isinstance(model_output, tuple):
-                if len(model_output) >= 2:
-                    logits = model_output[0]
-                    loss = model_output[1]
-                    # Additional elements in model_output are ignored for this path.
-                elif len(model_output) == 1:
-                    logits = model_output[0]
-                    loss = None # Loss will be calculated in training/validation step
-                else: # Empty tuple
-                    raise ValueError(
-                        f"Model returned an empty tuple. Expected at least logits. Got: {model_output}"
-                    )
-            elif torch.is_tensor(model_output):
-                # Model returned a single tensor, assume it's logits
-                logits = model_output
-                loss = None # Loss will be calculated in training/validation step
+        
+        # Prepare keyword arguments, separating the positional `input_ids`.
+        model_kwargs = {}
+        if targets is not None:
+            # Handle model-specific names for the target/label tensor.
+            if model_type in ['mla_llada', 'mdm']:
+                model_kwargs['labels'] = targets
             else:
-                raise ValueError(
-                    f"Unexpected output type from model. Expected tensor or tuple, got: {type(model_output)}"
-                )
-            return logits, loss, None # Return None for router_loss consistency
+                model_kwargs['targets'] = targets
+
+        # Add any other keyword arguments passed to this forward method.
+        model_kwargs.update(kwargs)
+
+        # Call the model. By passing `input_ids` as the first positional argument,
+        # we support models that name it `idx` (like NSA) or `input_ids`.
+        # The remaining arguments are passed by keyword.
+        model_output = self.model(input_ids, **model_kwargs)
+        
+        # --- Harmonize Output ---
+        logits, loss, router_loss = None, None, None
+
+        if isinstance(model_output, dict):
+            # Models that return dictionaries (e.g., MLA-LLaDA, MDM)
+            logits = model_output.get('logits')
+            loss = model_output.get('loss')
+            router_loss = model_output.get('router_loss') # Will be None if not present
+        
+        elif isinstance(model_output, tuple):
+            # Models that return tuples (e.g., DeepSeek, GPT, LLaDA)
+            if len(model_output) >= 2:
+                logits, loss = model_output[0], model_output[1]
+                if len(model_output) > 2:
+                    router_loss = model_output[2]
+            elif len(model_output) == 1:
+                logits = model_output[0]
+            else:
+                 raise ValueError("Model returned an empty tuple.")
+        
+        elif torch.is_tensor(model_output):
+            # Models that return only logits tensor
+            logits = model_output
+        
+        else:
+            raise TypeError(f"Unsupported model output type: {type(model_output)}")
+            
+        return {'logits': logits, 'loss': loss, 'router_loss': router_loss}
+
 
     def training_step(self, batch, batch_idx):
         t0 = time.time()
         input_ids, targets = self._unpack_batch(batch)
 
-        # Forward pass
+        # --- Simplified Forward Pass ---
         try:
             with self.timing_stats.track("forward"):
-                # Completely detach and clone input tensors to prevent double backward issues
-                with torch.no_grad():
-                    input_ids = input_ids.detach().clone().requires_grad_(False)
-                    targets = targets.detach().clone().requires_grad_(False)
+                # Detach inputs and run the unified forward pass
+                input_ids_detached = input_ids.detach().clone()
+                targets_detached = targets.detach().clone()
                 
-                # Add special handling for MLA and ParScale-MLA models
-                if self.args.model_type.lower() in ['mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'moe_mla']:
-                    try:
-                        # Ensure the model knows we're in training mode
-                        self.model.train()
-                        
-                        # Explicitly reset any inference-mode caches
-                        if hasattr(self.model, '_set_inference_mode'):
-                            self.model._set_inference_mode(False)
-                            
-                        # Run the forward pass
-                        logits, loss, router_loss = self(input_ids, targets=targets)
-                        
-                        # Ensure the loss has requires_grad for optimizer
-                        if loss is not None and not loss.requires_grad:
-                            loss = loss.clone().requires_grad_(True)
-                    except Exception as e:
-                        print(f"Error in MLA/ParScale-MLA forward pass: {e}")
-                        # Create error tensor with gradient for safe fallback
-                        logits = torch.zeros(1, device=self.device).requires_grad_(True)
-                        loss = torch.tensor(10.0, device=self.device).requires_grad_(True)
-                        router_loss = None
-                else:
-                    logits, loss, router_loss = self(input_ids, targets=targets)
-
-            if loss is None: # Handle cases where loss is calculated outside model.forward
-                # --- BEGIN SHAPE DIAGNOSTICS ---
-                if batch_idx < 2 and self.global_rank == 0: # Log for first few batches on rank 0
-                    print(f"TRAIN_STEP [{self.global_step}/{batch_idx}]: loss is None, calculating F.cross_entropy")
-                    print(f"TRAIN_STEP [{self.global_step}/{batch_idx}]: logits original shape: {logits.shape if logits is not None else 'None'}")
-                    print(f"TRAIN_STEP [{self.global_step}/{batch_idx}]: targets original shape: {targets.shape if targets is not None else 'None'}")
-                    if logits is not None and targets is not None:
-                        print(f"TRAIN_STEP [{self.global_step}/{batch_idx}]: logits.view(-1, logits.size(-1)) shape: {logits.view(-1, logits.size(-1)).shape}")
-                        print(f"TRAIN_STEP [{self.global_step}/{batch_idx}]: targets.view(-1) shape: {targets.view(-1).shape}")
-                # --- END SHAPE DIAGNOSTICS ---
+                # Pass detached tensors to the forward method
+                outputs = self(input_ids_detached, targets=targets_detached)
                 
-                # Create fresh detached copies to avoid double backward
-                logits_detached = logits.detach().clone().requires_grad_(True)
-                loss = F.cross_entropy(logits_detached.view(-1, logits_detached.size(-1)), targets.view(-1), ignore_index=-1)
+                loss = outputs['loss']
+                router_loss = outputs.get('router_loss') # Use .get for safety
 
-            # Handle router loss for MoE models
+            # If loss is not calculated by the model, compute it now
+            if loss is None:
+                logits = outputs['logits']
+                if logits is None:
+                     raise ValueError("Model output did not contain 'loss' or 'logits'.")
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets_detached.view(-1), ignore_index=-100)
+
+            # --- Loss Combination and NaN/Inf Handling ---
+            combined_loss = loss
             if router_loss is not None and torch.is_tensor(router_loss):
-                # Router loss should already be detached, but ensure it with torch.no_grad
-                with torch.no_grad():
-                    router_loss = router_loss.clone()
-                
-                # Check for NaN/inf in router_loss and handle
-                if torch.isnan(router_loss).any() or torch.isinf(router_loss).any():
+                if not (torch.isnan(router_loss).any() or torch.isinf(router_loss).any()):
+                    # For models that don't internally add router_loss, add it here
+                    if self.args.model_type.lower() not in ['mla', 'parscale_mla', 'moe_mla']:
+                        router_loss_coef = getattr(self.args, 'router_z_loss_coef', 0.001)
+                        combined_loss = combined_loss + router_loss_coef * router_loss
+                    self.log('train/router_loss', router_loss.item(), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+                else:
                     print(f"WARNING: NaN/Inf detected in router_loss at step {self.global_step}. Setting to zero.")
                     router_loss = torch.zeros_like(router_loss)
 
-                # For MLA, ParScale-MLA, and MOE-MLA models, router loss is already incorporated internally
-                model_type = getattr(self.args, 'model_type', 'gpt')
-                
-                if model_type in ['mla', 'parscale_mla', 'moe_mla']:
-                    # Don't add router loss to prevent double counting
-                    combined_loss = loss
-                    # Still log the router loss for monitoring
-                    if router_loss is not None:
-                        self.log('train/router_loss', float(router_loss.item()), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-                else:
-                    # For other models, add the router loss with coefficient
-                    router_loss_coef = getattr(self.args, 'router_z_loss_coef', 0.001)
-                    combined_loss = loss + router_loss_coef * router_loss
-                    self.log('train/router_loss', float(router_loss.item()), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-            else:
-                combined_loss = loss
-                # Create a tensor with no gradient history
-                with torch.no_grad():
-                    router_loss = torch.tensor(0.0, device=self.device, requires_grad=False) # For logging consistency
 
-            # Check for NaN/inf in combined_loss before logging/returning
             if torch.isnan(combined_loss).any() or torch.isinf(combined_loss).any():
-                print(f"ERROR: NaN/Inf detected in combined_loss at step {self.global_step}. Using zero loss.")
+                lr = self.trainer.optimizers[0].param_groups[0]['lr']
+                grad_norm_val = self.trainer.callback_metrics.get('train/grad_norm', 'N/A')
+                print(f"ERROR: NaN/Inf detected in combined_loss at step {self.global_step}.")
+                print(f"Details: LR={lr:.2e}, Last Grad Norm={grad_norm_val}, Raw Loss={loss.item() if loss is not None else 'N/A'}")
                 self.log('train/nan_loss_skipped', 1.0, on_step=True, on_epoch=False, sync_dist=True)
-                # Create a new tensor with requires_grad=True to allow optimizer to run
-                with torch.no_grad():
-                    combined_loss = torch.tensor(0.0, device=self.device, dtype=torch.float32)
-                    combined_loss = combined_loss.requires_grad_(True)
-
+                # Return a zero loss with gradient to prevent crash
+                combined_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
 
         except Exception as e:
             print(f"Error during training step {self.global_step}: {e}")
             print(traceback.format_exc())
-            
-            # Try to clean up memory to recover
             cleanup_memory()
-            
-            # Return a dummy loss to prevent crashing, log the error
             self.log('train/step_error', 1.0, on_step=True, on_epoch=False, sync_dist=True)
-            
-            # Create loss tensors with no gradient history
-            combined_loss = torch.tensor(0.0, device=self.device, dtype=torch.float32, requires_grad=True)
-            with torch.no_grad():
-                loss = torch.tensor(0.0, device=self.device, requires_grad=False)
-                router_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
-
+            # Create a dummy loss to prevent crashing
+            combined_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+            loss = torch.tensor(0.0, device=self.device) # for logging
 
         # --- Logging ---
         dt = time.time() - t0
-        # Use float() to ensure no gradient tracking during logging
-        loss_value = float(loss.item())
+        loss_value = loss.item()
         self.log('train/loss', loss_value, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
         
         # Calculate gradient norms for monitoring
         grad_norm = 0.0
-        if self.global_step % 10 == 0:  # Calculate grad norm every 10 steps
-            with torch.no_grad():
-                total_norm = 0.0
-                for p in self.model.parameters():
-                    if p.grad is not None:
-                        param_norm = p.grad.data.norm(2)
-                        total_norm += param_norm.item() ** 2
-                grad_norm = total_norm ** 0.5
-                self.log('train/grad_norm', grad_norm, on_step=True, on_epoch=False, sync_dist=True)
-        # Use float() for all tensor logging
-        with torch.no_grad():
-            self.log('train/combined_loss', float(combined_loss.item()), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        # Schedule this to run after the backward pass via a hook if possible,
+        # but for simplicity, checking after the optimizer step is also fine.
+        # This is just a snapshot of the *previous* step's gradients.
+        if self.global_step % 10 == 0:
+            total_norm = 0.0
+            for p in self.model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            grad_norm = total_norm ** 0.5
+            self.log('train/grad_norm', grad_norm, on_step=True, on_epoch=False, sync_dist=True)
+
+        self.log('train/combined_loss', combined_loss.item(), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
         self.log('train/step_time_ms', dt * 1000, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
         self.log('learning_rate', self.trainer.optimizers[0].param_groups[0]['lr'], on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 
         # Token/s calculation
         batch_tokens = input_ids.numel()
-        self.total_tokens += batch_tokens * self.trainer.world_size # Accumulate across all devices
+        self.total_tokens += batch_tokens * self.trainer.world_size
         self.tokens_window.append((time.time(), batch_tokens * self.trainer.world_size))
         if len(self.tokens_window) > self.window_size:
             self.tokens_window.pop(0)
@@ -912,148 +817,60 @@ class LLMLightningModule(pl.LightningModule):
         else:
             current_tokens_per_sec = 0
 
-        total_time_elapsed = time.time() - self.train_start_time
-        avg_tokens_per_sec = self.total_tokens / total_time_elapsed if total_time_elapsed > 0 else 0
+        self.log('tokens_per_sec_step', current_tokens_per_sec, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False)
+        self.log('total_tokens', float(self.total_tokens), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
+        
+        # Calculate average sequence length
+        non_pad_tokens = (targets != -100).sum(dim=1)
+        avg_seq_len = non_pad_tokens.float().mean().item()
+        self.log('train/avg_seq_len', avg_seq_len, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
+        
+        # CSV Logging
+        self._buffer_metrics_for_csv(loss_value, grad_norm, current_tokens_per_sec, avg_seq_len)
 
-        self.log('tokens_per_sec_step', current_tokens_per_sec, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False) # Log local Tps
-        self.log('tokens_per_sec_avg', avg_tokens_per_sec, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-        self.log('total_tokens', float(self.total_tokens), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True) # Log as float for logger compatibility
-        
-        # Calculate tokens per second per million parameters
-        param_count_millions = sum(p.numel() for p in self.model.parameters()) / 1e6
-        if param_count_millions > 0:
-            tokens_per_sec_per_M_params = current_tokens_per_sec / param_count_millions
-            avg_tokens_per_sec_per_M_params = avg_tokens_per_sec / param_count_millions
-            self.log('tokens_per_sec_per_M_params', tokens_per_sec_per_M_params, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False)
-            self.log('tokens_per_sec_per_M_params_avg', avg_tokens_per_sec_per_M_params, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
-        
-        # Store metrics in buffer for CSV logging
-        lr = self.trainer.optimizers[0].param_groups[0]['lr']
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Get validation metrics from callback metrics (if available)
-        # Update last known values if new ones are available
-        current_val_loss = self.trainer.callback_metrics.get('val/loss', None)
-        current_val_perplexity = self.trainer.callback_metrics.get('val/perplexity', None)
-        
-        if current_val_loss is not None:
-            self.last_val_loss = current_val_loss
-        if current_val_perplexity is not None:
-            self.last_val_perplexity = current_val_perplexity
-        
-        # Use the last known values for logging
-        val_loss = self.last_val_loss
-        val_perplexity = self.last_val_perplexity
-        
-        # Calculate tokens per second per million parameters for CSV
-        param_count_millions = sum(p.numel() for p in self.model.parameters()) / 1e6
-        tokens_per_sec_per_M_params = current_tokens_per_sec / param_count_millions if param_count_millions > 0 else 0
-        
-        self.metrics_buffer.append([
-            self.global_step,
-            f"{loss_value:.6f}",
-            f"{val_loss:.6f}" if val_loss is not None else "N/A",
-            f"{val_perplexity:.6f}" if val_perplexity is not None else "N/A",
-            f"{lr:.2e}",
-            f"{current_tokens_per_sec:.2f}",
-            f"{tokens_per_sec_per_M_params:.2f}",
-            f"{self.total_tokens}",
-            f"{grad_norm:.4f}" if grad_norm > 0 else "N/A",
-            timestamp
-        ])
-
-        # MFU calculation (optional, requires estimate_mfu method on model)
-        if hasattr(self.model, 'estimate_mfu') and self.trainer.global_step >= 5:
-             # Estimate MFU based on total batch size across devices
-             effective_batch_size = self.args.batch_size * self.trainer.accumulate_grad_batches * self.trainer.world_size
-             mfu = self.model.estimate_mfu(effective_batch_size, dt) # dt is per-step time on this rank
-             if mfu is not None:
-                 self.running_mfu = mfu if self.running_mfu == -1.0 else 0.9 * self.running_mfu + 0.1 * mfu
-                 self.log('perf/mfu_percent', self.running_mfu * 100, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
-
-        # Log timing stats periodically
-        self.timing_stats.step()
-        if self.timing_stats.should_print() and self.global_rank == 0:
-            self.timing_stats.print_stats()
-        
-        if self.global_step % 100 == 0:
-            self.generate_sample_text()
+        # Periodic tasks
+        if self.global_step > 0 and self.global_step % 100 == 0:
+            if self.global_rank == 0:
+                self.generate_sample_text()
+                self._log_metrics_to_csv()
             
-            # Log ParScale-specific metrics if applicable
             if self.args.model_type == 'parscale_mla' and hasattr(self.model, 'analyze_stream_diversity'):
                 diversity_stats = self.model.analyze_stream_diversity()
-                self.log('parscale/input_similarity', diversity_stats['input_similarity'], on_step=True, on_epoch=False, sync_dist=True)
-                self.log('parscale/layer_similarity', diversity_stats['layer_similarity'], on_step=True, on_epoch=False, sync_dist=True)
-                self.log('parscale/effective_streams', diversity_stats['effective_streams'], on_step=True, on_epoch=False, sync_dist=True)
-            
-            # Log metrics to CSV every 100 steps
-            self._log_metrics_to_csv()
-            
-            # cleanup_memory()
-        
-        # I want to print logs to check what tokens are sent to the models periodically
-        # if self.global_step % 100 == 0:
-        #     print(f"TEXT INPUT: {self.args.tokenizer.decode(input_ids[0])}")
-        #     print(f"TEXT TARGET: {self.args.tokenizer.decode(targets[0])}")
+                self.log_dict({f'parscale/{k}': v for k,v in diversity_stats.items()}, on_step=True, on_epoch=False, sync_dist=True)
 
-        # Clear MLA caches after each training step to prevent memory accumulation
-        if hasattr(self.model, 'clear_cache') and self.args.model_type.lower() in ['mla', 'parscale_mla', 'mla_selective', 'moe_mla']:
+        # Clear caches
+        if hasattr(self.model, 'clear_cache'):
             self.model.clear_cache()
-        # Clear diffusion cache for MLA-LLaDA
-        elif self.args.model_type.lower() == 'mla_llada' and hasattr(self.model, 'cache_manager'):
+        elif hasattr(self.model, 'cache_manager'):
             self.model.cache_manager.clear()
         
         return combined_loss
 
+
     def validation_step(self, batch, batch_idx):
         input_ids, targets = self._unpack_batch(batch)
 
-        # Forward pass - detach inputs just to be safe
         with torch.no_grad():
-            input_ids = input_ids.detach().clone().requires_grad_(False)
-            targets = targets.detach().clone().requires_grad_(False)
-            
-        # Forward pass with model-specific handling
-        if self.args.model_type.lower() in ['mla', 'parscale_mla', 'mla_llada', 'moe_mla']:
-            try:
-                # Ensure the model knows we're in eval mode
-                self.model.eval()
-                
-                # Run the forward pass
-                logits, loss, router_loss = self(input_ids, targets=targets)
-                
-                # For validation, we don't need gradients
-                if loss is not None:
-                    loss = loss.detach()
-            except Exception as e:
-                print(f"Error in MLA/ParScale-MLA validation: {e}")
-                # Create dummy values for safe fallback
-                logits = torch.zeros(1, device=self.device)
-                loss = torch.tensor(10.0, device=self.device)
-                router_loss = None
-        else:
-            logits, loss, router_loss = self(input_ids, targets=targets)
+            self.model.eval()
+            outputs = self(input_ids, targets=targets)
+            loss = outputs['loss']
+            router_loss = outputs.get('router_loss')
 
-        if loss is None: # Handle cases where loss is calculated outside model.forward
-            # --- BEGIN SHAPE DIAGNOSTICS ---
-            if batch_idx < 2 and self.global_rank == 0: # Log for first few batches on rank 0
-                print(f"VAL_STEP [{self.current_epoch}/{batch_idx}]: loss is None, calculating F.cross_entropy")
-                print(f"VAL_STEP [{self.current_epoch}/{batch_idx}]: logits original shape: {logits.shape if logits is not None else 'None'}")
-                print(f"VAL_STEP [{self.current_epoch}/{batch_idx}]: targets original shape: {targets.shape if targets is not None else 'None'}")
-                if logits is not None and targets is not None:
-                    print(f"VAL_STEP [{self.current_epoch}/{batch_idx}]: logits.view(-1, logits.size(-1)) shape: {logits.view(-1, logits.size(-1)).shape}")
-                    print(f"VAL_STEP [{self.current_epoch}/{batch_idx}]: targets.view(-1) shape: {targets.view(-1).shape}")
-            # --- END SHAPE DIAGNOSTICS ---
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-
-        # Log validation loss
+            if loss is None:
+                logits = outputs['logits']
+                if logits is None:
+                    # Log error and use a high loss value as a fallback
+                    print(f"VAL_STEP [{self.current_epoch}/{batch_idx}]: Model output missing 'loss' and 'logits'.")
+                    loss = torch.tensor(10.0, device=self.device)
+                else:
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
+        
+        # Log validation metrics
         self.log('val/loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-
-        # Calculate and log perplexity
         perplexity = calculate_perplexity(loss)
         self.log('val/perplexity', perplexity, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
 
-        if router_loss is not None and torch.is_tensor(router_loss):
+        if router_loss is not None:
              self.log('val/router_loss', router_loss, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
 
         return loss
@@ -1163,12 +980,6 @@ class LLMLightningModule(pl.LightningModule):
 
     def _lr_lambda(self, current_step: int):
         """Lambda function for LR scheduler based on original get_lr logic."""
-        # Adjust step by 1 because PL scheduler steps *before* optimizer step
-        # However, PL logs LR *after* the step, so using current_step directly might be correct
-        # Let's stick to the original logic's step counting if possible.
-        # PL's global_step should align with iter_num if accumulation=1
-        # If using gradient accumulation, PL's global_step increments every optimizer step,
-        # which matches the intent of iter_num in the original code.
         iter_num = self.global_step + 1 # global_step starts at 0
 
         return get_lr(
@@ -1182,16 +993,6 @@ class LLMLightningModule(pl.LightningModule):
 
     def on_validation_epoch_end(self):
         """Called at the end of the validation epoch."""
-        # Generate sample text only on rank 0
-        # if self.global_rank == 0 and hasattr(self.args, 'tokenizer') and self.args.tokenizer:
-        #     self.generate_sample_text()
-
-        # Optional: Perform more complex validation loss estimation like in original code
-        # This might involve running estimate_loss utility if needed, but PL's logging
-        # over the validation dataloader should be sufficient.
-        # losses = estimate_loss(...) # If needed
-        # self.log('val/estimated_loss', losses['val'], sync_dist=True)
-        # self.log('val/estimated_perplexity', losses['val_ppl'], sync_dist=True)
         pass
 
 
@@ -1270,9 +1071,6 @@ class LLMLightningModule(pl.LightningModule):
         else:
             raise ValueError(f"Unsupported batch type: {type(batch)}")
 
-        # Ensure targets have the same shape as input_ids if needed by loss function
-        # Often, targets are shifted inside the model's forward pass or loss calculation
-        # Return them as they are from the dataloader for flexibility.
         return input_ids, targets
     
     def _init_csv_logging(self):
@@ -1322,33 +1120,58 @@ class LLMLightningModule(pl.LightningModule):
             counter += 1
         
         # Open CSV file and write headers
-        self.csv_file = open(self.csv_file_path, 'w', newline='')
-        self.csv_writer = csv.writer(self.csv_file)
-        self.csv_writer.writerow(['step', 'train_loss', 'val_loss', 'val_perplexity', 'learning_rate', 'tokens_per_sec', 'tokens_per_sec_per_M_params', 'total_tokens', 'grad_norm', 'timestamp'])
-        self.csv_file.flush()
+        try:
+            self.csv_file = open(self.csv_file_path, 'w', newline='')
+            self.csv_writer = csv.writer(self.csv_file)
+            self.csv_writer.writerow(['step', 'train_loss', 'val_loss', 'val_perplexity', 'learning_rate', 'tokens_per_sec', 'avg_seq_len', 'total_tokens', 'grad_norm', 'timestamp'])
+            self.csv_file.flush()
+            print(f"CSV metrics logging initialized: {self.csv_file_path}")
+        except IOError as e:
+            print(f"Error initializing CSV logging: {e}")
+            self.csv_file = None
+            self.csv_writer = None
+
+    def _buffer_metrics_for_csv(self, loss, grad_norm, tps, avg_seq_len):
+        """Helper to buffer metrics for CSV logging."""
+        lr = self.trainer.optimizers[0].param_groups[0]['lr']
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        print(f"CSV metrics logging initialized: {self.csv_file_path}")
-    
+        current_val_loss = self.trainer.callback_metrics.get('val/loss')
+        current_val_perplexity = self.trainer.callback_metrics.get('val/perplexity')
+
+        if current_val_loss is not None:
+            self.last_val_loss = current_val_loss
+        if current_val_perplexity is not None:
+            self.last_val_perplexity = current_val_perplexity
+        
+        self.metrics_buffer.append([
+            self.global_step,
+            f"{loss:.6f}",
+            f"{self.last_val_loss:.6f}" if self.last_val_loss is not None else "N/A",
+            f"{self.last_val_perplexity:.6f}" if self.last_val_perplexity is not None else "N/A",
+            f"{lr:.2e}",
+            f"{tps:.2f}",
+            f"{avg_seq_len:.2f}",
+            f"{self.total_tokens}",
+            f"{grad_norm:.4f}" if grad_norm > 0 else "N/A",
+            timestamp
+        ])
+
     def _log_metrics_to_csv(self):
-        """Write buffered metrics to CSV file every 100 steps."""
-        if self.global_step % 100 != 0 or not self.csv_writer or not self.metrics_buffer:
+        """Write buffered metrics to CSV file."""
+        if not self.csv_writer or not self.metrics_buffer:
             return
-            
-        # Count rows before clearing
-        num_rows = len(self.metrics_buffer)
         
-        # Write all buffered rows to CSV
-        for row in self.metrics_buffer:
-            self.csv_writer.writerow(row)
-        
-        # Flush to disk
-        self.csv_file.flush()
-        
-        # Clear buffer for next window
-        self.metrics_buffer = []
-        
-        if self.global_rank == 0:
-            print(f"Written {num_rows} rows to CSV (up to step {self.global_step})")
+        try:
+            num_rows = len(self.metrics_buffer)
+            self.csv_writer.writerows(self.metrics_buffer)
+            self.csv_file.flush()
+            self.metrics_buffer = []
+            if self.global_rank == 0:
+                print(f"Written {num_rows} rows to CSV (up to step {self.global_step})")
+        except IOError as e:
+            print(f"Error writing to CSV file: {e}")
+
 
     # Optional: Add hooks for setup, cleanup, etc. if needed
     def setup(self, stage=None):
@@ -1363,18 +1186,35 @@ class LLMLightningModule(pl.LightningModule):
 
 
     def teardown(self, stage=None):
-         if stage == 'fit' or stage is None:
-             # Code to run after training finishes
-             cleanup_memory()
+        if stage == 'fit' or stage is None:
+            print("Tearing down the trainer...")
              
-             # Close CSV file
-             if self.csv_file:
-                 self.csv_file.close()
-                 print(f"CSV logging closed: {self.csv_file_path}")
-             
-             if self.global_rank == 0:
-                 print("Training finished. Final memory stats:")
-                 print_memory_stats("Teardown")
+            # Properly close dataloaders
+            if hasattr(self.trainer, 'train_dataloader') and hasattr(self.trainer.train_dataloader.dataset, 'close'):
+                print("Closing training dataset...")
+                self.trainer.train_dataloader.dataset.close()
+
+            if hasattr(self.trainer, 'val_dataloaders') and self.trainer.val_dataloaders:
+                for dl in self.trainer.val_dataloaders:
+                    if hasattr(dl, 'dataset') and hasattr(dl.dataset, 'close'):
+                        print("Closing validation dataset...")
+                        dl.dataset.close()
+            
+            # Final CSV log flush
+            if self.global_rank == 0:
+                self._log_metrics_to_csv()
+
+            # Code to run after training finishes
+            cleanup_memory()
+            
+            # Close CSV file
+            if self.csv_file:
+                self.csv_file.close()
+                print(f"CSV logging closed: {self.csv_file_path}")
+            
+            if self.global_rank == 0:
+                print("Training finished. Final memory stats:")
+                print_memory_stats("Teardown")
 
 
 # Note: DataModule definition would go here or in a separate file.
