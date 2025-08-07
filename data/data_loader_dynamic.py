@@ -11,6 +11,30 @@ import heapq
 from typing import List, Dict, Any, Optional, Tuple
 import numpy as np
 from datetime import datetime
+import signal
+import atexit
+import weakref
+
+# Global registry to track active datasets for cleanup
+_active_datasets = weakref.WeakSet()
+
+def _cleanup_all_datasets(signum=None, frame=None):
+    """Signal handler to clean up all active datasets"""
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Received interrupt signal, cleaning up datasets...")
+    for dataset in list(_active_datasets):
+        try:
+            dataset.close()
+        except Exception as e:
+            print(f"Error closing dataset: {e}")
+    
+    # Re-raise KeyboardInterrupt for proper exit
+    if signum == signal.SIGINT:
+        raise KeyboardInterrupt
+
+# Register signal handlers
+signal.signal(signal.SIGINT, _cleanup_all_datasets)
+signal.signal(signal.SIGTERM, _cleanup_all_datasets)
+atexit.register(_cleanup_all_datasets)
 
 class DynamicBatchBuffer:
     """Efficient buffer for dynamic batching with priority queue for size-based grouping"""
@@ -215,6 +239,10 @@ class DynamicFinewebDataset(IterableDataset):
         
         self._initialized = False
         self._workers_started = False
+        self._closed = False
+        
+        # Register this dataset for cleanup
+        _active_datasets.add(self)
         
         # Start workers immediately for better startup time
         self._start_workers()
@@ -260,7 +288,9 @@ class DynamicFinewebDataset(IterableDataset):
                         if docs_processed == 0:  # Log only first time
                             print(f"[{datetime.now().strftime('%H:%M:%S')}] Worker {worker_id}: Buffer full, waiting...")
                         while buffer_size > self.max_buffer_size // 2 and not self.should_stop.is_set():
-                            time.sleep(0.1)
+                            self.should_stop.wait(0.1)  # Use wait instead of sleep for faster response
+                            if self.should_stop.is_set():
+                                break
                             buffer_size = len(self.doc_buffer.tokenized_docs) if hasattr(self.doc_buffer, 'tokenized_docs') else 0
                     
                     if self.should_stop.is_set():
@@ -378,7 +408,7 @@ class DynamicFinewebDataset(IterableDataset):
                     if batch_count == 0:  # Log only first time
                         print(f"[{datetime.now().strftime('%H:%M:%S')}] Batch builder: Queue full ({queue_len}/{self.batch_queue.maxlen}), waiting...")
                     while len(self.batch_queue) >= self.batch_queue.maxlen - 2 and not self.should_stop.is_set():
-                        time.sleep(0.1)
+                        self.should_stop.wait(0.1)  # Use wait instead of sleep for faster response
                 
                 if self.should_stop.is_set():
                     break
@@ -447,7 +477,7 @@ class DynamicFinewebDataset(IterableDataset):
             thread = threading.Thread(
                 target=self._tokenizer_worker,
                 args=(i,),
-                daemon=True,
+                daemon=False,  # Make non-daemon for proper cleanup
                 name=f"TokenizerWorker-{i}"
             )
             thread.start()
@@ -556,34 +586,61 @@ class DynamicFinewebDataset(IterableDataset):
     
     def close(self):
         """Clean shutdown"""
+        if self._closed:
+            return  # Already closed
+        
+        self._closed = True
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Closing dynamic data loader")
-        print(self.should_stop)
+        
         if hasattr(self, 'should_stop'):
-            stats = self.get_stats()
-            print(f"\n{'='*60}")
-            print(f"Data Loader Final Statistics:")
-            print(f"  - Documents tokenized: {stats['docs_tokenized']:,}")
-            print(f"  - Batches created: {stats['batches_created']:,}")
-            print(f"  - Batches served: {stats['batches_served']:,}")
-            print(f"  - Average padding ratio: {stats['avg_padding_ratio']:.2%}")
-            print(f"{'='*60}\n")
+            # Print stats before closing
+            try:
+                stats = self.get_stats()
+                print(f"\n{'='*60}")
+                print(f"Data Loader Final Statistics:")
+                print(f"  - Documents tokenized: {stats['docs_tokenized']:,}")
+                print(f"  - Batches created: {stats['batches_created']:,}")
+                print(f"  - Batches served: {stats['batches_served']:,}")
+                print(f"  - Average padding ratio: {stats['avg_padding_ratio']:.2%}")
+                print(f"{'='*60}\n")
+            except Exception as e:
+                print(f"Error printing stats: {e}")
             
+            # Signal all threads to stop
             self.should_stop.set()
             
-            # Give threads time to finish gracefully
-            time.sleep(0.5)
+            # Close the buffer immediately to unblock any waiting threads
+            if hasattr(self, 'doc_buffer'):
+                self.doc_buffer.close()
             
-            # Then close the buffer
-            self.doc_buffer.close()
+            # Wake up any threads that might be waiting
+            with self.batch_queue_lock:
+                self.batch_queue_not_empty.notify_all()
             
-            # Wait for threads
-            for i, thread in enumerate(self.tokenizer_threads):
-                if thread.is_alive():
-                    thread.join(timeout=0.5)
+            # Give threads a moment to exit cleanly
+            time.sleep(0.1)
             
-            if self.batch_builder_thread and self.batch_builder_thread.is_alive():
-                self.batch_builder_thread.join(timeout=0.5)
+            # Join threads with timeout
+            if hasattr(self, 'tokenizer_threads'):
+                for i, thread in enumerate(self.tokenizer_threads):
+                    if thread.is_alive():
+                        thread.join(timeout=1.0)
+                        if thread.is_alive():
+                            print(f"Warning: TokenizerWorker-{i} did not terminate")
+            
+            if hasattr(self, 'batch_builder_thread') and self.batch_builder_thread:
+                if self.batch_builder_thread.is_alive():
+                    self.batch_builder_thread.join(timeout=1.0)
+                    if self.batch_builder_thread.is_alive():
+                        print(f"Warning: BatchBuilder thread did not terminate")
+            
+            # Remove from active datasets
+            _active_datasets.discard(self)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Dynamic data loader closed successfully")
     
     def __del__(self):
         """Destructor"""
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass  # Suppress errors during cleanup
