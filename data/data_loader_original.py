@@ -1,3 +1,6 @@
+# NOTE: For a more efficient implementation with dynamic batching,
+# please see `data/data_loader_dynamic.py`.
+
 import torch
 from torch.utils.data import IterableDataset
 from datasets import load_dataset

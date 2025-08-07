@@ -57,7 +57,7 @@ CMD="python run_train.py \
     --batch_size $BATCH_SIZE \
     --block_size $BLOCK_SIZE \
     --output_dir $OUTPUT_DIR \
-    --num_workers 2 \
+    --num_workers 1 \
     --gradient_accumulation_steps 1 \
     --learning_rate 5e-4 \
     --min_lr 3e-5 \
@@ -74,8 +74,7 @@ CMD="python run_train.py \
 if [ "$USE_BLACKWELL" -eq 1 ]; then
     CMD="$CMD \
         --use_fp8 \
-        --precision bf16-mixed \
-        --compile"
+        --precision bf16-mixed"
 fi
 
 # Create output directory

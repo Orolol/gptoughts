@@ -803,8 +803,10 @@ class LLMLightningModule(pl.LightningModule):
         self.log('train/step_time_ms', dt * 1000, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
         self.log('learning_rate', self.trainer.optimizers[0].param_groups[0]['lr'], on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 
-        # Token/s calculation
-        batch_tokens = input_ids.numel()
+        # Token/s calculation (now uses non-padding tokens for accuracy)
+        non_pad_tokens_mask = (targets != -100)
+        batch_tokens = non_pad_tokens_mask.sum().item() # Total non-pad tokens in the batch
+
         self.total_tokens += batch_tokens * self.trainer.world_size
         self.tokens_window.append((time.time(), batch_tokens * self.trainer.world_size))
         if len(self.tokens_window) > self.window_size:
@@ -819,10 +821,9 @@ class LLMLightningModule(pl.LightningModule):
 
         self.log('tokens_per_sec_step', current_tokens_per_sec, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False)
         self.log('total_tokens', float(self.total_tokens), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
-        
-        # Calculate average sequence length
-        non_pad_tokens = (targets != -100).sum(dim=1)
-        avg_seq_len = non_pad_tokens.float().mean().item()
+
+        # Calculate average sequence length from the same mask
+        avg_seq_len = non_pad_tokens_mask.sum(dim=1).float().mean().item()
         self.log('train/avg_seq_len', avg_seq_len, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
         
         # CSV Logging
