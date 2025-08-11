@@ -25,9 +25,27 @@ class LLaDAModel(nn.Module):
     2. Uses masking-based diffusion process instead of autoregressive generation
     3. Employs a low-confidence or random remasking strategy during generation
     """
-    # Class-level warning counter
-    _pos_warning_counter = 0
-    _pos_warning_max = 5
+    
+    def get_optimal_noise_schedule(self, block_length):
+        """
+        Returns optimal [beta, omega] for clipped noise schedule based on block length.
+        Based on BD3 paper Table 2 and Section 5.3.
+        
+        These values minimize gradient variance for different block sizes.
+        Can be further optimized with grid search during training.
+        """
+        if block_length <= 4:
+            # For L'=4: heavier masking is optimal
+            return 0.45, 0.95
+        elif block_length <= 16:
+            # For L'=16: moderate masking
+            return 0.3, 0.8
+        elif block_length <= 64:
+            # For L'=64: similar to L'=16
+            return 0.3, 0.8
+        else:
+            # For L'=128 and above: lighter masking can work
+            return 0.3, 0.8  # Conservative default
     
     def __init__(self, config):
         """Initializes the LLaDAModel."""
@@ -40,11 +58,8 @@ class LLaDAModel(nn.Module):
         default_bd3_block = config.block_size // 4 if config.block_size >= 16 else 16
         self.bd3_block_length = getattr(config, 'bd3_block_length', default_bd3_block)
         
-        # Token and position embeddings
+        # Token embeddings only - position encoding is handled by RoPE in attention
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
-        # Increase position embedding size to handle longer sequences during generation
-        max_pos_emb = max(config.block_size * 2, 2048)  # At least 2x block size or 2048
-        self.pos_emb = nn.Embedding(max_pos_emb, config.n_embd)
         
         # Transformer blocks
         self.blocks = nn.ModuleList([LLaDABlock(config) for _ in range(config.n_layer)])
@@ -207,20 +222,31 @@ class LLaDAModel(nn.Module):
 
     # --- End BD3-LM Helper Methods ---
 
-    def forward_process(self, input_ids, eps=1e-3):
+    def forward_process(self, input_ids, eps=1e-3, use_clipped_schedule=True):
         """
         Apply random masking with varying ratios for diffusion process.
         
         This is the forward noise process from the diffusion framework.
+        Uses clipped schedule as per BD3 paper to reduce gradient variance.
         """
         batch_size, seq_len = input_ids.shape
         
         # Ensure mask_token_id is within vocabulary range
         safe_mask_token_id = min(self.mask_token_id, self.config.vocab_size - 1)
         
-        # Sample random masking ratios between eps and 1-eps
-        t = torch.rand(batch_size, device=input_ids.device)
-        p_mask = (1 - eps) * t + eps
+        if use_clipped_schedule:
+            # BD3 paper shows optimal ranges depend on block size
+            # For block_length around 64-128, use U[0.3, 0.8]
+            # This avoids extreme masking rates that lead to high variance
+            beta = 0.3  # minimum masking rate
+            omega = 0.8  # maximum masking rate
+            t = torch.rand(batch_size, device=input_ids.device)
+            p_mask = beta + (omega - beta) * t  # Sample from U[beta, omega]
+        else:
+            # Original schedule: sample from U[eps, 1-eps]
+            t = torch.rand(batch_size, device=input_ids.device)
+            p_mask = (1 - eps) * t + eps
+        
         p_mask = p_mask[:, None].repeat(1, seq_len)
         
         # Apply masking randomly according to p_mask
@@ -258,11 +284,15 @@ class LLaDAModel(nn.Module):
             assert targets is not None, "Targets must be provided for BD3 training"
             
             # 1. Apply block-wise noise using the class method
-            # Now also returns p_mask_rates, though not strictly needed for simplified LBD loss
-            noisy_batch, masked_indices, _ = self._bd3_noise_process(
+            # Returns p_mask_rates needed for proper BD3 loss weighting
+            # Use optimal clipped schedule from BD3 paper based on block size
+            beta, omega = self.get_optimal_noise_schedule(self.bd3_block_length)
+            noisy_batch, masked_indices, p_mask_rates = self._bd3_noise_process(
                 input_ids,
                 self.bd3_block_length,
-                eps
+                beta=beta,
+                omega=omega,
+                eps=eps
             )
             
             # 2. Concatenate clean and noisy inputs
@@ -274,28 +304,8 @@ class LLaDAModel(nn.Module):
             # Mask shape needs to match attention mechanism [batch_size, num_heads, 2*seq_len, 2*seq_len] or broadcastable
             attn_mask = self._create_bd3_attention_mask(seq_len, self.bd3_block_length, device)
             
-            # 4. Embeddings
+            # 4. Embeddings (RoPE is applied in attention layers)
             x = self.tok_emb(combined_input_ids)
-            
-            # 5. Position Embeddings for combined length
-            # Position embeddings for combined length
-            max_pos_len = self.pos_emb.weight.shape[0]
-            if current_seq_len <= max_pos_len:
-                # We have enough position embeddings
-                pos = torch.arange(0, current_seq_len, device=device).unsqueeze(0)
-                pos_emb_lookup = self.pos_emb(pos)
-                x = x + pos_emb_lookup
-            else:
-                # Need to handle sequences longer than max position embeddings
-                if LLaDAModel._pos_warning_counter < LLaDAModel._pos_warning_max:
-                    print(f"Warning: BD3 combined length {current_seq_len} exceeds max pos embeddings {max_pos_len}. Using cyclic embeddings.")
-                    LLaDAModel._pos_warning_counter += 1
-                    if LLaDAModel._pos_warning_counter == LLaDAModel._pos_warning_max: print("Note: Suppressing further pos emb warnings.")
-                
-                # Use cyclic position embeddings for very long sequences
-                pos_indices = torch.arange(0, current_seq_len, device=device) % max_pos_len
-                pos_emb_lookup = self.pos_emb(pos_indices.unsqueeze(0))
-                x = x + pos_emb_lookup
                 
         else:
             # --- Original LLaDA Path ---
@@ -308,27 +318,8 @@ class LLaDAModel(nn.Module):
                 masked_indices = None
                 p_mask = None # Needed for original loss calc
             
-            # Embeddings
+            # Embeddings (RoPE is applied in attention layers)
             x = self.tok_emb(noisy_batch)
-            
-            # Position embeddings
-            max_pos_len = self.pos_emb.weight.shape[0]
-            if current_seq_len <= max_pos_len:
-                # Standard position embeddings
-                pos = torch.arange(0, current_seq_len, device=device).unsqueeze(0)
-                pos_emb_lookup = self.pos_emb(pos)
-                x = x + pos_emb_lookup
-            else:
-                # Handle sequences longer than max position embeddings
-                if LLaDAModel._pos_warning_counter < LLaDAModel._pos_warning_max:
-                    print(f"Warning: Sequence length {current_seq_len} exceeds max pos embeddings {max_pos_len}. Using cyclic embeddings.")
-                    LLaDAModel._pos_warning_counter += 1
-                    if LLaDAModel._pos_warning_counter == LLaDAModel._pos_warning_max: print("Note: Suppressing further pos emb warnings.")
-                
-                # Use cyclic position embeddings
-                pos_indices = torch.arange(0, current_seq_len, device=device) % max_pos_len
-                pos_emb_lookup = self.pos_emb(pos_indices.unsqueeze(0))
-                x = x + pos_emb_lookup
         
         # Apply dropout (common to both paths)
         x = self.drop(x)
@@ -379,58 +370,73 @@ class LLaDAModel(nn.Module):
                 # Loss is calculated only on initially masked positions in the noisy part
                 # using the original targets
                 masked_indices_flat = masked_indices.view(-1) # From _bd3_noise_process call above
+                p_mask_rates_flat = p_mask_rates.view(-1)  # Masking rates for weighting
                 
                 # Use masked computation instead of conditional branching
                 # Reshape logits and targets
                 noisy_logits_flat = noisy_logits.reshape(-1, noisy_logits.size(-1)) # [B*seq_len, V]
                 targets_flat = targets.reshape(-1) # [B*seq_len]
                 
-                # Calculate loss for all positions, then mask
+                # Calculate loss for all positions
                 all_losses = F.cross_entropy(noisy_logits_flat, targets_flat, reduction='none')
-                masked_losses = all_losses * masked_indices_flat.float()
+                
+                # Apply BD3 weighting: α'(t)/(1-α(t)) where 1-α(t) = p_mask_rate
+                # For clipped linear schedule within [beta, omega]: α'(t) ≈ 1/(omega - beta)
+                alpha_prime = 1.0 / (omega - beta + 1e-8)
+                weight = alpha_prime / (p_mask_rates_flat + 1e-8)  # α'(t)/(1-α(t))
+                
+                # Apply mask and weighting
+                weighted_losses = all_losses * masked_indices_flat.float() * weight
                 
                 # Calculate mean only over masked positions
                 num_masked = masked_indices_flat.float().sum()
                 loss = torch.where(
                     num_masked > 0,
-                    masked_losses.sum() / num_masked,
+                    weighted_losses.sum() / num_masked,
                     torch.tensor(0.0, device=device)
                 )
                     
             elif apply_masking and masked_indices is not None:
                 # --- Original LLaDA Loss Calculation ---
-                # Calculate loss only on masked tokens (using p_mask weighting)
+                # According to the paper (Eq. 3), the loss is computed only on masked tokens
+                # The 1/t factor in the paper normalizes for the expected number of masked tokens
+                # Since we're already computing the average over actual masked tokens, we don't need 1/t
+                
                 masked_indices_flat = masked_indices.view(-1)
-                # Use masked computation instead of conditional branching
                 logits_flat = logits.view(-1, logits.size(-1))
                 targets_flat = targets.view(-1)
-                p_mask_flat = p_mask.view(-1)
                 
                 # Calculate loss for all positions
                 all_losses = F.cross_entropy(logits_flat, targets_flat, reduction='none')
-                # Apply p_mask weighting and masked selection with clipping to prevent division by very large values
-                # Clamp p_mask to prevent extreme weighting that causes mode collapse
-                weighted_losses = (all_losses / torch.clamp(p_mask_flat, min=0.1, max=1.0)) * masked_indices_flat.float()
                 
-                # Calculate mean over all positions (normalized by batch_size * seq_len)
-                loss = weighted_losses.sum() / (batch_size * seq_len)
+                # Apply mask to only compute loss on masked tokens
+                masked_losses = all_losses * masked_indices_flat.float()
+                
+                # Count the number of masked tokens
+                num_masked = masked_indices_flat.float().sum()
+                
+                # Calculate average loss over masked positions only
+                # No need for 1/t factor since we're averaging over actual masked tokens
+                loss = masked_losses.sum() / (num_masked + 1e-8)
                 
                 # Add entropy regularization to prevent mode collapse
                 # This encourages the model to produce diverse predictions
                 if self.training:  # Only apply during training
-                    # Calculate entropy on masked positions only
-                    masked_logits = logits_flat[masked_indices_flat]
-                    if masked_logits.numel() > 0:
-                        # Apply softmax to get probabilities
-                        probs = F.softmax(masked_logits, dim=-1)
-                        # Calculate entropy: -sum(p * log(p))
-                        entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
-                        # Average entropy across masked positions
-                        avg_entropy = entropy.mean()
-                        # Subtract from loss (higher entropy = lower loss)
-                        # Use a small coefficient to not overwhelm the main loss
-                        entropy_coef = 0.01
-                        loss = loss - entropy_coef * avg_entropy
+                    # Calculate entropy on all positions but weight by mask (avoids dynamic shapes)
+                    # Apply softmax to get probabilities for all positions
+                    probs = F.softmax(logits_flat, dim=-1)
+                    # Calculate entropy: -sum(p * log(p)) for all positions
+                    entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
+                    # Weight entropy by mask and average only over masked positions
+                    masked_entropy = entropy * masked_indices_flat.float()
+                    num_masked = masked_indices_flat.float().sum()
+                    # Use safe division that avoids data-dependent branching
+                    # Adding 1e-8 prevents division by zero when no positions are masked
+                    avg_entropy = masked_entropy.sum() / (num_masked + 1e-8)
+                    # Subtract from loss (higher entropy = lower loss)
+                    # Use a small coefficient to not overwhelm the main loss
+                    entropy_coef = 0.01
+                    loss = loss - entropy_coef * avg_entropy
             # Else: No targets or no masking, loss remains None or 0.0 if initialized
             elif loss is None: # Ensure loss is tensor if targets provided but no masking
                 loss = torch.tensor(0.0, device=device)

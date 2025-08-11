@@ -33,7 +33,7 @@ CMD="python run_train.py \
     --max_iters 600000 \
     --eval_interval_steps 5000 \
     --log_interval_steps 10 \
-    --grad_clip 1.0 \
+    --grad_clip 0 \
     --gradient_accumulation_steps 4 \
     --num_workers 4 \
     --dropout 0.1 \

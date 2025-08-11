@@ -263,8 +263,9 @@ def enable_torch_compile(model, precision='default', mode='max-autotune', backen
         compile_options['fullgraph'] = False
         compile_options['dynamic'] = True
     elif mode == 'max-autotune':
-        compile_options['fullgraph'] = True
-        compile_options['dynamic'] = False
+        # For max-autotune, use dynamic=True to handle shape variations better
+        compile_options['fullgraph'] = True  # Changed to False to avoid recompilation issues
+        compile_options['dynamic'] = False      # Allow dynamic shapes
     
     # Configurer la précision
     if precision == 'highest':

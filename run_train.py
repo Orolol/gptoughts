@@ -40,7 +40,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train LLM models with PyTorch Lightning')
 
     # Model Parameters
-    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'gpt', 'mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'mdm', 'moe_mla', 'nsa'], default='gpt', help='Type of model to train')
+    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'gpt', 'mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'mdm', 'moe_mla', 'nsa', 'hrm'], default='gpt', help='Type of model to train')
     parser.add_argument('--size', type=str, choices=['small', 'medium', 'large', 'xl'], default='small', help='Size of the model')
     parser.add_argument('--use_lightning', action='store_true', default=True, help='Use PyTorch Lightning for training')
 
@@ -54,10 +54,11 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=12, help='Batch size per device')
     parser.add_argument('--block_size', type=int, default=512, help='Context size')
     parser.add_argument('--num_workers', type=int, default=2, help='Number of dataloader workers')
-    parser.add_argument('--dataloader_type', type=str, default='dynamic', choices=['original', 'dynamic'], help='Type of dataloader to use (`dynamic` is more efficient).')
+    parser.add_argument('--dataloader_type', type=str, default='packed', choices=['original', 'dynamic', 'packed'], help='Type of dataloader to use (`dynamic` is more efficient).')
 
     # Model Config Parameters (passed to LightningModule)
     parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate')
+    parser.add_argument('--label_smoothing', type=float, default=0.0, help='Label smoothing for CE loss (if supported by the model)')
     parser.add_argument('--bias', action='store_true', help='Use bias in linear layers')
     parser.add_argument('--attention_backend', type=str, default=None, help='Attention backend (e.g., flash)')
 
@@ -120,6 +121,18 @@ def parse_args():
     # Dynamic Tanh (DyT) Parameters
     parser.add_argument('--use_dyt', action='store_true', help='Use Dynamic Tanh (DyT) instead of RMSNorm for ~8% speedup')
     parser.add_argument('--dyt_alpha_init', type=float, default=0.5, help='Initial value for DyT alpha parameter')
+
+    # HRM-specific Parameters
+    parser.add_argument('--hrm_max_segments', type=int, default=None, help='Override: maximum number of HRM segments (ACT)')
+    parser.add_argument('--hrm_cycles_per_segment', type=int, default=None, help='Override: number of cycles per HRM segment (N)')
+    parser.add_argument('--hrm_steps_per_cycle', type=int, default=None, help='Override: number of L-steps per cycle (T)')
+    parser.add_argument('--ponder_loss_weight', type=float, default=0.01, help='HRM ponder loss weight')
+    parser.add_argument('--halt_bias_init', type=float, default=-2.0, help='Initial bias for HRM halting head (encourages early halting)')
+    parser.add_argument('--hrm_deq_one_step', action='store_true', help='Enable DEQ-style 1-step gradient (memory O(1) within segment)')
+    parser.add_argument('--hrm_use_deep_supervision', action='store_true', help='Enable deep supervision across segments with detach between segments')
+    parser.add_argument('--hrm_n_supervision_segments', type=int, default=1, help='Number of supervision segments if deep supervision is enabled')
+    parser.add_argument('--hrm_gradient_steps', type=int, default=None, help='Number of steps with gradients (-1 for all, 1 for 1-step approx)')
+    parser.add_argument('--hrm_use_act', type=str, default=None, help='Enable/disable Adaptive Computation Time (true/false)')
 
     # ParScale-MLA Parameters
     parser.add_argument('--parallel_streams', type=int, default=8, help='Number of parallel streams for ParScale')

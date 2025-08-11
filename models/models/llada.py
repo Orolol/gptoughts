@@ -27,8 +27,8 @@ class LLaDAConfig:
     bias: bool = True       # Whether to use bias in Linear and LayerNorm layers
     ratio_kv: int = 4      # Ratio of key/value heads
     mask_token_id: int = 126336  # Special token ID for [MASK]
-    num_experts: int = 8    # Number of experts in the MoE layer
-    k: int = 2             # Top-k experts to route tokens to
+    num_experts: int = 16    # Number of experts in the MoE layer
+    k: int = 1             # Top-k experts to route tokens to
     temperature: float = 0.0  # Temperature for sampling during generation
     remasking: str = 'low_confidence'  # Remasking strategy: 'low_confidence' or 'random'
     use_checkpoint: bool = False  # Whether to use gradient checkpointing

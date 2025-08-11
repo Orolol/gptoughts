@@ -8,7 +8,7 @@ MODEL_SIZE=${1:-small}
 BATCH_SIZE=${2:-4}  # Smaller batch size for better gradient quality
 BLOCK_SIZE=${3:-1024}  # Shorter sequences for faster iteration
 OUTPUT_DIR=${4:-out_mla_llada_optimized}
-USE_FP8=${5:-0}
+USE_FP8=${5:-1}
 USE_DYT=${6:-1}  # Dynamic Tanh enabled by default
 
 # Create output directory
@@ -33,13 +33,14 @@ CMD="python run_train.py \
     --max_iters 100000 \
     --eval_interval_steps 1000 \
     --log_interval_steps 10 \
-    --grad_clip 0.5 \
+    --grad_clip 0 \
     --gradient_accumulation_steps 4 \
     --num_workers 2 \
     --dropout 0.0 \
     --precision bf16-mixed \
     --attention_backend flash \
     --optimize_attention \
+    --compile \
     --optimizer_type adamw"
 
 # Add FP8 flags if enabled

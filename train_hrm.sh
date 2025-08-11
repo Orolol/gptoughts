@@ -1,58 +1,47 @@
 #!/bin/bash
 
-# Training script for NSA model with Blackwell optimizations
-# Usage: ./train_nsa_blackwell.sh [size] [batch_size] [block_size] [output_dir] [use_blackwell] [profile] [resume]
+# Training script for HRM model
+# Usage: ./train_hrm.sh [size] [batch_size] [block_size] [output_dir] [compile] [resume]
 
 # Default parameters
 SIZE=${1:-"medium"}
 BATCH_SIZE=${2:-8}
 BLOCK_SIZE=${3:-4096}
-OUTPUT_DIR=${4:-"out_nsa_blackwell"}
-USE_BLACKWELL=${5:-1}  # 1 to enable Blackwell optimizations, 0 to disable
-PROFILE=${6:-0}  # 1 to enable profiling, 0 to disable
-RESUME=${7:-false}
-
-# Set environment variables for optimal performance
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
-export CUDA_LAUNCH_BLOCKING=0
-export TORCH_CUDA_ARCH_LIST="9.0;10.0"  # Hopper and Blackwell
+OUTPUT_DIR=${4:-"out_hrm"}
+COMPILE=${5:-1}  # 1 to enable torch.compile, 0 to disable
+RESUME=${6:-false}
 
 echo "============================================"
-echo "Training NSA Model with Blackwell Optimizations"
+echo "Training HRM Model"
 echo "============================================"
 echo "Model size: $SIZE"
 echo "Batch size: $BATCH_SIZE"
 echo "Block size: $BLOCK_SIZE"
 echo "Output directory: $OUTPUT_DIR"
-echo "Blackwell optimizations: $USE_BLACKWELL"
+echo "Compile: $COMPILE"
 echo "Resume: $RESUME"
 echo "============================================"
 
-# Check if we're on a Blackwell GPU
+# Detect GPU
 python -c "
 import torch
+print(f'CUDA available: {torch.cuda.is_available()}')
 if torch.cuda.is_available():
     cc = torch.cuda.get_device_capability()
     name = torch.cuda.get_device_name()
     print(f'GPU: {name} (Compute Capability {cc[0]}.{cc[1]})')
-    if cc[0] >= 10:
-        print('✓ Blackwell architecture detected')
-    elif cc[0] >= 9:
-        print('✓ Hopper architecture detected')
-    else:
-        print('⚠ Older GPU - some optimizations may not be available')
 "
 
-# Set resume options
+# Resume option
 RESUME_ARGS=""
 if [ "$RESUME" = "true" ] || [ "$RESUME" = "1" ]; then
     RESUME_ARGS="--init_from resume"
     echo "Will attempt to resume from last checkpoint in $OUTPUT_DIR"
 fi
 
-# Build the command
+# Build command
 CMD="python run_train.py \
-    --model_type nsa \
+    --model_type hrm \
     --size $SIZE \
     --batch_size $BATCH_SIZE \
     --block_size $BLOCK_SIZE \
@@ -68,12 +57,16 @@ CMD="python run_train.py \
     --log_interval_steps 10 \
     --grad_clip 0 \
     --weight_decay 0.1 \
+    --label_smoothing 0.0 \
+    --ponder_loss_weight 0.01 \
+    --halt_bias_init -2.0 \
+    --hrm_deq_one_step \
+    --hrm_use_deep_supervision \
+    --hrm_n_supervision_segments 3 \
     $RESUME_ARGS"
 
-# Add Blackwell-specific optimizations if enabled
-if [ "$USE_BLACKWELL" -eq 1 ]; then
+if [ "$COMPILE" -eq 1 ]; then
     CMD="$CMD \
-        --use_fp8 \
         --compile \
         --precision bf16-mixed"
 fi
@@ -81,18 +74,10 @@ fi
 # Create output directory
 mkdir -p $OUTPUT_DIR
 
-# Add profiling options if enabled
-if [ "$PROFILE" = "1" ]; then
-    CMD="$CMD \
-    --profile \
-    --profile_interval 50"
-fi
-
-# Log the command
 echo ""
 echo "Running command:"
 echo "$CMD"
 echo ""
 
-# Execute training
 exec $CMD
+

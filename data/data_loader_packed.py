@@ -1,407 +1,341 @@
+import os
+import time
+import random
+import threading
+from collections import deque
+from typing import Any, Dict, List, Optional
+import signal
+import atexit
+import weakref
+from datetime import datetime
+
 import torch
 from torch.utils.data import IterableDataset
 from datasets import load_dataset
 from transformers import AutoTokenizer
-import threading
-import os
-import time
-from typing import Dict, List, Tuple, Optional
-import numpy as np
 
+# Global registry to track active datasets for cleanup
+_active_datasets = weakref.WeakSet()
 
-class PackedDocumentBuffer:
-    """Buffer that accumulates packed document sequences."""
-    def __init__(self, capacity=4):
-        self.capacity = capacity
-        self.buffer = []
-        self.lock = threading.Lock()
-        self.not_full = threading.Condition(self.lock)
-        self.not_empty = threading.Condition(self.lock)
-        self.is_closed = False
+def _cleanup_all_datasets(signum=None, frame=None):
+    """Signal handler to clean up all active datasets"""
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Received interrupt signal, cleaning up datasets...")
+    for dataset in list(_active_datasets):
+        try:
+            dataset.close()
+        except Exception as e:
+            print(f"Error closing dataset: {e}")
     
-    def put(self, batch):
-        """Add a packed batch to the buffer."""
+    # Re-raise KeyboardInterrupt for proper exit
+    if signum == signal.SIGINT:
+        raise KeyboardInterrupt
+
+# Register signal handlers
+signal.signal(signal.SIGINT, _cleanup_all_datasets)
+signal.signal(signal.SIGTERM, _cleanup_all_datasets)
+atexit.register(_cleanup_all_datasets)
+
+
+class PackedBatchQueue:
+    def __init__(self, capacity: int = 16):
+        self.capacity = capacity
+        self.queue: deque = deque(maxlen=capacity)
+        self.lock = threading.Lock()
+        self.not_empty = threading.Condition(self.lock)
+        self.not_full = threading.Condition(self.lock)
+        self.closed = False
+
+    def put(self, item: Dict[str, torch.Tensor]) -> bool:
         with self.lock:
-            while len(self.buffer) >= self.capacity and not self.is_closed:
+            while len(self.queue) >= self.capacity and not self.closed:
                 self.not_full.wait(timeout=1.0)
-                if self.is_closed:
+                if self.closed:
                     return False
-            
-            if self.is_closed:
+            if self.closed:
                 return False
-                
-            self.buffer.append(batch)
+            self.queue.append(item)
             self.not_empty.notify()
             return True
-    
-    def get(self):
-        """Get a packed batch from the buffer."""
+
+    def get(self) -> Optional[Dict[str, torch.Tensor]]:
         with self.lock:
-            while len(self.buffer) == 0 and not self.is_closed:
+            while len(self.queue) == 0 and not self.closed:
                 self.not_empty.wait(timeout=1.0)
-                if self.is_closed and len(self.buffer) == 0:
+                if self.closed and len(self.queue) == 0:
                     return None
-            
-            if len(self.buffer) == 0:
+            if len(self.queue) == 0:
                 return None
-                
-            batch = self.buffer.pop(0)
+            item = self.queue.popleft()
             self.not_full.notify()
-            return batch
-    
+            return item
+
     def close(self):
-        """Close the buffer and wake up all waiting threads."""
         with self.lock:
-            self.is_closed = True
+            self.closed = True
             self.not_empty.notify_all()
             self.not_full.notify_all()
-    
+
     def __len__(self):
         with self.lock:
-            return len(self.buffer)
+            return len(self.queue)
 
 
-class PackedDocumentDataset(IterableDataset):
+class PackedFinewebDataset(IterableDataset):
     """
-    Dataset that packs multiple documents into sequences up to max_length.
-    Documents are packed greedily - we keep adding documents until the next one won't fit.
+    Iterable dataset producing fixed-shape packed batches with minimal padding.
+    - Always emits constant shape (batch_size, target_seq_len) for compile stability.
+    - Packs multiple documents per sequence to maximize useful tokens/sec.
     """
+
     def __init__(
-        self, 
-        dataset_name="HuggingFaceFW/fineweb-edu",
-        dataset_config="CC-MAIN-2024-10",
-        split='train', 
-        max_length=8192,
-        buffer_size=4,
-        start_offset=0, 
-        tokenizer=None,
-        add_eos_between_docs=True,
-        min_length_ratio=0.8,  # Try to fill at least 80% of max_length
-        gradient_accumulation_steps=1,
-        tokenize_batch_size=10  # Number of documents to tokenize at once
+        self,
+        split: str = "train",
+        max_length: int = 2048,
+        batch_size: int = 4,
+        buffer_docs: int = 4096,
+        prefetch_batches: int = 16,
+        shuffle: bool = True,
+        tokenizer: Optional[Any] = None,
+        num_workers: int = 1,
+        start_offset: int = 0,
     ):
         super().__init__()
-        
-        # Load dataset
-        if dataset_name == "HuggingFaceFW/fineweb-edu":
-            self.dataset = load_dataset(
-                dataset_name,
-                name=dataset_config,
-                split=split,
-                streaming=True
-            ).skip(start_offset)
-        else:
-            self.dataset = load_dataset(
-                dataset_name,
-                split=split,
-                streaming=True
-            ).skip(start_offset)
-        
-        # Initialize tokenizer
+
+        self.split = split
+        self.max_length = max_length  # target_seq_len
+        self.batch_size = batch_size
+        self.buffer_docs = max(512, buffer_docs)
+        self.prefetch_batches = max(4, prefetch_batches)
+        self.shuffle = shuffle
+        self.num_workers = max(1, num_workers)
+
+        self.dataset = load_dataset(
+            "HuggingFaceFW/fineweb-edu",
+            name="CC-MAIN-2024-10",
+            split=split,
+            streaming=True,
+        ).skip(start_offset)
+
         if tokenizer is not None:
             self.tokenizer = tokenizer
         else:
-            access_token = os.getenv('HF_TOKEN')
+            access_token = os.getenv("HF_TOKEN")
             self.tokenizer = AutoTokenizer.from_pretrained(
-                "meta-llama/Llama-3.2-1B-Instruct", 
-                use_fast=True, 
-                access_token=access_token
+                "meta-llama/Llama-3.2-1B-Instruct", use_fast=True, access_token=access_token
             )
             self.tokenizer.pad_token = self.tokenizer.eos_token
-            
-        self.max_length = max_length
-        self.min_length = int(max_length * min_length_ratio)
-        self.buffer_size = buffer_size
-        self.start_offset = start_offset
-        self.add_eos_between_docs = add_eos_between_docs
-        self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.tokenize_batch_size = tokenize_batch_size
-        
-        # Special tokens
-        self.eos_token_id = self.tokenizer.eos_token_id
-        self.pad_token_id = self.tokenizer.pad_token_id
-        
-        # Buffer for packed sequences
-        self.batch_buffer = PackedDocumentBuffer(capacity=buffer_size)
-        
-        # Thread management
-        self.prefetch_thread = None
+
+        self.pad_id = int(self.tokenizer.pad_token_id)
+        self.eos_id = int(self.tokenizer.eos_token_id)
+
+        self.batch_queue = PackedBatchQueue(capacity=self.prefetch_batches)
         self.should_stop = threading.Event()
-        
-        # Statistics
-        self.sequences_prepared = 0
-        self.sequences_served = 0
-        self.documents_processed = 0
-        self.total_tokens_packed = 0
-        
-        # Start prefetching
-        self._start_prefetching()
-        
-        # Wait for first batch
-        print("Initializing packed document data loader...")
-        timeout = 30
-        start_time = time.time()
-        while len(self.batch_buffer) == 0 and time.time() - start_time < timeout:
-            time.sleep(0.1)
-        print(f"Data loader initialized, buffer has {len(self.batch_buffer)} sequences ready")
+        self.producer_thread: Optional[threading.Thread] = None
+        self.exception: Optional[BaseException] = None
 
-    def _tokenize_document(self, text: str) -> List[int]:
-        """Tokenize a single document without padding."""
-        tokens = self.tokenizer(
-            text,
-            add_special_tokens=False,
-            truncation=False,
-            return_attention_mask=False
-        )['input_ids']
-        return tokens
-
-    def _pack_and_tokenize(self, documents: List[str], document_tokens: List[List[int]]) -> Dict[str, torch.Tensor]:
-        """
-        Pack multiple documents into a single sequence up to max_length.
-        
-        Args:
-            documents: List of document texts
-            document_tokens: List of tokenized documents (already tokenized for efficiency)
-            
-        Returns:
-            Dict containing input_ids, labels, and document_boundaries
-        """
-        all_input_ids = []
-        document_boundaries = []
-        current_position = 0
-        documents_included = 0
-        
-        # Add special tokens at the beginning
-        all_input_ids.extend([self.tokenizer.bos_token_id] if self.tokenizer.bos_token_id is not None else [])
-        current_position = len(all_input_ids)
-        
-        for i, tokens in enumerate(document_tokens):
-            # Check if adding this document would exceed max_length
-            tokens_to_add = len(tokens)
-            if self.add_eos_between_docs and i > 0:
-                tokens_to_add += 1  # Account for EOS separator
-            
-            if current_position + tokens_to_add > self.max_length:
-                # This document won't fit, stop packing
-                break
-            
-            # Add EOS between documents if requested
-            if self.add_eos_between_docs and i > 0:
-                all_input_ids.append(self.eos_token_id)
-                current_position += 1
-            
-            # Add document tokens
-            doc_start = current_position
-            all_input_ids.extend(tokens)
-            current_position += len(tokens)
-            doc_end = current_position
-            
-            # Record document boundary
-            document_boundaries.append((doc_start, doc_end))
-            documents_included += 1
-        
-        # Pad to max_length if needed
-        if len(all_input_ids) < self.max_length:
-            padding_length = self.max_length - len(all_input_ids)
-            all_input_ids.extend([self.pad_token_id] * padding_length)
-        
-        # Convert to tensors with batch dimension
-        input_ids = torch.tensor(all_input_ids[:self.max_length], dtype=torch.long).unsqueeze(0)  # [1, seq_len]
-        
-        # Create attention mask (1 for real tokens, 0 for padding)
-        attention_mask = torch.ones_like(input_ids)
-        if current_position < self.max_length:
-            attention_mask[0, current_position:] = 0
-        
-        # Create labels by shifting input_ids left by 1
-        labels = input_ids.clone()
-        labels[:, :-1] = input_ids[:, 1:]
-        labels[:, -1] = -100  # Ignore last position in loss
-        
-        # Set padding positions to -100 in labels
-        labels[attention_mask == 0] = -100
-        
-        # Pre-compute document mask for attention
-        # This creates a 4D mask [B=1, 1, S, T] where attention is blocked across document boundaries
-        seq_len = self.max_length
-        document_mask = torch.zeros((1, 1, seq_len, seq_len), dtype=torch.float32)
-        
-        # Start with causal mask
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1)
-        document_mask[0, 0] = -causal_mask * 1e10  # Large negative value for positions to mask
-        
-        # Add document boundary constraints
-        for doc_start, doc_end in document_boundaries:
-            # For each position in this document, it can only attend to positions within the same document
-            for pos in range(doc_start, doc_end):
-                # Mask out positions before this document
-                if doc_start > 0:
-                    document_mask[0, 0, pos, :doc_start] = -1e10
-                # Mask out positions after this document
-                if doc_end < seq_len:
-                    document_mask[0, 0, pos, doc_end:] = -1e10
-        
-        # Mask out padding positions
-        if current_position < seq_len:
-            document_mask[0, 0, :, current_position:] = -1e10
-            document_mask[0, 0, current_position:, :] = -1e10
-        
-        # Statistics
-        utilization = current_position / self.max_length
-        
-        return {
-            'input_ids': input_ids.contiguous(),
-            'attention_mask': attention_mask.contiguous(),
-            'labels': labels.contiguous(),
-            'document_boundaries': document_boundaries,
-            'document_mask': document_mask.contiguous(),  # Pre-computed 4D mask
-            'documents_packed': documents_included,
-            'tokens_used': current_position,
-            'utilization': utilization,
-            # For compatibility with existing training code
-            'decoder_input_ids': input_ids.clone().contiguous(),
-            'decoder_attention_mask': attention_mask.clone().contiguous(),
+        self.stats = {
+            "batches_built": 0,
+            "docs_buffered": 0,
+            "avg_padding_ratio": 0.0,
+            "total_tokens": 0,
+            "total_padding": 0,
         }
 
-    def _prefetch_data(self):
-        """Background thread that continuously prefetches and packs documents."""
-        try:
-            dataset_iter = iter(self.dataset)
-            
-            # Buffer for documents waiting to be packed
-            document_buffer = []
-            tokenized_buffer = []
-            
-            while not self.should_stop.is_set():
-                try:
-                    # Collect documents until we have enough to potentially fill a sequence
-                    while len(tokenized_buffer) < self.tokenize_batch_size and not self.should_stop.is_set():
-                        try:
-                            example = next(dataset_iter)
-                            # Extract text from example
-                            text = None
-                            if 'text' in example:
-                                text = example['text']
-                            elif 'content' in example:
-                                text = example['content']
-                            else:
-                                # Try to find any text field
-                                for key in example:
-                                    if isinstance(example[key], str):
-                                        text = example[key]
-                                        break
-                            
-                            if text:
-                                # Tokenize the document
-                                tokens = self._tokenize_document(text)
-                                # Only keep documents that aren't too long
-                                if len(tokens) <= self.max_length - 100:  # Leave some room for special tokens
-                                    document_buffer.append(text)
-                                    tokenized_buffer.append(tokens)
-                                    self.documents_processed += 1
-                                
-                        except StopIteration:
-                            # Dataset exhausted, restart
-                            dataset_iter = iter(self.dataset)
-                    
-                    # Try to pack documents into sequences
-                    while len(tokenized_buffer) > 0 and not self.should_stop.is_set():
-                        # Greedily pack documents
-                        packed_docs = []
-                        packed_tokens = []
-                        current_length = 1  # Account for BOS token
-                        
-                        i = 0
-                        while i < len(tokenized_buffer):
-                            doc_length = len(tokenized_buffer[i])
-                            if packed_docs and self.add_eos_between_docs:
-                                doc_length += 1  # Account for EOS separator
-                            
-                            if current_length + doc_length <= self.max_length:
-                                # This document fits
-                                packed_docs.append(document_buffer[i])
-                                packed_tokens.append(tokenized_buffer[i])
-                                current_length += doc_length
-                                # Remove from buffers
-                                document_buffer.pop(i)
-                                tokenized_buffer.pop(i)
-                            else:
-                                # Try next document
-                                i += 1
-                        
-                        # Create batch if we have enough content
-                        if current_length >= self.min_length or (len(tokenized_buffer) == 0 and packed_docs):
-                            batch = self._pack_and_tokenize(packed_docs, packed_tokens)
-                            
-                            # Add to buffer
-                            if not self.batch_buffer.put(batch):
-                                break
-                            
-                            self.sequences_prepared += 1
-                            self.total_tokens_packed += batch['tokens_used']
-                            
-                            if self.sequences_prepared % 100 == 0:
-                                avg_utilization = self.total_tokens_packed / (self.sequences_prepared * self.max_length)
-                                print(f"Prepared {self.sequences_prepared} packed sequences "
-                                      f"({self.documents_processed} docs, "
-                                      f"{avg_utilization:.1%} avg utilization)")
-                        else:
-                            # Not enough content, wait for more documents
-                            break
-                    
-                except Exception as e:
-                    print(f"Exception in prefetch thread: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    self.batch_buffer.close()
-                    break
-                    
-        except Exception as e:
-            print(f"Fatal error in prefetch thread: {e}")
-            import traceback
-            traceback.print_exc()
-            self.batch_buffer.close()
+        self._closed = False
+        
+        # Register this dataset for cleanup
+        _active_datasets.add(self)
+        
+        self._start_producer()
 
-    def _start_prefetching(self):
-        """Start the prefetching thread."""
-        if self.prefetch_thread is None or not self.prefetch_thread.is_alive():
-            self.should_stop.clear()
-            self.prefetch_thread = threading.Thread(
-                target=self._prefetch_data, 
-                daemon=True,
-                name="PackedDataPrefetchThread"
-            )
-            self.prefetch_thread.start()
-            print(f"Started packed document prefetch thread (id: {self.prefetch_thread.ident})")
+    def _tokenize_text(self, text: str) -> torch.Tensor:
+        tokens = self.tokenizer(text, truncation=False, return_tensors="pt", padding=False)
+        ids = tokens["input_ids"].squeeze(0)
+        if ids.numel() == 0 or ids[-1].item() != self.eos_id:
+            # Ensure EOS at document end
+            ids = torch.cat([ids, torch.tensor([self.eos_id], dtype=torch.long)])
+        return ids.cpu()
+
+    def _split_long(self, ids: torch.Tensor) -> List[torch.Tensor]:
+        if ids.numel() <= self.max_length:
+            return [ids]
+        chunks = []
+        start = 0
+        L = ids.numel()
+        while start < L:
+            end = min(start + self.max_length, L)
+            chunk = ids[start:end]
+            if chunk[-1].item() != self.eos_id:
+                chunk = torch.cat([chunk, torch.tensor([self.eos_id], dtype=torch.long)])
+            if chunk.numel() > self.max_length:
+                chunk = chunk[: self.max_length]
+            chunks.append(chunk)
+            start = end
+        return chunks
+
+    def _fill_sequence(self, docs: deque) -> torch.Tensor:
+        # Returns 1D tensor length = max_length
+        out = torch.full((self.max_length,), self.pad_id, dtype=torch.long)
+        pos = 0
+        while docs and pos < self.max_length:
+            cur = docs[0]
+            remaining = self.max_length - pos
+            if cur.numel() <= remaining:
+                out[pos : pos + cur.numel()] = cur
+                pos += cur.numel()
+                docs.popleft()
+            else:
+                # Do not split the current document/chunk across sequences.
+                # Finish this sequence (leave remaining padded) and keep the full chunk for the next sequence.
+                break
+        return out
+
+    def _build_batch(self, docs_buffer: deque) -> Optional[Dict[str, torch.Tensor]]:
+        if len(docs_buffer) == 0:
+            return None
+
+        input_ids = torch.full((self.batch_size, self.max_length), self.pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((self.batch_size, self.max_length), dtype=torch.long)
+
+        for i in range(self.batch_size):
+            seq = self._fill_sequence(docs_buffer)
+            input_ids[i] = seq
+            attention_mask[i] = (seq != self.pad_id).long()
+
+        labels = input_ids.clone()
+        labels[:, :-1] = input_ids[:, 1:]
+        labels[:, -1] = self.pad_id
+        labels[input_ids == self.pad_id] = -100
+
+        total = input_ids.numel()
+        used = attention_mask.sum().item()
+        pad = total - used
+        self.stats["total_tokens"] += total
+        self.stats["total_padding"] += pad
+        if self.stats["total_tokens"] > 0:
+            self.stats["avg_padding_ratio"] = self.stats["total_padding"] / self.stats["total_tokens"]
+
+        return {
+            "input_ids": input_ids.contiguous(),  # [B, L]
+            "attention_mask": attention_mask.contiguous(),  # [B, L]
+            "decoder_input_ids": input_ids.clone().contiguous(),
+            "decoder_attention_mask": attention_mask.clone().contiguous(),
+            "labels": labels.contiguous(),
+        }
+
+    def _producer(self):
+        try:
+            it = iter(self.dataset)
+            docs: List[torch.Tensor] = []
+            docs_deque: deque = deque()
+
+            while not self.should_stop.is_set():
+                # Fill documents buffer
+                while len(docs) < self.buffer_docs and not self.should_stop.is_set():
+                    try:
+                        ex = next(it)
+                    except StopIteration:
+                        it = iter(self.dataset)
+                        continue
+                    ids = self._tokenize_text(ex["text"])  # [T]
+                    chunks = self._split_long(ids)
+                    docs.extend(chunks)
+
+                if self.shuffle and len(docs) > 0:
+                    random.shuffle(docs)
+
+                if len(docs_deque) == 0 and len(docs) > 0:
+                    docs_deque = deque(docs)
+                    docs = []
+
+                if len(docs_deque) == 0:
+                    time.sleep(0.01)
+                    continue
+
+                batch = self._build_batch(docs_deque)
+                if batch is None:
+                    continue
+                if not self.batch_queue.put(batch):
+                    break
+                self.stats["batches_built"] += 1
+
+        except BaseException as e:
+            self.exception = e
+        finally:
+            self.batch_queue.close()
+
+    def _start_producer(self):
+        if self.producer_thread is not None and self.producer_thread.is_alive():
+            return
+        self.should_stop.clear()
+        self.exception = None
+        self.producer_thread = threading.Thread(target=self._producer, daemon=False, name="PackedProducer")
+        self.producer_thread.start()
 
     def __iter__(self):
-        self._start_prefetching()
+        self._start_producer()
         return self
-    
+
     def __next__(self):
-        batch = self.batch_buffer.get()
-        
+        if self.exception:
+            raise self.exception
+        batch = self.batch_queue.get()
         if batch is None:
             self.should_stop.set()
             raise StopIteration
-        
-        self.sequences_served += 1
-        
-        # Log statistics occasionally
-        if self.sequences_served % 100 == 0:
-            print(f"Served {self.sequences_served} sequences, "
-                  f"latest: {batch['documents_packed']} docs, "
-                  f"{batch['utilization']:.1%} utilization")
-        
         return batch
 
-    def __del__(self):
-        """Clean shutdown."""
-        if hasattr(self, 'should_stop'):
-            self.should_stop.set()
+    def get_stats(self) -> Dict[str, Any]:
+        return dict(self.stats)
+
+    def close(self):
+        """Clean shutdown"""
+        if self._closed:
+            return  # Already closed
         
-        if hasattr(self, 'batch_buffer'):
-            self.batch_buffer.close()
+        self._closed = True
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Closing packed data loader")
+        
+        if hasattr(self, 'should_stop'):
+            # Print stats before closing
+            try:
+                stats = self.get_stats()
+                print(f"\n{'='*60}")
+                print(f"Data Loader Final Statistics:")
+                print(f"  - Batches built: {stats['batches_built']:,}")
+                print(f"  - Documents buffered: {stats['docs_buffered']:,}")
+                print(f"  - Average padding ratio: {stats['avg_padding_ratio']:.2%}")
+                print(f"  - Total tokens: {stats['total_tokens']:,}")
+                print(f"  - Total padding: {stats['total_padding']:,}")
+                print(f"{'='*60}\n")
+            except Exception as e:
+                print(f"Error printing stats: {e}")
             
-        if hasattr(self, 'prefetch_thread') and self.prefetch_thread is not None:
-            self.prefetch_thread.join(timeout=0.5)
+            # Signal thread to stop
+            self.should_stop.set()
+            
+            # Close the batch queue immediately to unblock any waiting threads
+            if hasattr(self, "batch_queue"):
+                self.batch_queue.close()
+            
+            # Give thread a moment to exit cleanly
+            time.sleep(0.1)
+            
+            # Join thread with timeout
+            if hasattr(self, 'producer_thread') and self.producer_thread is not None:
+                if self.producer_thread.is_alive():
+                    self.producer_thread.join(timeout=1.0)
+                    if self.producer_thread.is_alive():
+                        print(f"Warning: PackedProducer thread did not terminate")
+            
+            # Remove from active datasets
+            _active_datasets.discard(self)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Packed data loader closed successfully")
+
+    def __del__(self):
+        """Destructor"""
+        try:
+            self.close()
+        except Exception:
+            pass  # Suppress errors during cleanup
+

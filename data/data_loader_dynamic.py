@@ -48,6 +48,7 @@ class DynamicBatchBuffer:
         self.not_full = threading.Condition(self.lock)
         self.is_closed = False
         self.total_docs_processed = 0
+        self.last_cleanup_count = 0
         
     def add_documents(self, documents: List[Dict[str, torch.Tensor]]):
         """Add tokenized documents to the buffer"""
@@ -63,8 +64,18 @@ class DynamicBatchBuffer:
             
             self.tokenized_docs.extend(documents)
             self.total_docs_processed += len(documents)
-            # Log very rarely or not at all during normal operation
-            pass
+            
+            # Periodic cleanup to prevent excessive memory usage
+            if self.total_docs_processed - self.last_cleanup_count > 1000:
+                # Ensure we don't have too many docs in buffer
+                if len(self.tokenized_docs) > self.max_buffer_size * 2:
+                    # Remove oldest docs if buffer is too large
+                    self.tokenized_docs = self.tokenized_docs[-self.max_buffer_size:]
+                self.last_cleanup_count = self.total_docs_processed
+                # Force garbage collection periodically
+                if torch.cuda.is_available() and self.total_docs_processed % 5000 == 0:
+                    torch.cuda.empty_cache()
+            
             self.not_empty.notify_all()
             return True
     
@@ -130,8 +141,26 @@ class DynamicBatchBuffer:
                 self.tokenized_docs = self.tokenized_docs[len(batch):]
             else:
                 # Fixed batch size with similar lengths
-                batch = self.tokenized_docs[:batch_size]
-                self.tokenized_docs = self.tokenized_docs[batch_size:]
+                # Try to select documents with similar lengths for better padding efficiency
+                if len(self.tokenized_docs) >= batch_size * 2:
+                    # We have enough docs to be selective
+                    # Take a window of 2x batch_size and select the most similar ones
+                    window = self.tokenized_docs[:batch_size * 2]
+                    window_avg = sum(d['length'] for d in window) // len(window)
+                    
+                    # Sort by distance from average
+                    window.sort(key=lambda x: abs(x['length'] - window_avg))
+                    
+                    # Take the batch_size most similar docs
+                    batch = window[:batch_size]
+                    
+                    # Remove selected docs from buffer
+                    remaining = window[batch_size:]
+                    self.tokenized_docs = remaining + self.tokenized_docs[batch_size * 2:]
+                else:
+                    # Not enough docs, just take what we have
+                    batch = self.tokenized_docs[:batch_size]
+                    self.tokenized_docs = self.tokenized_docs[batch_size:]
             
             self.not_full.notify()
             return batch
@@ -157,7 +186,7 @@ class DynamicFinewebDataset(IterableDataset):
         max_length: int = 2048,
         max_sequences_per_batch: int = None,  # Matches datasets.py naming
         buffer_size: int = 16,  # Matches datasets.py naming
-        prefetch_size: int = 100,
+        prefetch_size: int = 10000,
         max_tokens_per_batch: Optional[int] = None,
         shuffle: bool = True,
         start_offset: int = 0,
@@ -165,6 +194,11 @@ class DynamicFinewebDataset(IterableDataset):
         gradient_accumulation_steps: int = 1,
         num_tokenizer_workers: int = 2,
         max_iterations: Optional[int] = None,  # Maximum iterations before stopping
+        use_fixed_padding: bool = False,  # Use fixed padding for torch.compile compatibility
+        padding_bucket_size: int = 512,  # Bucket size for padding (reduces recompilations)
+        use_dynamic_batch_size: bool = True,  # Adjust batch size based on actual padding
+        dynamic_batch_safety_factor: float = 0.8,  # Safety factor to avoid OOM (0.8 = use 80% of theoretical max)
+        dynamic_batch_max_multiplier: float = 2.0,  # Max multiplier over base batch size to avoid extreme cases
         # Backward compatibility
         batch_size: int = None,  # Legacy parameter
         **kwargs
@@ -199,17 +233,29 @@ class DynamicFinewebDataset(IterableDataset):
         
         # Batching parameters
         self.max_length = max_length
-        self.batch_size = max_sequences_per_batch  # Internal batch size
+        self.batch_size = max_sequences_per_batch  # Base batch size
         self.prefetch_size = prefetch_size
         self.max_buffer_size = buffer_size * max_sequences_per_batch  # Scale buffer by batch size
         self.max_tokens_per_batch = max_tokens_per_batch
         self.shuffle = shuffle
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.num_workers = num_tokenizer_workers
+        self.use_fixed_padding = use_fixed_padding  # For torch.compile compatibility
+        self.padding_bucket_size = padding_bucket_size  # Bucket size for reducing compilations
+        self.use_dynamic_batch_size = use_dynamic_batch_size  # Dynamic batch sizing
+        self.dynamic_batch_safety_factor = dynamic_batch_safety_factor
+        self.dynamic_batch_max_multiplier = dynamic_batch_max_multiplier
         
-        # Buffers and threading
+        # Calculate max tokens for dynamic batch sizing
+        # This represents the maximum GPU memory we can use
+        self.max_total_tokens = self.batch_size * self.max_length
+        
+        # Maximum allowed batch size to prevent OOM
+        self.max_allowed_batch_size = int(self.batch_size * self.dynamic_batch_max_multiplier)
+        
+        # Buffers and threading - reduce queue size to limit memory
         self.doc_buffer = DynamicBatchBuffer(prefetch_size, self.max_buffer_size)
-        self.batch_queue = deque(maxlen=20)  # Ready batches - increased size
+        self.batch_queue = deque(maxlen=10)  # Reduced to limit memory usage
         self.batch_queue_lock = threading.Lock()
         self.batch_queue_not_empty = threading.Condition(self.batch_queue_lock)
         
@@ -262,10 +308,11 @@ class DynamicFinewebDataset(IterableDataset):
             input_ids = tokens['input_ids'].squeeze(0)
             actual_length = len(input_ids)
             
+            # Move to CPU immediately to avoid GPU memory accumulation
             return {
-                'input_ids': input_ids,
+                'input_ids': input_ids.cpu(),
                 'length': actual_length,
-                'text': text[:100]  # Keep snippet for debugging
+                # Don't keep text snippets - they accumulate memory
             }
         except Exception as e:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Error tokenizing document: {e}")
@@ -348,15 +395,29 @@ class DynamicFinewebDataset(IterableDataset):
             pass
     
     def _create_padded_batch(self, documents: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-        """Create a padded batch from documents with dynamic padding"""
+        """Create a padded batch from documents with dynamic or fixed padding"""
         start_time = time.time()
         if not documents:
             return None
         
-        # Find max length in this batch (dynamic padding)
-        max_len = max(doc['length'] for doc in documents)
+        # Determine padding length
+        if self.use_fixed_padding:
+            # Use fixed padding for torch.compile compatibility
+            max_len = self.max_length
+        else:
+            # Find max length in this batch (dynamic padding)
+            actual_max = max(doc['length'] for doc in documents)
+            
+            # Apply bucketing if padding_bucket_size is set and we're using torch.compile
+            if self.padding_bucket_size > 0:
+                # Round up to the nearest bucket size
+                max_len = ((actual_max + self.padding_bucket_size - 1) // self.padding_bucket_size) * self.padding_bucket_size
+                # Cap at max_length
+                max_len = min(max_len, self.max_length)
+            else:
+                max_len = actual_max
         
-        # Prepare tensors
+        # Prepare tensors on CPU first
         batch_size = len(documents)
         input_ids = torch.full((batch_size, max_len), self.tokenizer.pad_token_id, dtype=torch.long)
         attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long)
@@ -366,6 +427,8 @@ class DynamicFinewebDataset(IterableDataset):
             doc_len = doc['length']
             input_ids[i, :doc_len] = doc['input_ids']
             attention_mask[i, :doc_len] = 1
+            # Clear the document's tensor reference after use
+            doc['input_ids'] = None
         
         # Create labels for autoregressive training
         labels = input_ids.clone()
@@ -400,6 +463,7 @@ class DynamicFinewebDataset(IterableDataset):
         batch_count = 0
         last_status_time = time.time()
         consecutive_none = 0
+        last_memory_check = 0
         try:
             while not self.should_stop.is_set():
                 # Don't build too many batches ahead
@@ -413,9 +477,42 @@ class DynamicFinewebDataset(IterableDataset):
                 if self.should_stop.is_set():
                     break
                 
+                # Calculate dynamic batch size based on actual document sizes
+                if self.use_dynamic_batch_size and len(self.doc_buffer.tokenized_docs) > 0:
+                    # Peek at the documents to estimate their average length
+                    sample_size = min(20, len(self.doc_buffer.tokenized_docs))
+                    with self.doc_buffer.lock:
+                        sample_docs = self.doc_buffer.tokenized_docs[:sample_size]
+                        avg_length = sum(d['length'] for d in sample_docs) // len(sample_docs)
+                    
+                    # Apply bucketing if enabled
+                    if self.padding_bucket_size > 0:
+                        padded_length = ((avg_length + self.padding_bucket_size - 1) // self.padding_bucket_size) * self.padding_bucket_size
+                        padded_length = min(padded_length, self.max_length)
+                    else:
+                        padded_length = avg_length
+                    
+                    # Calculate how many sequences we can fit
+                    # Formula: dynamic_batch_size = max_total_tokens / padded_length
+                    theoretical_batch_size = self.max_total_tokens // padded_length
+                    
+                    # Apply safety factor to avoid OOM (accounts for activations, gradients, optimizer states)
+                    safe_batch_size = int(theoretical_batch_size * self.dynamic_batch_safety_factor)
+                    
+                    # Apply maximum multiplier cap to avoid extreme cases
+                    dynamic_batch_size = min(safe_batch_size, self.max_allowed_batch_size)
+                    dynamic_batch_size = max(1, dynamic_batch_size)  # At least 1
+                    
+                    # Log dynamic sizing occasionally
+                    if batch_count % 100 == 0:
+                        print(f"Dynamic batch sizing: padded_length={padded_length}, batch_size={dynamic_batch_size} "
+                              f"(theoretical={theoretical_batch_size}, base={self.batch_size}, safety={self.dynamic_batch_safety_factor})")
+                else:
+                    dynamic_batch_size = self.batch_size
+                
                 # Get documents for a batch (always wait for the first batch)
                 docs = self.doc_buffer.get_batch(
-                    self.batch_size,
+                    dynamic_batch_size,  # Use dynamic batch size
                     self.max_tokens_per_batch,
                     wait=True  # Always wait for primary batch
                 )
@@ -439,8 +536,9 @@ class DynamicFinewebDataset(IterableDataset):
                     # Try to get additional batches for gradient accumulation (non-blocking)
                     for ga_idx in range(self.gradient_accumulation_steps - 1):
                         # Try to get additional batch without waiting
+                        # Use the same dynamic batch size for consistency
                         additional_docs = self.doc_buffer.get_batch(
-                            self.batch_size,
+                            dynamic_batch_size,  # Use same dynamic batch size
                             self.max_tokens_per_batch,
                             wait=False  # Don't wait for additional batches
                         )
@@ -454,9 +552,22 @@ class DynamicFinewebDataset(IterableDataset):
                     
                     # Add to batch queue
                     with self.batch_queue_lock:
+                        # Limit queue size to prevent memory accumulation
+                        if len(self.batch_queue) >= self.batch_queue.maxlen:
+                            # Remove oldest batch group if queue is full
+                            old_group = self.batch_queue.popleft()
+                            del old_group  # Explicitly delete
+                        
                         self.batch_queue.append(batch_group)
                         self.stats['batches_created'] += len(batch_group)
                         batch_count += 1
+                        
+                        # # Periodic GPU memory cleanup
+                        # if batch_count - last_memory_check > 100:
+                        #     if torch.cuda.is_available():
+                        #         torch.cuda.empty_cache()
+                        #     last_memory_check = batch_count
+                        
                         self.batch_queue_not_empty.notify()
         
         except Exception as e:
@@ -553,6 +664,9 @@ class DynamicFinewebDataset(IterableDataset):
             self.current_batch_index += 1
             self.stats['batches_served'] += 1
             self.iteration_count += 1
+            # Clear previous batch from group to free memory
+            if self.current_batch_index > 1:
+                self.current_batch_group[self.current_batch_index - 2] = None
             return batch
         
         # Get new batch group
@@ -567,6 +681,13 @@ class DynamicFinewebDataset(IterableDataset):
                     raise StopIteration
                 
                 self.batch_queue_not_empty.wait(timeout=1.0)
+            
+            # Clear old batch group before getting new one
+            if self.current_batch_group is not None:
+                self.current_batch_group = None
+                # Force garbage collection of GPU memory
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
             self.current_batch_group = self.batch_queue.popleft()
         

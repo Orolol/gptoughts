@@ -19,6 +19,7 @@ from models.models.parscale_mla import ParScaleMLA, ParScaleMLAConfig, create_pa
 from models.models.mla_selective_model import MLASelectiveModel, MLASelectiveModelConfig
 from models.models.moe_mla_model import MOEMLA, MOEMLAConfig
 from models.models.nsa_model import NSAModel, NSAModelConfig
+from models.models.hrm_model import HRM, HRMConfig
 from models.mdm.model import MDMModel
 from models.config import MDMConfig
 from train.train_utils import (
@@ -66,6 +67,14 @@ class LLMLightningModule(pl.LightningModule):
         
         # Compile model if requested
         if hasattr(self.args, 'compile') and self.args.compile:
+            # Configure torch._dynamo for better compatibility with dynamic shapes
+            # import torch._dynamo as dynamo
+            # # Increase cache size limit to handle more shape variations
+            # dynamo.config.cache_size_limit = 64  # Default is 8
+            # # Continue on errors instead of crashing
+            # dynamo.config.suppress_errors = True
+            # print(f"Configured torch._dynamo with cache_size_limit=64 for dynamic batching")
+            
             # Skip compilation for models with known torch.compile compatibility issues
             skip_compile_models = ['mla_llada']
             if self.args.model_type.lower() in skip_compile_models:
@@ -141,6 +150,9 @@ class LLMLightningModule(pl.LightningModule):
         elif model_type == 'nsa':
             config = self._create_nsa_config()
             model = self._create_nsa_model(config)
+        elif model_type == 'hrm':
+            config = self._create_hrm_config()
+            model = self._create_hrm_model(config)
         else: # gpt
             config = self._create_gpt_config()
             model = GPT(config)
@@ -209,9 +221,9 @@ class LLMLightningModule(pl.LightningModule):
         """Create configuration for MLA-Model."""
         # Define key parameters based on size
         if self.args.size == 'small':
-            n_layer = 12
+            n_layer = 16
             n_embd = 768
-            n_head = 12
+            n_head = 16
             q_lora_rank = 0
             kv_lora_rank = 256
             qk_nope_head_dim = 128
@@ -403,7 +415,7 @@ class LLMLightningModule(pl.LightningModule):
         if self.args.size == 'small':  # Target: ~500M parameters
             hidden_size = 768  # Increased from 256
             num_layers = 12   # Reduced from 20
-            intermediate_size = 3072  # Increased proportionally
+            intermediate_size = 1024  # Increased proportionally
             kv_lora_rank = 64  # Increased from 32
         elif self.args.size == 'medium':  # Target: ~1B parameters
             hidden_size = 384
@@ -670,6 +682,94 @@ class LLMLightningModule(pl.LightningModule):
     
     # --- End Config Creation Methods ---
 
+    def _parse_bool_arg(self, arg_name, default=False):
+        """Parse boolean argument that might be passed as string."""
+        if not hasattr(self.args, arg_name):
+            return default
+        value = getattr(self.args, arg_name)
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() in ('true', '1', 'yes', 'on')
+        return bool(value)
+
+    def _create_hrm_config(self):
+        """Create configuration for HRM (Hierarchical Reasoning Model)."""
+        # Define sizes matching the paper's ~27M params for small
+        if self.args.size == 'small':
+            n_embd = 512
+            n_head = 8
+            n_inner = 2048
+            max_segments = 8
+            cycles_per_segment = 2
+            steps_per_cycle = 3
+        elif self.args.size == 'medium':
+            n_embd = 768
+            n_head = 12
+            n_inner = 3072
+            max_segments = 8
+            cycles_per_segment = 3
+            steps_per_cycle = 4
+        elif self.args.size == 'large':
+            n_embd = 1024
+            n_head = 16
+            n_inner = 4096
+            max_segments = 10
+            cycles_per_segment = 4
+            steps_per_cycle = 4
+        else:  # xl
+            n_embd = 1536
+            n_head = 24
+            n_inner = 6144
+            max_segments = 12
+            cycles_per_segment = 4
+            steps_per_cycle = 5
+
+        config = HRMConfig(
+            # Architecture
+            n_layer=1,  # HRM uses recurrence, not stacked layers
+            n_embd=n_embd,
+            n_head=n_head,
+            n_inner=n_inner,
+            vocab_size=self.args.vocab_size,
+            block_size=self.args.block_size,
+            
+            # HRM specific parameters
+            cycles_per_segment=getattr(self.args, 'hrm_cycles_per_segment', cycles_per_segment) if hasattr(self.args, 'hrm_cycles_per_segment') and self.args.hrm_cycles_per_segment is not None else cycles_per_segment,
+            steps_per_cycle=getattr(self.args, 'hrm_steps_per_cycle', steps_per_cycle) if hasattr(self.args, 'hrm_steps_per_cycle') and self.args.hrm_steps_per_cycle is not None else steps_per_cycle,
+            max_segments=getattr(self.args, 'hrm_max_segments', max_segments) if hasattr(self.args, 'hrm_max_segments') and self.args.hrm_max_segments is not None else max_segments,
+            min_segments=getattr(self.args, 'min_segments', 1),
+            gradient_steps=getattr(self.args, 'hrm_gradient_steps', -1) if hasattr(self.args, 'hrm_gradient_steps') and self.args.hrm_gradient_steps is not None else -1,
+            
+            # ACT parameters
+            use_act=self._parse_bool_arg('hrm_use_act', True),
+            act_epsilon=getattr(self.args, 'act_epsilon', 0.1),
+            ponder_loss_weight=getattr(self.args, 'ponder_loss_weight', 0.01),
+            halt_bias_init=getattr(self.args, 'halt_bias_init', -2.0),
+            
+            # Training parameters
+            dropout=self.args.dropout,
+            bias=self.args.bias,
+            use_gradient_checkpointing=False,  # HRM uses 1-step gradient instead
+            deq_one_step=getattr(self.args, 'hrm_deq_one_step', False),
+            use_deep_supervision=getattr(self.args, 'hrm_use_deep_supervision', False),
+            n_supervision_segments=getattr(self.args, 'hrm_n_supervision_segments', 4),
+            label_smoothing=getattr(self.args, 'label_smoothing', 0.0),
+            
+            # Learning rate and optimization
+            learning_rate=self.args.learning_rate,
+            weight_decay=self.args.weight_decay,
+            warmup_steps=self.args.warmup_iters,
+            grad_clip=getattr(self.args, 'grad_clip', 1.0),
+        )
+        return config
+
+    def _create_hrm_model(self, config):
+        """Create HRM model instance."""
+        return HRM(config)
+
     def forward(self, input_ids, targets=None, **kwargs):
         """
         Unified forward pass that harmonizes outputs from different models
@@ -681,13 +781,15 @@ class LLMLightningModule(pl.LightningModule):
         model_kwargs = {}
         if targets is not None:
             # Handle model-specific names for the target/label tensor.
-            if model_type in ['mla_llada', 'mdm']:
+            if model_type in ['mla_llada', 'mdm', 'hrm']:
                 model_kwargs['labels'] = targets
             else:
                 model_kwargs['targets'] = targets
 
         # Add any other keyword arguments passed to this forward method.
         model_kwargs.update(kwargs)
+
+        # Do not force BD3 here; training_step passes it explicitly for train only
 
         # Call the model. By passing `input_ids` as the first positional argument,
         # we support models that name it `idx` (like NSA) or `input_ids`.
@@ -698,10 +800,19 @@ class LLMLightningModule(pl.LightningModule):
         logits, loss, router_loss = None, None, None
 
         if isinstance(model_output, dict):
-            # Models that return dictionaries (e.g., MLA-LLaDA, MDM)
+            # Models that return dictionaries (e.g., MLA-LLaDA, MDM, HRM)
             logits = model_output.get('logits')
             loss = model_output.get('loss')
             router_loss = model_output.get('router_loss') # Will be None if not present
+            
+            # Handle HRM's special losses
+            if model_type == 'hrm':
+                # HRM returns ponder_loss separately, but it's already included in 'loss'
+                # We can log it separately if needed
+                ponder_loss = model_output.get('ponder_loss')
+                if ponder_loss is not None and hasattr(self, 'log'):
+                    self.log('train/ponder_loss', ponder_loss.item() if torch.is_tensor(ponder_loss) else ponder_loss, 
+                            on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
         
         elif isinstance(model_output, tuple):
             # Models that return tuples (e.g., DeepSeek, GPT, LLaDA)
@@ -736,7 +847,10 @@ class LLMLightningModule(pl.LightningModule):
                 targets_detached = targets.detach().clone()
                 
                 # Pass detached tensors to the forward method
-                outputs = self(input_ids_detached, targets=targets_detached)
+                forward_kwargs = {}
+                if self.args.model_type.lower() == 'llada' and getattr(self.args, 'use_bd3_training', False):
+                    forward_kwargs['use_bd3_training'] = True
+                outputs = self(input_ids_detached, targets=targets_detached, **forward_kwargs)
                 
                 loss = outputs['loss']
                 router_loss = outputs.get('router_loss') # Use .get for safety
@@ -807,6 +921,13 @@ class LLMLightningModule(pl.LightningModule):
         non_pad_tokens_mask = (targets != -100)
         batch_tokens = non_pad_tokens_mask.sum().item() # Total non-pad tokens in the batch
 
+        # Percentage of non-padding tokens in the batch
+        total_tokens_in_batch = targets.numel()
+        non_padding_token_count = batch_tokens
+        non_padding_token_percentage = (
+            (non_padding_token_count / total_tokens_in_batch) * 100.0 if total_tokens_in_batch > 0 else 0.0
+        )
+
         self.total_tokens += batch_tokens * self.trainer.world_size
         self.tokens_window.append((time.time(), batch_tokens * self.trainer.world_size))
         if len(self.tokens_window) > self.window_size:
@@ -820,6 +941,7 @@ class LLMLightningModule(pl.LightningModule):
             current_tokens_per_sec = 0
 
         self.log('tokens_per_sec_step', current_tokens_per_sec, on_step=True, on_epoch=False, prog_bar=True, sync_dist=False)
+        self.log('train/non_pad_pct', non_padding_token_percentage, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
         self.log('total_tokens', float(self.total_tokens), on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
 
         # Calculate average sequence length from the same mask
@@ -1124,7 +1246,7 @@ class LLMLightningModule(pl.LightningModule):
         try:
             self.csv_file = open(self.csv_file_path, 'w', newline='')
             self.csv_writer = csv.writer(self.csv_file)
-            self.csv_writer.writerow(['step', 'train_loss', 'val_loss', 'val_perplexity', 'learning_rate', 'tokens_per_sec', 'avg_seq_len', 'total_tokens', 'grad_norm', 'timestamp'])
+            self.csv_writer.writerow(['step', 'train_loss', 'val_loss', 'val_perplexity', 'learning_rate', 'tokens_per_sec', 'avg_seq_len', 'batch_size', 'block_size', 'total_tokens', 'grad_norm', 'timestamp'])
             self.csv_file.flush()
             print(f"CSV metrics logging initialized: {self.csv_file_path}")
         except IOError as e:
