@@ -41,6 +41,13 @@ class LLaDAConfig:
     use_checkpoint: bool = False  # Whether to use gradient checkpointing
     use_dyt: bool = False  # Whether to use Dynamic Tanh (DyT) instead of RMSNorm
     dyt_alpha_init: float = 0.5  # Initial value for DyT alpha parameter
+    
+    # BD3-specific parameters
+    bd3_block_length: Optional[int] = None  # Block length for BD3 training
+    bd3_beta: Optional[float] = None  # Minimum masking rate for clipped schedule
+    bd3_omega: Optional[float] = None  # Maximum masking rate for clipped schedule
+    disable_entropy_regularization: bool = False  # Disable entropy regularization
+    entropy_coef: float = 0.001  # Coefficient for entropy regularization
 
 @dataclass
 class ModelArgs:
@@ -149,4 +156,40 @@ class MDMConfig:
     
     # Advanced features (for later)
     use_mla: bool = False       # Whether to replace attention with MLA
-    use_fp8: bool = False       # Whether to use FP8 precision 
+    use_fp8: bool = False       # Whether to use FP8 precision
+
+@dataclass
+class SEDDConfig:
+    """Configuration class for SEDD (Score Entropy Discrete Diffusion) model hyperparameters."""
+    
+    # Model architecture
+    block_size: int = 1024      # Maximum sequence length
+    vocab_size: int = 50304     # Vocabulary size
+    n_layer: int = 12           # Number of transformer layers (n_blocks in original)
+    n_head: int = 12            # Number of attention heads
+    n_embd: int = 768           # Hidden dimension (hidden_size in original)
+    dropout: float = 0.1        # Dropout probability
+    bias: bool = False          # Whether to use bias in linear layers
+    
+    # SEDD-specific parameters
+    mask_token_id: int = 50303  # Special token ID for [MASK] (vocab_size - 1)
+    cond_dim: int = 128         # Conditioning dimension for timestep embeddings
+    scale_by_sigma: bool = True # Whether to scale output by sigma
+    mlp_ratio: int = 4          # MLP expansion ratio
+    
+    # Diffusion parameters
+    graph_type: Literal["uniform", "absorb"] = "absorb"  # Graph type for diffusion process
+    noise_type: Literal["geometric", "loglinear"] = "loglinear"  # Noise schedule type
+    sigma_min: float = 1e-4     # Minimum noise level
+    sigma_max: float = 20.0     # Maximum noise level
+    sampling_eps: float = 1e-3  # Sampling epsilon for numerical stability
+    
+    # Training parameters
+    label_smoothing: float = 0.0  # Label smoothing (not typically used with score entropy loss)
+    use_gradient_checkpointing: bool = False  # Memory optimization
+    attention_backend: Optional[str] = None   # Attention backend (auto-select)
+    
+    # Advanced features
+    use_fp8: bool = False       # Whether to use FP8 precision
+    use_dyt: bool = False       # Whether to use Dynamic Tanh (DyT) instead of LayerNorm
+    dyt_alpha_init: float = 0.5 # Initial value for DyT alpha parameter 

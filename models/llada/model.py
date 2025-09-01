@@ -55,7 +55,7 @@ class LLaDAModel(nn.Module):
         # --- BD3-LM Specific Config ---
         # Add block_length for BD3 processing, default could be config.block_size or smaller
         # Use a reasonable default if not provided in config
-        default_bd3_block = config.block_size // 4 if config.block_size >= 16 else 16
+        default_bd3_block = config.block_size // 4 if config.block_size >= 128 else 128
         self.bd3_block_length = getattr(config, 'bd3_block_length', default_bd3_block)
         
         # Token embeddings only - position encoding is handled by RoPE in attention
@@ -238,8 +238,9 @@ class LLaDAModel(nn.Module):
             # BD3 paper shows optimal ranges depend on block size
             # For block_length around 64-128, use U[0.3, 0.8]
             # This avoids extreme masking rates that lead to high variance
-            beta = 0.3  # minimum masking rate
-            omega = 0.8  # maximum masking rate
+            # Allow override from config for experimentation
+            beta = getattr(self.config, 'bd3_beta', 0.3)  # minimum masking rate
+            omega = getattr(self.config, 'bd3_omega', 0.8)  # maximum masking rate
             t = torch.rand(batch_size, device=input_ids.device)
             p_mask = beta + (omega - beta) * t  # Sample from U[beta, omega]
         else:
@@ -382,6 +383,8 @@ class LLaDAModel(nn.Module):
                 
                 # Apply BD3 weighting: α'(t)/(1-α(t)) where 1-α(t) = p_mask_rate
                 # For clipped linear schedule within [beta, omega]: α'(t) ≈ 1/(omega - beta)
+                beta = getattr(self.config, 'bd3_beta', 0.3)
+                omega = getattr(self.config, 'bd3_omega', 0.8)
                 alpha_prime = 1.0 / (omega - beta + 1e-8)
                 weight = alpha_prime / (p_mask_rates_flat + 1e-8)  # α'(t)/(1-α(t))
                 
@@ -419,9 +422,11 @@ class LLaDAModel(nn.Module):
                 # No need for 1/t factor since we're averaging over actual masked tokens
                 loss = masked_losses.sum() / (num_masked + 1e-8)
                 
-                # Add entropy regularization to prevent mode collapse
+                # Add entropy regularization to prevent mode collapse (optional)
                 # This encourages the model to produce diverse predictions
-                if self.training:  # Only apply during training
+                # Can be disabled for BD3 training where it may cause instability
+                disable_entropy = getattr(self.config, 'disable_entropy_regularization', False)
+                if self.training and not disable_entropy:  # Only apply during training if not disabled
                     # Calculate entropy on all positions but weight by mask (avoids dynamic shapes)
                     # Apply softmax to get probabilities for all positions
                     probs = F.softmax(logits_flat, dim=-1)
@@ -435,7 +440,7 @@ class LLaDAModel(nn.Module):
                     avg_entropy = masked_entropy.sum() / (num_masked + 1e-8)
                     # Subtract from loss (higher entropy = lower loss)
                     # Use a small coefficient to not overwhelm the main loss
-                    entropy_coef = 0.01
+                    entropy_coef = getattr(self.config, 'entropy_coef', 0.001)  # Reduced from 0.01
                     loss = loss - entropy_coef * avg_entropy
             # Else: No targets or no masking, loss remains None or 0.0 if initialized
             elif loss is None: # Ensure loss is tensor if targets provided but no masking
@@ -595,7 +600,7 @@ class LLaDAModel(nn.Module):
             # Return original prompt or partial generation? Returning prompt for safety.
             return prompt, e 
     # Placeholder for the diffusion sampler for a single block
-    def _sample_block_diffusion(self, model_fn, conditioning_kv=None, block_shape=None, device=None, steps=10, prev_tokens=None, repetition_penalty=1.2):
+    def _sample_block_diffusion(self, model_fn, conditioning_kv=None, block_shape=None, device=None, steps=10, prev_tokens=None, repetition_penalty=1.2, temperature=None, top_k=None):
         """
         Samples a single block using a discrete diffusion process.
         Implements a simplified iterative denoising approach for LLaDA.
@@ -634,7 +639,9 @@ class LLaDAModel(nn.Module):
             else:
                 logits = model_fn(current_tokens)
             
-            # Convert logits to probabilities
+            # Temperature scaling then convert to probabilities
+            if temperature is not None and temperature > 0:
+                logits = logits / max(temperature, 1e-6)
             probs = torch.softmax(logits, dim=-1)
             
             # Find currently masked positions
@@ -671,6 +678,15 @@ class LLaDAModel(nn.Module):
                 
                 # Sample tokens for these positions
                 selected_probs = probs[b][positions_to_unmask]
+                # Apply top-k filtering per position if requested
+                if top_k is not None and top_k > 0:
+                    k = min(top_k, selected_probs.size(-1))
+                    topk_vals, topk_idx = torch.topk(selected_probs, k, dim=-1)
+                    filtered = torch.zeros_like(selected_probs)
+                    filtered.scatter_(dim=-1, index=topk_idx, src=topk_vals)
+                    # Renormalize
+                    denom = filtered.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                    selected_probs = filtered / denom
                 
                 # Apply repetition penalty if previous tokens provided
                 if prev_tokens is not None and repetition_penalty != 1.0:
@@ -694,6 +710,8 @@ class LLaDAModel(nn.Module):
             else:
                 logits = model_fn(current_tokens)
             
+            if temperature is not None and temperature > 0:
+                logits = logits / max(temperature, 1e-6)
             probs = torch.softmax(logits, dim=-1)
             # Apply repetition penalty for final sampling
             if prev_tokens is not None and repetition_penalty != 1.0:
@@ -711,6 +729,13 @@ class LLaDAModel(nn.Module):
                         if masked_positions[b, pos]:
                             # Apply repetition penalty if needed
                             pos_probs = probs[b, pos]
+                            # Apply top-k at final pass if requested
+                            if top_k is not None and top_k > 0:
+                                k = min(top_k, pos_probs.size(-1))
+                                topk_vals, topk_idx = torch.topk(pos_probs, k, dim=-1)
+                                filtered = torch.zeros_like(pos_probs)
+                                filtered.scatter_(dim=-1, index=topk_idx, src=topk_vals)
+                                pos_probs = filtered / filtered.sum().clamp_min(1e-8)
                             if prev_tokens is not None and repetition_penalty != 1.0:
                                 prev_unique = torch.unique(prev_tokens[b])
                                 pos_probs[prev_unique] = pos_probs[prev_unique] / repetition_penalty
@@ -810,7 +835,9 @@ class LLaDAModel(nn.Module):
                 device=device,
                 steps=10, # Example diffusion steps per block
                 prev_tokens=prev_tokens,
-                repetition_penalty=1.2  # Apply repetition penalty
+                repetition_penalty=1.2,  # Apply repetition penalty
+                temperature=temperature,
+                top_k=top_k
             )
 
             # Place the sampled block into the full sequence

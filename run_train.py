@@ -40,7 +40,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train LLM models with PyTorch Lightning')
 
     # Model Parameters
-    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'gpt', 'mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'mdm', 'moe_mla', 'nsa', 'hrm'], default='gpt', help='Type of model to train')
+    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'sedd', 'gpt', 'mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'mdm', 'moe_mla', 'nsa', 'hrm'], default='gpt', help='Type of model to train')
     parser.add_argument('--size', type=str, choices=['small', 'medium', 'large', 'xl'], default='small', help='Size of the model')
     parser.add_argument('--use_lightning', action='store_true', default=True, help='Use PyTorch Lightning for training')
 
@@ -102,6 +102,10 @@ def parse_args():
 
     # BD3-LM Specific Args (passed to LightningModule)
     parser.add_argument('--use_bd3_training', action='store_true', help='Enable BD3-LM vectorized training path for LLaDA model')
+    parser.add_argument('--bd3_block_length', type=int, default=128, help='Block length for BD3 training')
+    parser.add_argument('--bd3_beta', type=float, default=0.3, help='Minimum masking rate for BD3 clipped schedule')
+    parser.add_argument('--bd3_omega', type=float, default=0.8, help='Maximum masking rate for BD3 clipped schedule')
+    parser.add_argument('--disable_entropy_regularization', action='store_true', help='Disable entropy regularization in LLaDA loss')
 
     # Tokenizer Parameters
     parser.add_argument('--tokenizer_name', type=str, default="meta-llama/Llama-3.2-1B-Instruct", help='Tokenizer name from Hugging Face Hub')

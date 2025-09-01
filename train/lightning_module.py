@@ -22,13 +22,14 @@ from models.models.nsa_model import NSAModel, NSAModelConfig
 from models.models.hrm_model import HRM, HRMConfig
 from models.mdm.model import MDMModel
 from models.config import MDMConfig
+from models.sedd.model import SEDDModel, SEDDConfig
 from train.train_utils import (
     get_lr, calculate_perplexity, ensure_model_dtype,
     AveragedTimingStats, generate_text, estimate_loss
 )
 from optimization.memory_optim import cleanup_memory, print_memory_stats, preallocate_cuda_memory
 from optimization.cuda_optim import setup_cuda_optimizations, print_gpu_stats
-from optimization.training_optim import enable_torch_compile
+from optimization.training_optim import enable_torch_compile, autoconfigure_environment, optimize_attention_operations
 from optimization.fp8_deepseek_trainer import FP8AdamW, FP8MixedPrecisionTrainer
 from models.galore2_fixed import GaLore2AdamW
 
@@ -40,6 +41,11 @@ class LLMLightningModule(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(args) # Saves args to self.hparams
         self.args = args # Keep args accessible directly too
+        # Early environment configuration for optimal kernels and allocator
+        try:
+            autoconfigure_environment()
+        except Exception:
+            pass
         self.model = self._build_model()
         self.timing_stats = AveragedTimingStats(print_interval=1000)
         self.train_start_time = time.time()
@@ -60,6 +66,12 @@ class LLMLightningModule(pl.LightningModule):
         # Apply CUDA optimizations if available and requested
         if torch.cuda.is_available():
             setup_cuda_optimizations()
+            # Enable optimized attention kernels (PyTorch SDPA/Flash SDP) when requested
+            if getattr(self.args, 'optimize_attention', True):
+                try:
+                    optimize_attention_operations()
+                except Exception:
+                    pass
             if hasattr(self.args, 'preallocate_memory') and self.args.preallocate_memory:
                 preallocate_cuda_memory()
             if self.global_rank == 0:
@@ -129,6 +141,9 @@ class LLMLightningModule(pl.LightningModule):
         elif model_type == 'llada':
             config = self._create_llada_config()
             model = LLaDAModel(config)
+        elif model_type == 'sedd':
+            config = self._create_sedd_config()
+            model = SEDDModel(config)
         elif model_type == 'mla':
             config = self._create_mla_config()
             model = self._create_mla_model(config)
@@ -197,23 +212,110 @@ class LLMLightningModule(pl.LightningModule):
 
     def _create_llada_config(self):
         from models.llada.model import LLaDAConfig
+        
+        # Common BD3 parameters
+        bd3_params = {}
+        if hasattr(self.args, 'bd3_block_length'):
+            bd3_params['bd3_block_length'] = self.args.bd3_block_length
+        if hasattr(self.args, 'bd3_beta'):
+            bd3_params['bd3_beta'] = self.args.bd3_beta
+        if hasattr(self.args, 'bd3_omega'):
+            bd3_params['bd3_omega'] = self.args.bd3_omega
+        if hasattr(self.args, 'disable_entropy_regularization'):
+            bd3_params['disable_entropy_regularization'] = self.args.disable_entropy_regularization
+        
         if self.args.size == 'small':
             config = LLaDAConfig(
                 block_size=self.args.block_size, vocab_size=self.args.vocab_size,
                 n_layer=8, n_head=8, n_embd=768, dropout=self.args.dropout,
-                bias=self.args.bias, ratio_kv=8, use_checkpoint=False
+                bias=self.args.bias, ratio_kv=8, use_checkpoint=False,
+                **bd3_params
             )
         elif self.args.size == 'medium':
             config = LLaDAConfig(
                 block_size=self.args.block_size, vocab_size=self.args.vocab_size,
                 n_layer=16, n_head=16, n_embd=1024, dropout=self.args.dropout,
-                bias=self.args.bias, ratio_kv=8, use_checkpoint=False
+                bias=self.args.bias, ratio_kv=8, use_checkpoint=False,
+                **bd3_params
             )
         else: # large
             config = LLaDAConfig(
                 block_size=self.args.block_size, vocab_size=self.args.vocab_size,
                 n_layer=24, n_head=16, n_embd=1536, dropout=self.args.dropout,
-                bias=self.args.bias, ratio_kv=8, use_checkpoint=False
+                bias=self.args.bias, ratio_kv=8, use_checkpoint=False,
+                **bd3_params
+            )
+        return config
+
+    def _create_sedd_config(self):
+        if self.args.size == 'small':
+            config = SEDDConfig(
+                block_size=self.args.block_size,
+                vocab_size=self.args.vocab_size,
+                n_layer=12,
+                n_head=12,
+                n_embd=768,
+                dropout=self.args.dropout,
+                bias=self.args.bias,
+                mask_token_id=self.args.vocab_size - 1,
+                cond_dim=128,
+                scale_by_sigma=True,
+                mlp_ratio=4,
+                graph_type=getattr(self.args, 'graph_type', 'absorb'),
+                noise_type=getattr(self.args, 'noise_type', 'loglinear'),
+                sigma_min=getattr(self.args, 'sigma_min', 1e-4),
+                sigma_max=getattr(self.args, 'sigma_max', 20.0),
+                use_gradient_checkpointing=False,
+                attention_backend=getattr(self.args, 'attention_backend', None),
+                use_fp8=getattr(self.args, 'use_fp8', False),
+                use_dyt=getattr(self.args, 'use_dyt', False),
+                dyt_alpha_init=getattr(self.args, 'dyt_alpha_init', 0.5),
+            )
+        elif self.args.size == 'medium':
+            config = SEDDConfig(
+                block_size=self.args.block_size,
+                vocab_size=self.args.vocab_size,
+                n_layer=16,
+                n_head=16,
+                n_embd=1024,
+                dropout=self.args.dropout,
+                bias=self.args.bias,
+                mask_token_id=self.args.vocab_size - 1,
+                cond_dim=128,
+                scale_by_sigma=True,
+                mlp_ratio=4,
+                graph_type=getattr(self.args, 'graph_type', 'absorb'),
+                noise_type=getattr(self.args, 'noise_type', 'loglinear'),
+                sigma_min=getattr(self.args, 'sigma_min', 1e-4),
+                sigma_max=getattr(self.args, 'sigma_max', 20.0),
+                use_gradient_checkpointing=False,
+                attention_backend=getattr(self.args, 'attention_backend', None),
+                use_fp8=getattr(self.args, 'use_fp8', False),
+                use_dyt=getattr(self.args, 'use_dyt', False),
+                dyt_alpha_init=getattr(self.args, 'dyt_alpha_init', 0.5),
+            )
+        else:  # large
+            config = SEDDConfig(
+                block_size=self.args.block_size,
+                vocab_size=self.args.vocab_size,
+                n_layer=24,
+                n_head=16,
+                n_embd=1536,
+                dropout=self.args.dropout,
+                bias=self.args.bias,
+                mask_token_id=self.args.vocab_size - 1,
+                cond_dim=128,
+                scale_by_sigma=True,
+                mlp_ratio=4,
+                graph_type=getattr(self.args, 'graph_type', 'absorb'),
+                noise_type=getattr(self.args, 'noise_type', 'loglinear'),
+                sigma_min=getattr(self.args, 'sigma_min', 1e-4),
+                sigma_max=getattr(self.args, 'sigma_max', 20.0),
+                use_gradient_checkpointing=False,
+                attention_backend=getattr(self.args, 'attention_backend', None),
+                use_fp8=getattr(self.args, 'use_fp8', False),
+                use_dyt=getattr(self.args, 'use_dyt', False),
+                dyt_alpha_init=getattr(self.args, 'dyt_alpha_init', 0.5),
             )
         return config
 
@@ -781,7 +883,7 @@ class LLMLightningModule(pl.LightningModule):
         model_kwargs = {}
         if targets is not None:
             # Handle model-specific names for the target/label tensor.
-            if model_type in ['mla_llada', 'mdm', 'hrm']:
+            if model_type in ['mla_llada', 'mdm', 'hrm', 'sedd']:
                 model_kwargs['labels'] = targets
             else:
                 model_kwargs['targets'] = targets
@@ -842,18 +944,30 @@ class LLMLightningModule(pl.LightningModule):
         # --- Simplified Forward Pass ---
         try:
             with self.timing_stats.track("forward"):
-                # Detach inputs and run the unified forward pass
-                input_ids_detached = input_ids.detach().clone()
-                targets_detached = targets.detach().clone()
-                
-                # Pass detached tensors to the forward method
+                # Run the unified forward pass under autocast
+                input_ids_detached = input_ids
+                targets_detached = targets
+
                 forward_kwargs = {}
                 if self.args.model_type.lower() == 'llada' and getattr(self.args, 'use_bd3_training', False):
                     forward_kwargs['use_bd3_training'] = True
-                outputs = self(input_ids_detached, targets=targets_detached, **forward_kwargs)
+                use_amp = (self.device.type == 'cuda')
+                with torch.amp.autocast(enabled=use_amp, device_type='cuda'):
+                    outputs = self(input_ids_detached, targets=targets_detached, **forward_kwargs)
                 
                 loss = outputs['loss']
                 router_loss = outputs.get('router_loss') # Use .get for safety
+                # Log auxiliary CE loss if provided by model
+                aux_ce = outputs.get('aux_ce_loss')
+                if aux_ce is not None and torch.is_tensor(aux_ce):
+                    self.log('train/aux_ce_loss', aux_ce.item(), on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+                # Log components if provided
+                if 'score_entropy_loss' in outputs and outputs['score_entropy_loss'] is not None:
+                    se = outputs['score_entropy_loss']
+                    self.log('train/se_loss', se.item() if torch.is_tensor(se) else se, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+                if 'masked_ce_loss' in outputs and outputs['masked_ce_loss'] is not None:
+                    mce = outputs['masked_ce_loss']
+                    self.log('train/masked_ce_loss', mce.item() if torch.is_tensor(mce) else mce, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 
             # If loss is not calculated by the model, compute it now
             if loss is None:
@@ -961,11 +1075,12 @@ class LLMLightningModule(pl.LightningModule):
                 diversity_stats = self.model.analyze_stream_diversity()
                 self.log_dict({f'parscale/{k}': v for k,v in diversity_stats.items()}, on_step=True, on_epoch=False, sync_dist=True)
 
-        # Clear caches
-        if hasattr(self.model, 'clear_cache'):
-            self.model.clear_cache()
-        elif hasattr(self.model, 'cache_manager'):
-            self.model.cache_manager.clear()
+        # Clear caches less frequently to retain useful caches
+        if self.global_step % 50 == 0:
+            if hasattr(self.model, 'clear_cache'):
+                self.model.clear_cache()
+            elif hasattr(self.model, 'cache_manager'):
+                self.model.cache_manager.clear()
         
         return combined_loss
 
@@ -975,9 +1090,20 @@ class LLMLightningModule(pl.LightningModule):
 
         with torch.no_grad():
             self.model.eval()
-            outputs = self(input_ids, targets=targets)
+            use_amp = (self.device.type == 'cuda')
+            with torch.amp.autocast(enabled=use_amp, device_type='cuda'):
+                outputs = self(input_ids, targets=targets)
             loss = outputs['loss']
             router_loss = outputs.get('router_loss')
+            aux_ce = outputs.get('aux_ce_loss')
+            if aux_ce is not None and torch.is_tensor(aux_ce):
+                self.log('val/aux_ce_loss', aux_ce.item(), on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+            if 'score_entropy_loss' in outputs and outputs['score_entropy_loss'] is not None:
+                se = outputs['score_entropy_loss']
+                self.log('val/se_loss', se.item() if torch.is_tensor(se) else se, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+            if 'masked_ce_loss' in outputs and outputs['masked_ce_loss'] is not None:
+                mce = outputs['masked_ce_loss']
+                self.log('val/masked_ce_loss', mce.item() if torch.is_tensor(mce) else mce, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
 
             if loss is None:
                 logits = outputs['logits']
@@ -1075,12 +1201,21 @@ class LLMLightningModule(pl.LightningModule):
         else:
             # Fallback to default AdamW for models without configure_optimizers
             print(f"Using default AdamW optimizer")
-            optimizer = AdamW(
-                self.model.parameters(),
-                lr=self.args.learning_rate,
-                weight_decay=self.args.weight_decay,
-                betas=(self.args.beta1, self.args.beta2)
-            )
+            try:
+                optimizer = AdamW(
+                    self.model.parameters(),
+                    lr=self.args.learning_rate,
+                    weight_decay=self.args.weight_decay,
+                    betas=(self.args.beta1, self.args.beta2),
+                    fused=False
+                )
+            except TypeError:
+                optimizer = AdamW(
+                    self.model.parameters(),
+                    lr=self.args.learning_rate,
+                    weight_decay=self.args.weight_decay,
+                    betas=(self.args.beta1, self.args.beta2)
+                )
 
         # Learning rate scheduler
         if self.args.decay_lr:
@@ -1138,16 +1273,17 @@ class LLMLightningModule(pl.LightningModule):
             # Ensure model is in eval mode for generation
             self.model.eval()
 
-            with torch.no_grad(): # No need for gradients during generation
-                 # Use the generic generate_text utility function
-                 output_text = generate_text(
-                     self.model, # Pass the LightningModule's model
-                     input_tokens,
-                     max_new_tokens=min(100, self.args.block_size - input_tokens.shape[1]),
-                     temperature=0.7,
-                     top_k=40,
-                     tokenizer=tokenizer
-                 )
+            with torch.no_grad():
+                 use_amp = (self.device.type == 'cuda')
+                 with torch.amp.autocast(enabled=use_amp, device_type='cuda'):
+                     output_text = generate_text(
+                         self.model,
+                         input_tokens,
+                         max_new_tokens=min(100, self.args.block_size - input_tokens.shape[1]),
+                         temperature=0.7,
+                         top_k=40,
+                         tokenizer=tokenizer
+                     )
 
             # Switch back to train mode
             self.model.train()

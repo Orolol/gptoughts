@@ -494,9 +494,18 @@ def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8, top_
     output_tokens = None # Initialize
     try:
         with torch.no_grad(): # No need for gradients during generation
-            # Prefer explicit LLaDA handling first to avoid mis-calling with input_ids
+            # Check for SEDD model first
             model_instance = model.module if hasattr(model, 'module') else model
-            if LLaDAModel is not None and isinstance(model_instance, LLaDAModel):
+            if hasattr(model_instance, '__class__') and 'SEDD' in model_instance.__class__.__name__:
+                # SEDD model generation
+                output_tokens = model.generate(
+                    input_ids=encoder_input,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_k=top_k
+                )
+            # Prefer explicit LLaDA handling first to avoid mis-calling with input_ids
+            elif LLaDAModel is not None and isinstance(model_instance, LLaDAModel):
                 # Use BD3 block-by-block generation (new LLaDA API)
                 # Returns (tokens, None)
                 output_tokens, _ = model.generate(
@@ -1047,8 +1056,18 @@ def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8, top_
             output_tokens = None
             output_text_from_generate = None # Store text if generate provides it directly
 
+            # Check for SEDD model first
+            model_instance = model.module if hasattr(model, 'module') else model
+            if hasattr(model_instance, '__class__') and 'SEDD' in model_instance.__class__.__name__:
+                # SEDD model generation
+                output_tokens = model.generate(
+                    input_ids=encoder_input,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_k=top_k
+                )
             # Check if it's the LLaDA model and use its generate method
-            if LLaDAModel is not None and isinstance(model.module if hasattr(model, 'module') else model, LLaDAModel):
+            elif LLaDAModel is not None and isinstance(model_instance, LLaDAModel):
                 # Use the new BD3-based generation method
                 # The new generate method returns (tokens, None)
                 output_tokens, _ = model.generate(

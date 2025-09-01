@@ -112,7 +112,6 @@ class BlockwiseSelection(nn.Module):
     def compute_importance_scores(
         self, 
         q: torch.Tensor, 
-        k_compressed: torch.Tensor,
         attn_scores_compressed: torch.Tensor
     ) -> torch.Tensor:
         """
@@ -120,8 +119,7 @@ class BlockwiseSelection(nn.Module):
         
         Args:
             q: Query tensor [B, H, T, head_dim]
-            k_compressed: Compressed key tensor [B, H, num_blocks, head_dim]
-            attn_scores_compressed: Attention scores from compression [B, H, T, num_blocks]
+            attn_scores_compressed: Attention weights from compression [B, H, T, num_blocks]
             
         Returns:
             Importance scores [B, n_groups, num_blocks]
@@ -259,7 +257,7 @@ class NSAAttention(nn.Module):
             
         Returns:
             Attention output [B, T, n_heads * value_dim]
-            Attention scores for importance computation [B, n_heads, T, num_blocks]
+            Attention weights (no dropout) for importance computation [B, n_heads, T, num_blocks]
         """
         B, T, D = x.shape
         
@@ -307,15 +305,15 @@ class NSAAttention(nn.Module):
                 scores = scores.masked_fill(compressed_mask == 0, float('-inf'))
         
         # Softmax
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
+        attn_weights_no_dropout = F.softmax(scores, dim=-1)
+        attn_weights_for_output = self.dropout(attn_weights_no_dropout)
         
         # Apply attention
-        output = torch.matmul(attn_weights, v_compressed)  # [B, n_heads, T, value_dim]
+        output = torch.matmul(attn_weights_for_output, v_compressed)  # [B, n_heads, T, value_dim]
         output = output.transpose(1, 2).contiguous()
         output = output.view(B, T, self.n_heads * self.value_dim)
         
-        return output, scores
+        return output, attn_weights_no_dropout
     
     def selected_attention(
         self,
@@ -357,54 +355,41 @@ class NSAAttention(nn.Module):
         k = torch.cat((k_rope, k[..., self.config.qk_rope_head_dim:]), dim=-1)
 
         # Compute importance and select top blocks for each group
-        k_compressed_dummy = k.mean(dim=2, keepdim=True)
-        importance = self.block_selection.compute_importance_scores(q, k_compressed_dummy, attn_scores_compressed)
+        importance = self.block_selection.compute_importance_scores(q, attn_scores_compressed)
         selected_block_indices = self.block_selection.select_top_blocks(importance, n_selected) # [B, G, n_selected]
 
-        # Process group by group to ensure correctness
-        output_groups = []
-        for g in range(G):
-            # Q for this group: [B, H/G, T, head_dim]
-            q_group = q.view(B, G, heads_per_group, T, self.head_dim)[:, g, ...]
-            
-            # Get K and V for this group's selected blocks
-            group_block_indices = selected_block_indices[:, g, :] # [B, n_selected]
-            
-            # Convert block indices to token indices
-            start_indices = (group_block_indices * self.config.compress_stride) # [B, n_selected]
-            block_offsets = torch.arange(l_prime, device=x.device) # [l_prime]
-            token_indices = start_indices.unsqueeze(-1) + block_offsets # [B, n_selected, l_prime]
-            token_indices = torch.clamp(token_indices.view(B, -1), 0, T - 1) # [B, n_selected * l_prime]
-            
-            # Gather K and V for the group
-            k_group = k.view(B, G, heads_per_group, T, self.head_dim)[:, g, ...] # [B, H/G, T, head_dim]
-            v_group = v.view(B, G, heads_per_group, T, self.value_dim)[:, g, ...] # [B, H/G, T, value_dim]
-            
-            # Expand indices for gathering: [B, 1, n_sel*l', 1] -> [B, H/G, n_sel*l', dim]
-            token_indices_expanded_k = token_indices.view(B, 1, -1, 1).expand(-1, heads_per_group, -1, self.head_dim)
-            k_gathered = torch.gather(k_group, 2, token_indices_expanded_k) # [B, H/G, n_sel*l', head_dim]
+        # Vectorized computation over groups
+        q_group = q.view(B, G, heads_per_group, T, self.head_dim)  # [B, G, H/G, T, Hd]
+        k_group = k.view(B, G, heads_per_group, T, self.head_dim)  # [B, G, H/G, T, Hd]
+        v_group = v.view(B, G, heads_per_group, T, self.value_dim) # [B, G, H/G, T, Vd]
 
-            token_indices_expanded_v = token_indices.view(B, 1, -1, 1).expand(-1, heads_per_group, -1, self.value_dim)
-            v_gathered = torch.gather(v_group, 2, token_indices_expanded_v) # [B, H/G, n_sel*l', value_dim]
+        # Convert selected block indices to token indices per group
+        start_indices = selected_block_indices * self.config.compress_stride           # [B, G, n_selected]
+        block_offsets = torch.arange(l_prime, device=x.device)                         # [l']
+        token_indices = start_indices.unsqueeze(-1) + block_offsets                    # [B, G, n_selected, l']
+        token_indices = torch.clamp(token_indices.view(B, G, -1), 0, T - 1)           # [B, G, n_sel*l']
 
-            # Attention scores: [B, H/G, T, n_sel*l']
-            scores = torch.matmul(q_group, k_gathered.transpose(-2, -1)) / self.scale
+        # Gather K and V for all groups at once along sequence dim
+        token_idx_exp_k = token_indices.view(B, G, 1, -1, 1).expand(-1, -1, heads_per_group, -1, self.head_dim)
+        k_gathered = torch.gather(k_group, 3, token_idx_exp_k)                         # [B, G, H/G, n_sel*l', Hd]
 
-            # --- Causal Masking ---
-            # Query at `t` can only see keys at or before `t`.
-            q_indices = torch.arange(T, device=x.device).view(1, 1, T, 1)
-            k_indices_gathered = token_indices.view(B, 1, 1, -1)
-            causal_mask = q_indices >= k_indices_gathered # Broadcasts to [B, 1, T, n_sel*l']
-            scores = scores.masked_fill(~causal_mask, torch.finfo(scores.dtype).min)
+        token_idx_exp_v = token_indices.view(B, G, 1, -1, 1).expand(-1, -1, heads_per_group, -1, self.value_dim)
+        v_gathered = torch.gather(v_group, 3, token_idx_exp_v)                         # [B, G, H/G, n_sel*l', Vd]
 
-            # Softmax and attention
-            attn_weights = F.softmax(scores, dim=-1)
-            attn_weights = self.dropout(attn_weights)
-            output_group = torch.matmul(attn_weights, v_gathered) # [B, H/G, T, value_dim]
-            output_groups.append(output_group)
+        # Attention scores and causal mask
+        scores = torch.matmul(q_group, k_gathered.transpose(-2, -1)) / self.scale      # [B, G, H/G, T, n_sel*l']
+        q_indices = torch.arange(T, device=x.device).view(1, 1, 1, T, 1)
+        k_indices_gathered = token_indices.view(B, G, 1, 1, -1)
+        causal_mask = q_indices >= k_indices_gathered                                   # [B, G, 1, T, n_sel*l']
+        scores = scores.masked_fill(~causal_mask, torch.finfo(scores.dtype).min)
 
-        # Concatenate group outputs and project
-        output = torch.cat(output_groups, dim=1) # [B, H, T, value_dim]
+        # Softmax and attention output
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        output = torch.matmul(attn_weights, v_gathered)                                 # [B, G, H/G, T, Vd]
+
+        # Merge groups and heads, then reshape to [B, T, H*Vd]
+        output = output.reshape(B, G * heads_per_group, T, self.value_dim)             # [B, H, T, Vd]
         output = output.transpose(1, 2).contiguous().view(B, T, H * self.value_dim)
         return output
     
@@ -448,27 +433,25 @@ class NSAAttention(nn.Module):
         # Create sliding window mask (vectorized)
         q_indices = torch.arange(T, device=x.device)[:, None]
         k_indices = torch.arange(T, device=x.device)[None, :]
-        
         window_mask = (k_indices <= q_indices) & (k_indices > q_indices - window_size)
-        
-        # Compute attention scores
-        scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale
-        
-        # Apply window mask
-        scores = scores.masked_fill(~window_mask.unsqueeze(0).unsqueeze(0), torch.finfo(scores.dtype).min)
-        
-        # Try to use Flash Attention if available and appropriate
+
+        # Try to use Flash Attention (SDPA) with a proper boolean mask first
         if hasattr(F, 'scaled_dot_product_attention') and mask is None and T <= 2048:
-            # Use Flash Attention for efficiency
+            attn_mask_bool = ~window_mask.unsqueeze(0).unsqueeze(0)  # True where masked
+            attn_mask_bool = attn_mask_bool.to(torch.bool)
             output = F.scaled_dot_product_attention(
-                q, k, v, 
-                attn_mask=window_mask.unsqueeze(0).unsqueeze(0).to(q.dtype),
+                q, k, v,
+                attn_mask=attn_mask_bool,
                 dropout_p=self.config.dropout if self.training else 0.0,
-                is_causal=False  # We handle causality with window_mask
+                is_causal=False
             )
             output = output.transpose(1, 2).contiguous()
             output = output.view(B, T, self.n_heads * self.value_dim)
             return output
+
+        # Fallback to explicit scores path
+        scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+        scores = scores.masked_fill(~window_mask.unsqueeze(0).unsqueeze(0), torch.finfo(scores.dtype).min)
         
         # Apply additional mask if provided
         if mask is not None:
