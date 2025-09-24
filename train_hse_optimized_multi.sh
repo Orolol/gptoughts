@@ -3,7 +3,6 @@
 # Optimized training launcher for the HSE model on 2x H100 GPUs.
 # Defaults assume two Hopper 80GB devices and PyTorch Lightning backend.
 
-set -euo pipefail
 
 MODEL_SIZE=${1:-small}                # Model config preset defined in lightning module
 BATCH_SIZE_PER_GPU=${2:-8}             # Per-device batch size
