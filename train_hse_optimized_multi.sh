@@ -16,6 +16,7 @@ GRAD_ACCUM=${GRAD_ACCUM:-2}
 PRECISION=${PRECISION:-bf16-mixed}
 USE_FP8=${USE_FP8:-0}
 NUM_WORKERS=${NUM_WORKERS:-4}
+DDP_STRATEGY=${DDP_STRATEGY:-ddp_find_unused_parameters_true}
 
 # Environment tailored for Hopper class GPUs
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
@@ -25,6 +26,8 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
 export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-0}
 export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}
+export TORCH_NCCL_BLOCKING_WAIT=${TORCH_NCCL_BLOCKING_WAIT:-1}
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 export PYTHONUNBUFFERED=1
 
@@ -34,6 +37,7 @@ printf 'Block size ............... %s\n' "$BLOCK_SIZE"
 printf 'Per-GPU batch size ....... %s\n' "$BATCH_SIZE_PER_GPU"
 printf 'Gradient accumulation .... %s\n' "$GRAD_ACCUM"
 printf 'Requested devices ........ %s\n' "$DEVICES"
+printf 'DDP strategy ............. %s\n' "$DDP_STRATEGY"
 printf 'Precision mode ........... %s\n' "$PRECISION"
 printf 'Output directory ......... %s\n' "$OUTPUT_DIR"
 printf 'Resume from checkpoint ... %s\n' "$RESUME"
@@ -79,7 +83,7 @@ CMD=(python run_train.py
     --output_dir "$OUTPUT_DIR"
     --precision "$PRECISION"
     --devices "$DEVICES"
-    --strategy ddp
+    --strategy "$DDP_STRATEGY"
     --num_workers "$NUM_WORKERS"
     --gradient_accumulation_steps "$GRAD_ACCUM"
     --learning_rate 5e-5
