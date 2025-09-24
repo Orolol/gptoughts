@@ -9,15 +9,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from flash_attn import flash_attn_func_2
+    from flash_attn import flash_attn_func as flash_attn_func_2
     FLASH_ATTENTION_AVAILABLE = True
-except ImportError:
+except ImportError as e:
+    print(f"Flash Attention 2 not available: {e}")
     FLASH_ATTENTION_AVAILABLE = False
 
 try:
     import xformers.ops as xops
     XFORMERS_AVAILABLE = True
-except ImportError:
+except ImportError as e:
+    print(f"Xformers not available: {e}")
     XFORMERS_AVAILABLE = False
 
 ATTENTION_BACKENDS = {
@@ -253,9 +255,8 @@ class CausalSelfAttention(nn.Module):
         x = x.to(working_dtype)
         
         try:
-            # Vérification et correction des NaN/Inf
-            if torch.isnan(x).any() or torch.isinf(x).any():
-                x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
+            # Correction des NaN/Inf (sans branchement dépendant des données pour torch.compile)
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
             
             # Cross-attention
             if key_value is not None:
@@ -341,9 +342,8 @@ class CausalSelfAttention(nn.Module):
                 
                 y = torch.matmul(att, v)
             
-            # Vérification finale des NaN/Inf
-            if torch.isnan(y).any() or torch.isinf(y).any():
-                y = torch.nan_to_num(y, nan=0.0, posinf=1e4, neginf=-1e4)
+            # Correction finale des NaN/Inf (compile-safe)
+            y = torch.nan_to_num(y, nan=0.0, posinf=1e4, neginf=-1e4)
             
             # Reshape et projection finale
             y = y.transpose(1, 2).contiguous().view(B, T, C)

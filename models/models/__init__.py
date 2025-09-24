@@ -9,6 +9,7 @@ from .mla_selective_model import MLASelectiveModel, MLASelectiveModelConfig, cre
 from .mla_llada import MLALLaDAModel, MLALLaDAConfig, create_mla_llada_model
 from .nsa_model import NSAModel, NSAModelConfig, create_nsa_model
 from ..mdm.model import MDMModel
+from .hse_model import HSEModel, HSEConfig, create_hse_model
 
 __all__ = [
     'GPT',
@@ -31,4 +32,7 @@ __all__ = [
     'NSAModelConfig',
     'create_nsa_model',
     'MDMModel',
+    'HSEModel',
+    'HSEConfig',
+    'create_hse_model',
 ]

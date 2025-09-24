@@ -9,6 +9,7 @@ import traceback
 import random
 import csv
 from datetime import datetime
+import wandb
 
 # Import necessary components from your project
 from models.deepseek.deepseek_adapter_mtp import DeepSeekMiniMTP, DeepSeekMiniConfigMTP
@@ -19,6 +20,7 @@ from models.models.parscale_mla import ParScaleMLA, ParScaleMLAConfig, create_pa
 from models.models.mla_selective_model import MLASelectiveModel, MLASelectiveModelConfig
 from models.models.moe_mla_model import MOEMLA, MOEMLAConfig
 from models.models.nsa_model import NSAModel, NSAModelConfig
+from models.models.hse_model import HSEModel, HSEConfig
 from models.models.hrm_model import HRM, HRMConfig
 from models.mdm.model import MDMModel
 from models.config import MDMConfig
@@ -41,12 +43,34 @@ class LLMLightningModule(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(args) # Saves args to self.hparams
         self.args = args # Keep args accessible directly too
+        
+        # Block size adaptation parameters
+        self.load_checkpoint_path = getattr(args, 'load_checkpoint_path', None)
+        self.original_block_size = getattr(args, 'original_block_size', None)
+        
+        # Progressive training parameters
+        self.progressive_training = getattr(args, 'progressive_training', False)
+        self.progressive_block_sizes = getattr(args, 'progressive_block_sizes', [512, 1024, 2048, 4096])
+        self.progressive_epochs_per_stage = getattr(args, 'progressive_epochs_per_stage', 5)
+        self.progressive_current_stage = 0
+        self.progressive_lr_scale = getattr(args, 'progressive_lr_scale', 0.5)  # LR reduction at transitions
+        
+        # Initialize wandb if enabled
+        self.use_wandb = getattr(args, 'use_wandb', True)
+        if self.use_wandb and self.global_rank == 0:
+            self._init_wandb()
+        
         # Early environment configuration for optimal kernels and allocator
         try:
             autoconfigure_environment()
         except Exception:
             pass
         self.model = self._build_model()
+        
+        # Handle checkpoint loading with block size adaptation if needed
+        if self.load_checkpoint_path and self.original_block_size:
+            self._load_and_adapt_checkpoint()
+            
         self.timing_stats = AveragedTimingStats(print_interval=1000)
         self.train_start_time = time.time()
         self.total_tokens = 0
@@ -67,11 +91,11 @@ class LLMLightningModule(pl.LightningModule):
         if torch.cuda.is_available():
             setup_cuda_optimizations()
             # Enable optimized attention kernels (PyTorch SDPA/Flash SDP) when requested
-            if getattr(self.args, 'optimize_attention', True):
-                try:
-                    optimize_attention_operations()
-                except Exception:
-                    pass
+            # if getattr(self.args, 'optimize_attention', True):
+            #     try:
+            #         optimize_attention_operations()
+            #     except Exception:
+            #         pass
             if hasattr(self.args, 'preallocate_memory') and self.args.preallocate_memory:
                 preallocate_cuda_memory()
             if self.global_rank == 0:
@@ -128,6 +152,59 @@ class LLMLightningModule(pl.LightningModule):
         
         # Initialize CSV logging
         self._init_csv_logging()
+        
+        # Watch model with wandb if enabled
+        if self.use_wandb and self.global_rank == 0:
+            try:
+                wandb.watch(self.model, log="all", log_freq=100)
+            except Exception as e:
+                print(f"Warning: Failed to watch model with wandb: {e}")
+
+    def _init_wandb(self):
+        """Initialize wandb logging with project configuration."""
+        try:
+            # Create wandb config from args
+            wandb_config = {
+                'model_type': self.args.model_type,
+                'size': self.args.size,
+                'batch_size': self.args.batch_size,
+                'block_size': self.args.block_size,
+                'learning_rate': self.args.learning_rate,
+                'dropout': getattr(self.args, 'dropout', 0.1),
+                'vocab_size': self.args.vocab_size,
+                'weight_decay': getattr(self.args, 'weight_decay', 0.01),
+                'warmup_iters': getattr(self.args, 'warmup_iters', 2000),
+                'lr_decay_iters': getattr(self.args, 'lr_decay_iters', 600000),
+                'min_lr': getattr(self.args, 'min_lr', 6e-5),
+                'beta1': getattr(self.args, 'beta1', 0.9),
+                'beta2': getattr(self.args, 'beta2', 0.95),
+                'grad_clip': getattr(self.args, 'grad_clip', 1.0),
+                'compile': getattr(self.args, 'compile', False),
+                'use_fp8': getattr(self.args, 'use_fp8', False),
+                'optimizer_type': getattr(self.args, 'optimizer_type', 'adamw'),
+                'dataset': getattr(self.args, 'dataset', 'apollo-mini'),
+            }
+            
+            # Add model-specific configs
+            if hasattr(self.args, 'num_experts'):
+                wandb_config['num_experts'] = self.args.num_experts
+            if hasattr(self.args, 'experts_per_token'):
+                wandb_config['experts_per_token'] = self.args.experts_per_token
+            if hasattr(self.args, 'shared_weight_ratio'):
+                wandb_config['shared_weight_ratio'] = self.args.shared_weight_ratio
+                
+            # Initialize wandb
+            wandb.init(
+                project=getattr(self.args, 'wandb_project', 'gptoughts-training'),
+                name=getattr(self.args, 'wandb_run_name', f"{self.args.model_type}_{self.args.size}"),
+                config=wandb_config,
+                tags=[self.args.model_type, self.args.size],
+                resume=getattr(self.args, 'wandb_resume', None)
+            )
+            print("Wandb initialized successfully")
+        except Exception as e:
+            print(f"Warning: Failed to initialize wandb: {e}")
+            self.use_wandb = False
 
     def _build_model(self):
         """Initializes the model based on configuration."""
@@ -162,9 +239,15 @@ class LLMLightningModule(pl.LightningModule):
         elif model_type == 'moe_mla':
             config = self._create_moe_mla_config()
             model = self._create_moe_mla_model(config)
+        elif model_type == 'slm':
+            config = self._create_slm_config()
+            model = self._create_slm_model(config)
         elif model_type == 'nsa':
             config = self._create_nsa_config()
             model = self._create_nsa_model(config)
+        elif model_type == 'hse':
+            config = self._create_hse_config()
+            model = self._create_hse_model(config)
         elif model_type == 'hrm':
             config = self._create_hrm_config()
             model = self._create_hrm_model(config)
@@ -323,7 +406,7 @@ class LLMLightningModule(pl.LightningModule):
         """Create configuration for MLA-Model."""
         # Define key parameters based on size
         if self.args.size == 'small':
-            n_layer = 16
+            n_layer = 12
             n_embd = 768
             n_head = 16
             q_lora_rank = 0
@@ -686,9 +769,9 @@ class LLMLightningModule(pl.LightningModule):
             use_gradient_checkpointing=base_config.use_gradient_checkpointing,
             
             # MOE-specific parameters
-            num_experts=getattr(self.args, 'num_experts', 8),
+            num_experts=getattr(self.args, 'num_experts', 16),
             experts_per_token=getattr(self.args, 'experts_per_token', 2),
-            shared_weight_ratio=getattr(self.args, 'shared_weight_ratio', 0.75),
+            shared_weight_ratio=getattr(self.args, 'shared_weight_ratio', 0.9),
             
             # FP8 settings
             use_fp8=getattr(self.args, 'use_fp8', False),
@@ -704,6 +787,109 @@ class LLMLightningModule(pl.LightningModule):
     def _create_moe_mla_model(self, config):
         """Create MOE-MLA model instance."""
         return MOEMLA(config)
+    
+    def _create_slm_config(self):
+        """Create configuration for SLM-MoE-MLA Model."""
+        from models.models.slm_moe_mla import SLMConfig
+        
+        # Define key parameters based on size - optimized for different parameter counts
+        if self.args.size == 'tiny':
+            # ~100M parameters
+            n_layer = 8
+            n_embd = 512
+            n_head = 8
+            num_experts = 16
+            experts_per_token = 2
+            kv_lora_rank = 128
+            qk_nope_head_dim = 64
+            qk_rope_head_dim = 32
+            v_head_dim = 64
+        elif self.args.size == 'small':
+            # ~200M parameters
+            n_layer = 10
+            n_embd = 768
+            n_head = 12
+            num_experts = 32
+            experts_per_token = 4
+            kv_lora_rank = 256
+            qk_nope_head_dim = 96
+            qk_rope_head_dim = 32
+            v_head_dim = 96
+        elif self.args.size == 'medium':
+            # ~400M parameters
+            n_layer = 12
+            n_embd = 1024
+            n_head = 16
+            num_experts = 48
+            experts_per_token = 6
+            kv_lora_rank = 384
+            qk_nope_head_dim = 128
+            qk_rope_head_dim = 64
+            v_head_dim = 128
+        else:  # large - ~800M parameters
+            n_layer = 16
+            n_embd = 1280
+            n_head = 20
+            num_experts = 64
+            experts_per_token = 8
+            kv_lora_rank = 512
+            qk_nope_head_dim = 160
+            qk_rope_head_dim = 80
+            v_head_dim = 160
+        
+        # Create SLM config
+        config = SLMConfig(
+            # Architecture
+            n_layer=n_layer,
+            n_embd=n_embd,
+            n_head=n_head,
+            vocab_size=self.args.vocab_size,
+            block_size=self.args.block_size,
+            
+            # MLA parameters
+            q_lora_rank=0,  # No low-rank for queries in SLM
+            kv_lora_rank=kv_lora_rank,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            
+            # MoE parameters - ultra high sharing
+            num_experts=getattr(self.args, 'num_experts', num_experts),
+            experts_per_token=getattr(self.args, 'experts_per_token', experts_per_token),
+            shared_weight_ratio=getattr(self.args, 'shared_weight_ratio', 0.90),
+            
+            # Router parameters
+            router_temperature=getattr(self.args, 'router_temperature', 0.1),
+            router_z_loss_coef=getattr(self.args, 'router_z_loss_coef', 0.001),
+            load_balance_coef=getattr(self.args, 'load_balance_coef', 0.01),
+            
+            # RoPE parameters
+            rope_theta=10000.0,
+            original_max_seq_len=self.args.block_size,
+            
+            # Precision and optimization
+            use_fp8=getattr(self.args, 'use_fp8', False),
+            fp8_tile_size=getattr(self.args, 'fp8_tile_size', 128),
+            
+            # Training parameters
+            dropout=self.args.dropout,
+            bias=self.args.bias,
+            use_gradient_checkpointing=getattr(self.args, 'gradient_checkpointing', True),
+            
+            # Dynamic Tanh - enabled by default for SLM
+            use_dyt=getattr(self.args, 'use_dyt', True),
+            dyt_alpha_init=getattr(self.args, 'dyt_alpha_init', 0.5),
+            
+            # Attention backend
+            attention_backend=getattr(self.args, 'attention_backend', None),
+        )
+        
+        return config
+    
+    def _create_slm_model(self, config):
+        """Create SLM-MoE-MLA model instance."""
+        from models.models.slm_moe_mla import SLMMLA
+        return SLMMLA(config)
     
     def _create_nsa_config(self):
         """Create configuration for NSA Model."""
@@ -781,6 +967,77 @@ class LLMLightningModule(pl.LightningModule):
     def _create_nsa_model(self, config):
         """Create NSA model instance."""
         return NSAModel(config)
+
+    def _create_hse_config(self):
+        """Create configuration for HSE Model (NSA orchestrator + MoE experts)."""
+        # Size presets similar to NSA
+        if self.args.size == 'small':
+            n_layer, n_embd, n_head = 12, 768, 12
+            compress_block_size, compress_stride = 16, 8
+            selection_block_size, num_selected_blocks = 32, 8
+            sliding_window_size = 256
+        elif self.args.size == 'medium':
+            n_layer, n_embd, n_head = 24, 1024, 16
+            compress_block_size, compress_stride = 32, 16
+            selection_block_size, num_selected_blocks = 64, 12
+            sliding_window_size = 384
+        elif self.args.size == 'large':
+            n_layer, n_embd, n_head = 32, 2048, 16
+            compress_block_size, compress_stride = 32, 16
+            selection_block_size, num_selected_blocks = 64, 16
+            sliding_window_size = 512
+        else:  # xl
+            n_layer, n_embd, n_head = 40, 2560, 20
+            compress_block_size, compress_stride = 64, 32
+            selection_block_size, num_selected_blocks = 128, 20
+            sliding_window_size = 640
+
+        config = HSEConfig(
+            # Architecture
+            n_layer=n_layer,
+            n_embd=n_embd,
+            n_head=n_head,
+            vocab_size=self.args.vocab_size,
+            block_size=self.args.block_size,
+
+            # Orchestrator (NSA)
+            compress_block_size=compress_block_size,
+            compress_stride=compress_stride,
+            selection_block_size=selection_block_size,
+            num_selected_blocks=num_selected_blocks,
+            sliding_window_size=sliding_window_size,
+
+            # Experts
+            num_experts=getattr(self.args, 'num_experts', 8),
+            experts_per_token=getattr(self.args, 'experts_per_token', 2),
+
+            # Scribes
+            scribe_chunk_size=getattr(self.args, 'scribe_chunk_size', 2048),
+            scribe_summary_len=getattr(self.args, 'scribe_summary_len', 128),
+
+            # QAP budgets
+            qap_per_step=getattr(self.args, 'qap_per_step', 12),
+            qap_per_expert=getattr(self.args, 'qap_per_expert', 6),
+            qap_max_queries=getattr(self.args, 'qap_max_queries', 20),
+
+            # Training
+            dropout=self.args.dropout,
+            bias=self.args.bias,
+            use_gradient_checkpointing=getattr(self.args, 'gradient_checkpointing', True),
+            use_fp8=getattr(self.args, 'use_fp8', False),
+            fp8_tile_size=getattr(self.args, 'fp8_tile_size', 128),
+            use_dyt=getattr(self.args, 'use_dyt', False),
+            dyt_alpha_init=getattr(self.args, 'dyt_alpha_init', 0.5),
+            label_smoothing=getattr(self.args, 'label_smoothing', 0.0),
+            # Standard attention extras
+            ratio_kv=getattr(self.args, 'ratio_kv', 8),
+            attention_backend=getattr(self.args, 'attention_backend', None),
+        )
+        return config
+
+    def _create_hse_model(self, config):
+        """Create HSE model instance."""
+        return HSEModel(config)
     
     # --- End Config Creation Methods ---
 
@@ -871,6 +1128,435 @@ class LLMLightningModule(pl.LightningModule):
     def _create_hrm_model(self, config):
         """Create HRM model instance."""
         return HRM(config)
+    
+    def adapt_to_new_block_size(self, model, old_block_size, new_block_size):
+        """
+        Adapts a model trained on old_block_size to work with new_block_size.
+        Handles different types of position encoding (fixed embeddings, RoPE, etc.)
+        """
+        if old_block_size == new_block_size:
+            print(f"Block size unchanged ({new_block_size}), no adaptation needed")
+            return model
+            
+        print(f"Adapting model from block_size {old_block_size} to {new_block_size}")
+        model_type = self.args.model_type.lower()
+        
+        if model_type in ['gpt', 'mdm']:
+            self._adapt_fixed_position_embeddings(model, old_block_size, new_block_size)
+        elif model_type in ['mla', 'mla_selective', 'parscale_mla', 'moe_mla', 'slm', 'nsa']:
+            self._adapt_rope_position_encoding(model, old_block_size, new_block_size)
+        elif model_type == 'llada':
+            self._adapt_llada_position_encoding(model, old_block_size, new_block_size)
+        elif model_type in ['deepseek']:
+            self._adapt_deepseek_position_encoding(model, old_block_size, new_block_size)
+        elif model_type == 'sedd':
+            self._adapt_sedd_position_encoding(model, old_block_size, new_block_size)
+        else:
+            print(f"Warning: No specific adaptation implemented for model type {model_type}")
+            
+        return model
+    
+    def _adapt_fixed_position_embeddings(self, model, old_size, new_size):
+        """Adapt models with fixed position embeddings (nn.Embedding)."""
+        print(f"Adapting fixed position embeddings from {old_size} to {new_size}")
+        
+        if hasattr(model, 'transformer') and hasattr(model.transformer, 'wpe'):
+            old_pos_embed = model.transformer.wpe
+            old_weights = old_pos_embed.weight.data.clone()
+            
+            # Create new position embedding layer
+            new_pos_embed = torch.nn.Embedding(new_size, old_pos_embed.embedding_dim)
+            
+            if new_size > old_size:
+                # Extend: copy old weights and interpolate new positions
+                new_pos_embed.weight.data[:old_size] = old_weights
+                
+                # Interpolate remaining positions
+                for i in range(old_size, new_size):
+                    # Linear interpolation from the last few positions
+                    if old_size >= 4:
+                        # Use weighted average of last 4 positions
+                        weights = torch.tensor([0.1, 0.2, 0.3, 0.4])
+                        interpolated = torch.sum(old_weights[-4:] * weights.unsqueeze(1), dim=0)
+                    else:
+                        # If too few positions, just use the last one with noise
+                        interpolated = old_weights[-1] + torch.randn_like(old_weights[-1]) * 0.02
+                    
+                    new_pos_embed.weight.data[i] = interpolated
+                    
+            else:
+                # Truncate: just take the first new_size positions
+                new_pos_embed.weight.data = old_weights[:new_size]
+            
+            # Replace the old embedding
+            model.transformer.wpe = new_pos_embed
+            print(f"Position embeddings adapted: {old_size} -> {new_size}")
+            
+        elif hasattr(model, 'position_embedding'):
+            # For models like MDM
+            old_pos_embed = model.position_embedding
+            old_weights = old_pos_embed.weight.data.clone()
+            
+            new_pos_embed = torch.nn.Embedding(new_size, old_pos_embed.embedding_dim)
+            
+            if new_size > old_size:
+                new_pos_embed.weight.data[:old_size] = old_weights
+                # Interpolate remaining positions
+                for i in range(old_size, new_size):
+                    if old_size >= 4:
+                        weights = torch.tensor([0.1, 0.2, 0.3, 0.4])
+                        interpolated = torch.sum(old_weights[-4:] * weights.unsqueeze(1), dim=0)
+                    else:
+                        interpolated = old_weights[-1] + torch.randn_like(old_weights[-1]) * 0.02
+                    new_pos_embed.weight.data[i] = interpolated
+            else:
+                new_pos_embed.weight.data = old_weights[:new_size]
+                
+            model.position_embedding = new_pos_embed
+            print(f"Position embeddings adapted: {old_size} -> {new_size}")
+    
+    def _adapt_rope_position_encoding(self, model, old_size, new_size):
+        """Adapt models with RoPE position encoding."""
+        print(f"Adapting RoPE encoding from {old_size} to {new_size}")
+        
+        # For RoPE, we need to extend the cached cos/sin values
+        def extend_rope_cache(module):
+            if hasattr(module, 'rope'):
+                rope = module.rope
+                if hasattr(rope, '_extend_cos_sin_cache'):
+                    rope._extend_cos_sin_cache(new_size)
+                    print(f"Extended RoPE cache in {module.__class__.__name__} to {new_size}")
+                elif hasattr(rope, 'max_seq_len') and rope.max_seq_len < new_size:
+                    # Recreate RoPE with new max_seq_len
+                    from models.blocks.positional_encoding import RoPE
+                    new_rope = RoPE(rope.dim, max_seq_len=new_size, base=rope.base)
+                    module.rope = new_rope
+                    print(f"Recreated RoPE in {module.__class__.__name__} with max_seq_len={new_size}")
+        
+        # Recursively find and update RoPE modules
+        def update_rope_recursive(module):
+            extend_rope_cache(module)
+            for child in module.children():
+                update_rope_recursive(child)
+        
+        update_rope_recursive(model)
+        
+        # Apply position interpolation for better generalization
+        if new_size > old_size and hasattr(self.args, 'use_position_interpolation') and self.args.use_position_interpolation:
+            self._apply_position_interpolation(model, old_size, new_size)
+    
+    def _adapt_llada_position_encoding(self, model, old_size, new_size):
+        """Adapt LLaDA model position encoding."""
+        print(f"Adapting LLaDA position encoding from {old_size} to {new_size}")
+        
+        # LLaDA uses RoPE in attention layers
+        self._adapt_rope_position_encoding(model, old_size, new_size)
+        
+        # Update BD3 block length if needed
+        if hasattr(model, 'config'):
+            if hasattr(model.config, 'bd3_block_length'):
+                # Scale BD3 block length proportionally
+                old_bd3_block = getattr(model.config, 'bd3_block_length', old_size // 4)
+                new_bd3_block = int(old_bd3_block * new_size / old_size)
+                model.config.bd3_block_length = max(32, new_bd3_block)  # Minimum sensible block size
+                print(f"Updated BD3 block length: {old_bd3_block} -> {model.config.bd3_block_length}")
+    
+    def _adapt_deepseek_position_encoding(self, model, old_size, new_size):
+        """Adapt DeepSeek model position encoding."""
+        print(f"Adapting DeepSeek position encoding from {old_size} to {new_size}")
+        
+        # DeepSeek uses RoPE
+        self._adapt_rope_position_encoding(model, old_size, new_size)
+        
+        # Update max_position_embeddings in config if present
+        if hasattr(model, 'config') and hasattr(model.config, 'max_position_embeddings'):
+            model.config.max_position_embeddings = new_size
+            print(f"Updated max_position_embeddings to {new_size}")
+    
+    def _adapt_sedd_position_encoding(self, model, old_size, new_size):
+        """Adapt SEDD model position encoding."""
+        print(f"Adapting SEDD position encoding from {old_size} to {new_size}")
+        
+        # SEDD uses RoPE in transformer blocks
+        self._adapt_rope_position_encoding(model, old_size, new_size)
+    
+    def _apply_position_interpolation(self, model, old_size, new_size):
+        """
+        Apply Position Interpolation (PI) to RoPE frequencies.
+        Scales the frequencies to maintain learned positional relationships.
+        """
+        print(f"Applying position interpolation: scaling factor = {new_size/old_size:.2f}")
+        
+        def interpolate_rope_freqs(module):
+            if hasattr(module, 'rope'):
+                rope = module.rope
+                if hasattr(rope, 'base'):
+                    # Calculate new base frequency
+                    scale_factor = new_size / old_size
+                    new_base = rope.base * (scale_factor ** (rope.dim / (rope.dim - 2)))
+                    
+                    # Recreate RoPE with interpolated frequencies
+                    from models.blocks.positional_encoding import RoPE
+                    new_rope = RoPE(rope.dim, max_seq_len=new_size, base=new_base)
+                    module.rope = new_rope
+                    print(f"Applied PI to {module.__class__.__name__}: base {rope.base:.0f} -> {new_base:.0f}")
+        
+        def apply_pi_recursive(module):
+            interpolate_rope_freqs(module)
+            for child in module.children():
+                apply_pi_recursive(child)
+        
+        apply_pi_recursive(model)
+    
+    def _clean_checkpoint_keys(self, state_dict):
+        """
+        Clean checkpoint keys to handle different formats:
+        - Remove _orig_mod prefix from torch.compile()
+        - Remove model. prefix from Lightning checkpoints
+        - Handle other common prefixes
+        """
+        cleaned_state_dict = {}
+        
+        # Analyze the key patterns to choose the best cleaning strategy
+        sample_keys = list(state_dict.keys())[:10]
+        print(f"Sample checkpoint keys: {sample_keys}")
+        
+        # Detect the pattern
+        has_model_prefix = any(key.startswith('model.') for key in sample_keys)
+        has_orig_mod_prefix = any('_orig_mod.' in key for key in sample_keys)
+        
+        print(f"Key pattern analysis: model.={has_model_prefix}, _orig_mod.={has_orig_mod_prefix}")
+        
+        for key, value in state_dict.items():
+            clean_key = key
+            
+            # Apply cleaning in order based on detected patterns
+            if has_orig_mod_prefix and '_orig_mod.' in clean_key:
+                # Handle model._orig_mod.xxx or _orig_mod.xxx
+                if clean_key.startswith('model._orig_mod.'):
+                    clean_key = clean_key.replace('model._orig_mod.', '')
+                elif clean_key.startswith('_orig_mod.'):
+                    clean_key = clean_key.replace('_orig_mod.', '')
+            elif has_model_prefix and clean_key.startswith('model.'):
+                # Simple Lightning checkpoint format
+                clean_key = clean_key.replace('model.', '')
+            
+            # Additional prefixes
+            if clean_key.startswith('_forward_module.'):
+                clean_key = clean_key.replace('_forward_module.', '')
+                
+            cleaned_state_dict[clean_key] = value
+            
+        return cleaned_state_dict
+    
+    def _is_model_compiled(self, state_dict):
+        """Check if the model state dict is from a compiled model."""
+        return any(key.startswith('_orig_mod.') for key in state_dict.keys())
+    
+    def _add_compile_prefix_to_state_dict(self, state_dict):
+        """Add _orig_mod prefix to all keys in state dict for compiled models."""
+        compiled_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('model.'):
+                # Replace model. with model._orig_mod.
+                new_key = key.replace('model.', 'model._orig_mod.')
+            elif not key.startswith('_orig_mod.'):
+                # Add _orig_mod prefix if not already present
+                new_key = f'_orig_mod.{key}' if not key.startswith('model.') else key.replace('model.', 'model._orig_mod.')
+            else:
+                new_key = key
+            compiled_state_dict[new_key] = value
+        return compiled_state_dict
+    
+    def _load_and_adapt_checkpoint(self):
+        """Load checkpoint and adapt model to new block size if needed."""
+        print(f"Loading checkpoint from: {self.load_checkpoint_path}")
+        
+        try:
+            # Load checkpoint (weights_only=False for PyTorch 2.6+ compatibility)
+            checkpoint = torch.load(self.load_checkpoint_path, map_location='cpu', weights_only=False)
+            
+            # Extract model state dict
+            if 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            else:
+                state_dict = checkpoint
+            
+            # Clean checkpoint keys (handle _orig_mod, model. prefixes, etc.)
+            original_keys = len(state_dict)
+            state_dict = self._clean_checkpoint_keys(state_dict)
+            
+            # Check what prefixes were cleaned
+            compiled_keys = [k for k in checkpoint.get('state_dict', checkpoint).keys() if '_orig_mod.' in k]
+            lightning_keys = [k for k in checkpoint.get('state_dict', checkpoint).keys() if k.startswith('model.') and '_orig_mod' not in k]
+            
+            if compiled_keys:
+                print(f"Detected compiled model checkpoint ({len(compiled_keys)} keys with _orig_mod prefix)")
+            if lightning_keys:
+                print(f"Detected Lightning checkpoint format ({len(lightning_keys)} keys with model. prefix)")
+                
+            print(f"Cleaned {original_keys} checkpoint keys")
+            
+            # Load state dict into model (strict=False to handle potential size mismatches)
+            missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+            
+            # Check if loading was successful
+            total_model_params = len([name for name, _ in self.model.named_parameters()])
+            loaded_params = len(state_dict) - len(missing_keys)
+            loading_success_rate = loaded_params / len(state_dict) * 100 if len(state_dict) > 0 else 0
+            
+            print(f"=== Checkpoint Loading Statistics ===")
+            print(f"Total parameters in checkpoint: {len(state_dict)}")
+            print(f"Total parameters in model: {total_model_params}")
+            print(f"Successfully loaded: {loaded_params} ({loading_success_rate:.1f}%)")
+            print(f"Missing keys: {len(missing_keys)}")
+            print(f"Unexpected keys: {len(unexpected_keys)}")
+            
+            if missing_keys:
+                print(f"First 5 missing keys: {missing_keys[:5]}")
+            if unexpected_keys:
+                print(f"First 5 unexpected keys: {unexpected_keys[:5]}")
+                
+            # Critical validation: if too many keys are missing, abort
+            if len(missing_keys) > len(state_dict) * 0.8:  # More than 80% missing
+                error_msg = f"CRITICAL ERROR: {len(missing_keys)} out of {len(state_dict)} keys missing ({100 - loading_success_rate:.1f}% failure rate). This indicates the model weights were not loaded properly."
+                print(f"ERROR: {error_msg}")
+                raise RuntimeError(error_msg)
+            elif len(missing_keys) > len(state_dict) * 0.5:  # More than 50% missing
+                print(f"WARNING: {len(missing_keys)} keys missing ({100 - loading_success_rate:.1f}% failure rate). Model may not work properly.")
+                
+            print(f"Checkpoint loaded with {loading_success_rate:.1f}% success rate")
+            
+            # Adapt to new block size if needed
+            if self.original_block_size != self.args.block_size:
+                print(f"Adapting model from block_size {self.original_block_size} to {self.args.block_size}")
+                
+                # Store some weights before adaptation to verify they're preserved
+                sample_weights_before = {}
+                for name, param in self.model.named_parameters():
+                    if 'transformer.wte.weight' in name or 'transformer.h.0.norm1.weight' in name:
+                        sample_weights_before[name] = param.data.clone()
+                        print(f"Sample weight before adaptation - {name}: mean={param.data.mean():.6f}, std={param.data.std():.6f}")
+                        break
+                
+                self.model = self.adapt_to_new_block_size(self.model, self.original_block_size, self.args.block_size)
+                
+                # Check that main weights are preserved after adaptation
+                for name, param in self.model.named_parameters():
+                    if name in sample_weights_before:
+                        weight_diff = (param.data - sample_weights_before[name]).abs().mean()
+                        print(f"Sample weight after adaptation - {name}: mean={param.data.mean():.6f}, std={param.data.std():.6f}, diff={weight_diff:.8f}")
+                        if weight_diff > 1e-6:
+                            print(f"WARNING: Weight {name} changed significantly during adaptation!")
+                        else:
+                            print(f"✓ Weight {name} preserved correctly during adaptation")
+                        break
+                
+                print("Model adaptation completed")
+                
+                # Update config to reflect new block size
+                if hasattr(self.model, 'config'):
+                    self.model.config.block_size = self.args.block_size
+                if hasattr(self, 'config'):
+                    self.config.block_size = self.args.block_size
+            
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            print(traceback.format_exc())
+            raise e
+    
+    def setup_progressive_training(self):
+        """Setup progressive training if enabled."""
+        if not self.progressive_training:
+            return
+            
+        # Start with the smallest block size
+        if len(self.progressive_block_sizes) > 0:
+            initial_block_size = self.progressive_block_sizes[0]
+            if initial_block_size != self.args.block_size:
+                print(f"Progressive training: starting with block_size={initial_block_size}")
+                old_block_size = self.args.block_size
+                self.args.block_size = initial_block_size
+                
+                # Adapt model if needed
+                if hasattr(self.model, 'config'):
+                    self.model.config.block_size = initial_block_size
+                if hasattr(self, 'config'):
+                    self.config.block_size = initial_block_size
+                    
+                # Adapt the model to the smaller size if coming from larger
+                if old_block_size > initial_block_size:
+                    self.model = self.adapt_to_new_block_size(self.model, old_block_size, initial_block_size)
+    
+    def should_progress_to_next_stage(self):
+        """Check if we should move to the next progressive training stage."""
+        if not self.progressive_training:
+            return False
+            
+        # Check if we've completed enough epochs for current stage
+        epochs_in_stage = self.current_epoch - (self.progressive_current_stage * self.progressive_epochs_per_stage)
+        
+        return (epochs_in_stage >= self.progressive_epochs_per_stage and 
+                self.progressive_current_stage < len(self.progressive_block_sizes) - 1)
+    
+    def progress_to_next_stage(self):
+        """Progress to next stage in progressive training."""
+        if not self.progressive_training or self.progressive_current_stage >= len(self.progressive_block_sizes) - 1:
+            return False
+            
+        old_stage = self.progressive_current_stage
+        old_block_size = self.progressive_block_sizes[old_stage]
+        
+        self.progressive_current_stage += 1
+        new_block_size = self.progressive_block_sizes[self.progressive_current_stage]
+        
+        print(f"\n=== Progressive Training: Stage {old_stage} -> {self.progressive_current_stage} ===")
+        print(f"Transitioning from block_size {old_block_size} to {new_block_size}")
+        
+        # Update args and configs
+        self.args.block_size = new_block_size
+        if hasattr(self.model, 'config'):
+            self.model.config.block_size = new_block_size
+        if hasattr(self, 'config'):
+            self.config.block_size = new_block_size
+        
+        # Adapt model to new block size
+        self.model = self.adapt_to_new_block_size(self.model, old_block_size, new_block_size)
+        
+        # Scale learning rate down for stability
+        if hasattr(self.trainer, 'optimizers') and len(self.trainer.optimizers) > 0:
+            optimizer = self.trainer.optimizers[0]
+            for param_group in optimizer.param_groups:
+                old_lr = param_group['lr']
+                param_group['lr'] = old_lr * self.progressive_lr_scale
+                print(f"Scaled learning rate: {old_lr:.2e} -> {param_group['lr']:.2e}")
+        
+        print(f"=== Stage transition completed ===\n")
+        
+        # Log to wandb if available
+        if self.use_wandb and self.global_rank == 0:
+            try:
+                wandb.log({
+                    'progressive_training/stage': self.progressive_current_stage,
+                    'progressive_training/block_size': new_block_size,
+                    'progressive_training/transition_epoch': self.current_epoch
+                }, step=self.global_step)
+            except Exception as e:
+                print(f"Warning: Failed to log progressive training to wandb: {e}")
+        
+        return True
+    
+    def on_train_epoch_end(self):
+        """Called at the end of each training epoch."""
+        # Check for progressive training transitions
+        if self.should_progress_to_next_stage():
+            self.progress_to_next_stage()
+            
+            # Force a checkpoint save after stage transition
+            if self.global_rank == 0 and hasattr(self.trainer, 'save_checkpoint'):
+                checkpoint_path = f"progressive_stage_{self.progressive_current_stage}_epoch_{self.current_epoch}.ckpt"
+                self.trainer.save_checkpoint(checkpoint_path)
+                print(f"Saved checkpoint after stage transition: {checkpoint_path}")
 
     def forward(self, input_ids, targets=None, **kwargs):
         """
@@ -1013,6 +1699,16 @@ class LLMLightningModule(pl.LightningModule):
         loss_value = loss.item()
         self.log('train/loss', loss_value, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
         
+        # Wandb logging
+        if self.use_wandb and self.global_rank == 0:
+            wandb_metrics = {
+                'train/loss': loss_value,
+                'train/combined_loss': combined_loss.item(),
+                'train/step_time_ms': dt * 1000,
+                'learning_rate': self.trainer.optimizers[0].param_groups[0]['lr'],
+                'global_step': self.global_step
+            }
+        
         # Calculate gradient norms for monitoring
         grad_norm = 0.0
         # Schedule this to run after the backward pass via a hook if possible,
@@ -1064,9 +1760,28 @@ class LLMLightningModule(pl.LightningModule):
         
         # CSV Logging
         self._buffer_metrics_for_csv(loss_value, grad_norm, current_tokens_per_sec, avg_seq_len)
+        
+        # Complete wandb logging with additional metrics
+        if self.use_wandb and self.global_rank == 0:
+            wandb_metrics.update({
+                'train/grad_norm': grad_norm,
+                'tokens_per_sec': current_tokens_per_sec,
+                'train/non_pad_pct': non_padding_token_percentage,
+                'total_tokens': float(self.total_tokens),
+                'train/avg_seq_len': avg_seq_len,
+            })
+            
+            # Add router loss if available
+            if router_loss is not None and torch.is_tensor(router_loss):
+                wandb_metrics['train/router_loss'] = router_loss.item()
+            
+            try:
+                wandb.log(wandb_metrics, step=self.global_step)
+            except Exception as e:
+                print(f"Warning: Failed to log to wandb: {e}")
 
         # Periodic tasks
-        if self.global_step > 0 and self.global_step % 100 == 0:
+        if self.global_step > 0 and self.global_step % 1000 == 0:
             if self.global_rank == 0:
                 self.generate_sample_text()
                 self._log_metrics_to_csv()
@@ -1121,6 +1836,26 @@ class LLMLightningModule(pl.LightningModule):
 
         if router_loss is not None:
              self.log('val/router_loss', router_loss, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True)
+
+        # Wandb validation logging
+        if self.use_wandb and self.global_rank == 0:
+            val_metrics = {
+                'val/loss': loss.item() if torch.is_tensor(loss) else loss,
+                'val/perplexity': perplexity,
+                'epoch': self.current_epoch
+            }
+            
+            if router_loss is not None:
+                val_metrics['val/router_loss'] = router_loss.item() if torch.is_tensor(router_loss) else router_loss
+            
+            # Add auxiliary losses if available
+            if aux_ce is not None and torch.is_tensor(aux_ce):
+                val_metrics['val/aux_ce_loss'] = aux_ce.item()
+            
+            try:
+                wandb.log(val_metrics, step=self.global_step)
+            except Exception as e:
+                print(f"Warning: Failed to log validation metrics to wandb: {e}")
 
         return loss
 
@@ -1442,6 +2177,14 @@ class LLMLightningModule(pl.LightningModule):
                  print(f"Global batch size: {self.args.batch_size * self.trainer.world_size * self.trainer.accumulate_grad_batches}")
                  print(f"Gradient accumulation steps: {self.trainer.accumulate_grad_batches}")
                  print(f"Using precision: {self.trainer.precision}")
+                 
+                 # Setup progressive training if enabled
+                 if self.progressive_training:
+                     print(f"Progressive training enabled:")
+                     print(f"  Block sizes: {self.progressive_block_sizes}")
+                     print(f"  Epochs per stage: {self.progressive_epochs_per_stage}")
+                     print(f"  LR scale at transitions: {self.progressive_lr_scale}")
+                     self.setup_progressive_training()
 
 
     def teardown(self, stage=None):
@@ -1474,6 +2217,14 @@ class LLMLightningModule(pl.LightningModule):
             if self.global_rank == 0:
                 print("Training finished. Final memory stats:")
                 print_memory_stats("Teardown")
+                
+                # Finish wandb run
+                if self.use_wandb:
+                    try:
+                        wandb.finish()
+                        print("Wandb run finished successfully")
+                    except Exception as e:
+                        print(f"Warning: Failed to finish wandb run: {e}")
 
 
 # Note: DataModule definition would go here or in a separate file.

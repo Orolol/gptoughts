@@ -45,14 +45,9 @@ python run_train.py \
     --shared_weight_ratio $SHARED_RATIO \
     --output_dir $OUTPUT_DIR \
     --precision bf16-mixed \
-    --optimizer_type galore2 \
-    --galore_rank $GALORE_RANK \
-    --galore_update_proj_gap $UPDATE_GAP \
-    --galore_scale 0.25 \
-    --galore_proj_type std \
+    --optimizer_type adamw \
     --optimize_attention \
     --preallocate_memory \
-    --grad_clip 1.0 \
     --learning_rate 5e-5 \
     --weight_decay 0.1 \
     --warmup_iters 200 \

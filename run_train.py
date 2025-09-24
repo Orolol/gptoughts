@@ -40,7 +40,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train LLM models with PyTorch Lightning')
 
     # Model Parameters
-    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'sedd', 'gpt', 'mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'mdm', 'moe_mla', 'nsa', 'hrm'], default='gpt', help='Type of model to train')
+    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'sedd', 'gpt', 'mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'mdm', 'moe_mla', 'slm', 'nsa', 'hrm', 'hse'], default='gpt', help='Type of model to train')
     parser.add_argument('--size', type=str, choices=['small', 'medium', 'large', 'xl'], default='small', help='Size of the model')
     parser.add_argument('--use_lightning', action='store_true', default=True, help='Use PyTorch Lightning for training')
 
@@ -99,6 +99,14 @@ def parse_args():
     parser.add_argument('--num_experts', type=int, default=8, help='Number of experts in MoE models')
     parser.add_argument('--experts_per_token', type=int, default=2, help='Number of experts selected per token (top-k routing)')
     parser.add_argument('--shared_weight_ratio', type=float, default=0.75, help='Ratio of weights shared between experts (0.0 to 1.0)')
+
+    # HSE-specific Parameters
+    parser.add_argument('--scribe_chunk_size', type=int, default=2048, help='Scribes local chunk size')
+    parser.add_argument('--scribe_summary_len', type=int, default=128, help='Number of summary tokens produced by Scribes')
+    parser.add_argument('--qap_per_step', type=int, default=12, help='QAP budget per decoding step')
+    parser.add_argument('--qap_per_expert', type=int, default=6, help='QAP budget per expert per step')
+    parser.add_argument('--qap_max_queries', type=int, default=20, help='Max QAP queries per step')
+    parser.add_argument('--ratio_kv', type=int, default=8, help='KV head ratio for GQA in standard attention')
 
     # BD3-LM Specific Args (passed to LightningModule)
     parser.add_argument('--use_bd3_training', action='store_true', help='Enable BD3-LM vectorized training path for LLaDA model')
