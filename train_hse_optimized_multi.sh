@@ -17,6 +17,8 @@ PRECISION=${PRECISION:-bf16-mixed}
 USE_FP8=${USE_FP8:-0}
 NUM_WORKERS=${NUM_WORKERS:-4}
 DDP_STRATEGY=${DDP_STRATEGY:-ddp_find_unused_parameters_true}
+USE_PREALLOC=${USE_PREALLOC:-0}
+USE_COMPILE=${USE_COMPILE:-1}
 
 # Environment tailored for Hopper class GPUs
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
@@ -41,7 +43,9 @@ printf 'DDP strategy ............. %s\n' "$DDP_STRATEGY"
 printf 'Precision mode ........... %s\n' "$PRECISION"
 printf 'Output directory ......... %s\n' "$OUTPUT_DIR"
 printf 'Resume from checkpoint ... %s\n' "$RESUME"
-printf 'FP8 enabled .............. %s\n\n' "$USE_FP8"
+printf 'FP8 enabled .............. %s\n' "$USE_FP8"
+printf 'Preallocate cache ........ %s\n' "$USE_PREALLOC"
+printf 'torch.compile enabled .... %s\n\n' "$USE_COMPILE"
 
 # Quick sanity check on visible GPUs
 python - <<'PY'
@@ -96,10 +100,8 @@ CMD=(python run_train.py
     --weight_decay 0.1
     --optimizer_type lion
     --optimize_attention
-    --preallocate_memory
     --attention_backend sdpa
     --use_dyt
-    --compile
     --num_experts "$NUM_EXPERTS"
     --experts_per_token "$EXPERTS_PER_TOKEN"
     --scribe_chunk_size "$SCRIBE_CHUNK_SIZE"
@@ -111,6 +113,14 @@ CMD=(python run_train.py
 
 if [[ "$USE_FP8" == "1" || "$USE_FP8" == "true" ]]; then
     CMD+=(--use_fp8)
+fi
+
+if [[ "$USE_PREALLOC" == "1" || "$USE_PREALLOC" == "true" ]]; then
+    CMD+=(--preallocate_memory)
+fi
+
+if [[ "$USE_COMPILE" == "1" || "$USE_COMPILE" == "true" ]]; then
+    CMD+=(--compile)
 fi
 
 if [[ -n "$RESUME_ARGS" ]]; then
