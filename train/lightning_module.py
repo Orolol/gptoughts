@@ -156,7 +156,7 @@ class LLMLightningModule(pl.LightningModule):
         # Watch model with wandb if enabled
         if self.use_wandb and self.global_rank == 0:
             try:
-                wandb.watch(self.model, log="all", log_freq=100)
+                wandb.watch(self.model, log=None, log_freq=100)
             except Exception as e:
                 print(f"Warning: Failed to watch model with wandb: {e}")
 

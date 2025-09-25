@@ -32,7 +32,6 @@ python run_train.py \
     --block_size $BLOCK_SIZE \
     --output_dir $OUTPUT_DIR \
     --precision bf16-mixed \
-    --optimize_attention \
     --preallocate_memory \
     --grad_clip 1.0 \
     --learning_rate 5e-5 \
@@ -44,7 +43,6 @@ python run_train.py \
     --log_interval_steps 10 \
     --gradient_accumulation_steps 1 \
     --use_dyt \
-    --use_fp8 \
     --compile \
     $RESUME_ARGS
 
