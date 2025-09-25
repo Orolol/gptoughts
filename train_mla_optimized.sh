@@ -32,6 +32,7 @@ python run_train.py \
     --block_size $BLOCK_SIZE \
     --output_dir $OUTPUT_DIR \
     --precision bf16-mixed \
+    --optimize_attention \
     --preallocate_memory \
     --grad_clip 1.0 \
     --learning_rate 5e-5 \
