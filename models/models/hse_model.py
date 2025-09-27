@@ -144,6 +144,7 @@ class HSEModel(nn.Module):
             chunk_size=config.scribe_chunk_size,
             summary_len=config.scribe_summary_len,
         ))
+        self.scribe.requires_grad_(False)  # Metadata helper, not trained with LM loss
         self.cache_manager = HierarchicalCache()
         self.qap = QAPController(budget=QAPBudget(
             per_step=config.qap_per_step,
