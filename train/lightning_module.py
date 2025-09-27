@@ -806,11 +806,11 @@ class LLMLightningModule(pl.LightningModule):
             v_head_dim = 64
         elif self.args.size == 'small':
             # ~200M parameters
-            n_layer = 10
+            n_layer = 8
             n_embd = 768
             n_head = 12
             num_experts = 32
-            experts_per_token = 4
+            experts_per_token = 1
             kv_lora_rank = 256
             qk_nope_head_dim = 96
             qk_rope_head_dim = 32

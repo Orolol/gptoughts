@@ -47,13 +47,13 @@ python run_train.py \
     --preallocate_memory \
     --optimizer_type lion \
     --grad_clip 1.0 \
-    --learning_rate 5e-5 \
+    --learning_rate 1e-4 \
     --weight_decay 0.1 \
     --warmup_iters 200 \
     --max_iters 10000000 \
     --eval_interval_steps 1000 \
     --log_interval_steps 10 \
-    --gradient_accumulation_steps 1 \
+    --gradient_accumulation_steps 2 \
     --use_dyt \
     --compile \
     $FP8_FLAG \

@@ -59,7 +59,12 @@ class HSEConfig:
 
     # Experts (MoE)
     num_experts: int = 8
-    experts_per_token: int = 2
+    experts_per_token: int = 1
+    moe_type: str = "standard"  # "standard" | "switch"
+    moe_capacity_factor: float = 1.25
+    moe_drop_tokens: bool = True
+    moe_router_z_loss: float = 1e-2
+    moe_load_balance_loss: float = 1e-2
 
     # Scribe
     scribe_chunk_size: int = 2048
@@ -110,6 +115,11 @@ class HSEModel(nn.Module):
                         attention_backend=config.attention_backend,
                         num_experts=config.num_experts,
                         experts_per_token=config.experts_per_token,
+                        moe_type=config.moe_type,
+                        moe_capacity_factor=config.moe_capacity_factor,
+                        moe_drop_tokens=config.moe_drop_tokens,
+                        moe_router_z_loss=config.moe_router_z_loss,
+                        moe_load_balance_loss=config.moe_load_balance_loss,
                         use_gradient_checkpointing=config.use_gradient_checkpointing,
                         use_dyt=config.use_dyt,
                         dyt_alpha_init=config.dyt_alpha_init,

@@ -18,6 +18,7 @@ import torch.utils.checkpoint as checkpoint
 from .attention import CausalSelfAttention
 from .normalization import RMSNorm, DynamicTanh
 from .moe import MoELayer
+from .moe_switch import SwitchMoELayer
 
 
 @dataclass
@@ -33,6 +34,11 @@ class HSEBlockConfig:
     # MoE parameters
     num_experts: int = 8
     experts_per_token: int = 2
+    moe_type: str = "standard"  # "standard" | "switch"
+    moe_capacity_factor: float = 1.25
+    moe_drop_tokens: bool = True
+    moe_router_z_loss: float = 1e-2
+    moe_load_balance_loss: float = 1e-2
     # Aux
     use_gradient_checkpointing: bool = False
     use_dyt: bool = False
@@ -60,11 +66,33 @@ class HSEBlock(nn.Module):
             'attention_backend': config.attention_backend,
         })()
         self.attn = CausalSelfAttention(attn_cfg)
-        self.moe = MoELayer(
-            type('MoEConfig', (), {'n_embd': config.n_embd})(),
-            num_experts=config.num_experts,
-            k=config.experts_per_token,
-        )
+
+        moe_cfg = type(
+            'MoEConfig',
+            (),
+            {
+                'n_embd': config.n_embd,
+                'bias': config.bias,
+                'dropout': config.dropout,
+            },
+        )()
+        if getattr(config, "moe_type", "standard") == "switch":
+            self.moe = SwitchMoELayer(
+                moe_cfg,
+                num_experts=config.num_experts,
+                capacity_factor=config.moe_capacity_factor,
+                drop_tokens=config.moe_drop_tokens,
+                router_z_loss_coef=config.moe_router_z_loss,
+                load_balance_coef=config.moe_load_balance_loss,
+            )
+            self._moe_requires_prenorm = False
+        else:
+            self.moe = MoELayer(
+                moe_cfg,
+                num_experts=config.num_experts,
+                k=config.experts_per_token,
+            )
+            self._moe_requires_prenorm = True
 
         self.use_checkpoint = getattr(config, 'use_gradient_checkpointing', False)
 
@@ -73,7 +101,9 @@ class HSEBlock(nn.Module):
         return self.attn(self.norm1(x))
 
     def _moe_block(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.moe(self.norm2(x))
+        if getattr(self, "_moe_requires_prenorm", True):
+            return self.moe(self.norm2(x))
+        return self.moe(x)
 
     def forward(self, x: torch.Tensor, rope: nn.Module, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         # Attention + residual (disable checkpointing under torch.compile capture)
