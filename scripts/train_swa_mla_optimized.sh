@@ -44,6 +44,7 @@ python run_train.py \
     --eval_interval_steps 1000 \
     --log_interval_steps 10 \
     --gradient_accumulation_steps 1 \
+    --num_workers 8 \
     --compile \
     --swa_layers_per_cycle 2 \
     --mla_layers_per_cycle 1 \
