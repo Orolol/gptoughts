@@ -289,7 +289,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--log-dir",
-        default="out/metrics_logs",
+        default="outputs/out/metrics_logs",
         type=Path,
         help="Directory containing metrics CSV files",
     )

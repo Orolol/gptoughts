@@ -10,6 +10,8 @@ from .mla_llada import MLALLaDAModel, MLALLaDAConfig, create_mla_llada_model
 from .nsa_model import NSAModel, NSAModelConfig, create_nsa_model
 from ..mdm.model import MDMModel
 from .hse_model import HSEModel, HSEConfig, create_hse_model
+from .swan_model import SWANModel, SWANConfig, create_swan_model
+from .swa_mla_model import SWAMLAModel, SWAMLAConfig, create_swa_mla_model
 
 __all__ = [
     'GPT',
@@ -35,4 +37,10 @@ __all__ = [
     'HSEModel',
     'HSEConfig',
     'create_hse_model',
+    'SWANModel',
+    'SWANConfig',
+    'create_swan_model',
+    'SWAMLAModel',
+    'SWAMLAConfig',
+    'create_swa_mla_model',
 ]

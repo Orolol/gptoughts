@@ -2,6 +2,7 @@
 torch
 numpy
 transformers
+xformers
 
 # Training utilities
 wandb
@@ -28,3 +29,4 @@ tensorboardX
 galore_torch
 apollo_torch
 lion_pytorch
+runpod

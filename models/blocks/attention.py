@@ -59,7 +59,25 @@ class CausalSelfAttention(nn.Module):
         # Regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        
+
+        # Optional features for positional handling and masking
+        self.use_rope = getattr(config, 'use_rope', True)
+        self.rope_theta = getattr(config, 'rope_theta', 10000)
+        self.attention_window = getattr(config, 'attention_window', getattr(config, 'sliding_window_size', None))
+        if self.attention_window is not None and self.attention_window <= 0:
+            self.attention_window = None
+
+        scale_base = getattr(config, 'logit_scale_base', None)
+        if scale_base is not None and scale_base <= 1.0:
+            scale_base = None
+        self.scale_base = scale_base
+        self.scale_window = max(1, getattr(config, 'logit_scale_window', 128))
+        self.scale_offset = getattr(config, 'logit_scale_offset', 0)
+        self.scale_min = getattr(config, 'logit_scale_min', 1.0)
+        self.scale_max = getattr(config, 'logit_scale_max', None)
+        self.scale_in_training = getattr(config, 'logit_scale_during_training', False)
+        self._scale_log_denom = math.log(self.scale_base) if self.scale_base is not None else None
+
         # Attention backend setup
         if hasattr(config, 'attention_backend') and config.attention_backend is not None:
             if config.attention_backend not in ATTENTION_BACKENDS:
@@ -71,17 +89,22 @@ class CausalSelfAttention(nn.Module):
                 self.attention_backend = config.attention_backend
         else:
             self.attention_backend = get_best_attention_backend()
-            
+
+        if self.attention_window is not None and self.attention_backend in ('flash_attn_2', 'xformers'):
+            # Fallback to SDPA when explicit masking is required
+            self.attention_backend = 'sdpa'
+
         print(f"Using attention backend: {self.attention_backend}")
-        
-        # For RoPE positioning
+
+        # For RoPE positioning when enabled
         from .positional_encoding import RoPE
-        self.rope = RoPE(self.head_dim, config.block_size)
-        
+        self.rope = RoPE(self.head_dim, config.block_size, base=self.rope_theta) if self.use_rope else None
+
         # Préallouer le masque causal
         mask = torch.full((config.block_size, config.block_size), float('-inf'))
         mask = torch.triu(mask, diagonal=1)
         self.register_buffer('mask', mask)
+        self._sliding_mask_cache = None
 
     def _memory_efficient_attention(self, q, k, v, mask=None, is_causal=True):
         """
@@ -121,6 +144,9 @@ class CausalSelfAttention(nn.Module):
             if hasattr(self, '_cached_k') and hasattr(self, '_cached_v'):
                 k = torch.cat([self._cached_k, k], dim=1)
                 v = torch.cat([self._cached_v, v], dim=1)
+                if self.attention_window is not None and k.size(1) > self.attention_window:
+                    k = k[:, -self.attention_window:, :, :]
+                    v = v[:, -self.attention_window:, :, :]
                 # Ensure cached tensors have the same dtype
                 k = k.to(working_dtype)
                 v = v.to(working_dtype)
@@ -163,6 +189,9 @@ class CausalSelfAttention(nn.Module):
             if hasattr(self, '_cached_k') and hasattr(self, '_cached_v'):
                 k = torch.cat([self._cached_k, k], dim=2)  # dim=2 car Flash Attention utilise [B, H, T, D]
                 v = torch.cat([self._cached_v, v], dim=2)
+                if self.attention_window is not None and k.size(-2) > self.attention_window:
+                    k = k[:, :, -self.attention_window:, :]
+                    v = v[:, :, -self.attention_window:, :]
                 self._cached_k = k
                 self._cached_v = v
             
@@ -191,6 +220,9 @@ class CausalSelfAttention(nn.Module):
             if hasattr(self, '_cached_k') and hasattr(self, '_cached_v'):
                 k = torch.cat([self._cached_k, k], dim=2)
                 v = torch.cat([self._cached_v, v], dim=2)
+                if self.attention_window is not None and k.size(-2) > self.attention_window:
+                    k = k[:, :, -self.attention_window:, :]
+                    v = v[:, :, -self.attention_window:, :]
                 self._cached_k = k
                 self._cached_v = v
             
@@ -214,6 +246,9 @@ class CausalSelfAttention(nn.Module):
         if hasattr(self, '_cached_k') and hasattr(self, '_cached_v'):
             k = torch.cat([self._cached_k, k], dim=2)
             v = torch.cat([self._cached_v, v], dim=2)
+            if self.attention_window is not None and k.size(-2) > self.attention_window:
+                k = k[:, :, -self.attention_window:, :]
+                v = v[:, :, -self.attention_window:, :]
             self._cached_k = k
             self._cached_v = v
         
@@ -244,8 +279,57 @@ class CausalSelfAttention(nn.Module):
         out = torch.empty(att.shape[:-2] + (att.shape[-2], v.shape[-1]), 
                          dtype=q.dtype, device=q.device)
         out = torch.bmm(att, v)
-        
+
         return out
+
+    def _build_sliding_mask(self, T: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        window = self.attention_window
+        if window is None:
+            return torch.zeros((T, T), device=device, dtype=dtype)
+
+        compiling = False
+        try:
+            import torch._dynamo as _dynamo  # type: ignore
+            compiling = bool(getattr(_dynamo, 'is_compiling', lambda: False)())
+        except Exception:
+            compiling = False
+
+        cache = self._sliding_mask_cache if not compiling else None
+        cache_key = (T, str(device), str(dtype))
+        if cache is not None and cache.get('key') == cache_key:
+            return cache['mask']
+
+        positions = torch.arange(T, device=device)
+        diff = positions.unsqueeze(1) - positions.unsqueeze(0)
+        mask = torch.zeros((T, T), device=device, dtype=dtype)
+        mask = mask.masked_fill(diff > window, float('-inf'))
+        if not compiling:
+            self._sliding_mask_cache = {'key': cache_key, 'mask': mask}
+        return mask
+
+    def _get_causal_mask(self, base_mask: Optional[torch.Tensor], T: int, device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
+        if self.attention_window is None:
+            return None
+        sliding_mask = self._build_sliding_mask(T, device, dtype)
+        if base_mask is None:
+            base_mask = torch.zeros((T, T), device=device, dtype=dtype)
+        return base_mask + sliding_mask
+
+    def _compute_logit_scale(self, T: int, device: torch.device, dtype: torch.dtype) -> Optional[torch.Tensor]:
+        if self.scale_base is None or self._scale_log_denom is None:
+            return None
+        if not self.scale_in_training and self.training:
+            return None
+        positions = torch.arange(T, device=device, dtype=torch.float32)
+        positions = positions + float(self.scale_offset)
+        window = float(self.scale_window)
+        window_idx = torch.div(positions, window, rounding_mode='floor')
+        scale = torch.log(self.scale_base + window_idx) / self._scale_log_denom
+        if self.scale_min is not None:
+            scale = torch.clamp(scale, min=float(self.scale_min))
+        if self.scale_max is not None:
+            scale = torch.clamp(scale, max=float(self.scale_max))
+        return scale.to(dtype)
 
     def forward(self, x, key_value=None, is_generation=False):
         B, T, C = x.size()
@@ -276,8 +360,9 @@ class CausalSelfAttention(nn.Module):
                 v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
                 
                 # Apply RoPE to queries and keys
-                q = self.rope(q)
-                k = self.rope(k)
+                if self.rope is not None:
+                    q = self.rope(q)
+                    k = self.rope(k)
                 
             else:
                 # Self-attention
@@ -302,16 +387,26 @@ class CausalSelfAttention(nn.Module):
                     v = v.repeat_interleave(self.n_head // self.n_head_kv, dim=1)
                 
                 # Apply RoPE to queries and keys
-                q = self.rope(q)
-                k = self.rope(k)
+                if self.rope is not None:
+                    q = self.rope(q)
+                    k = self.rope(k)
 
             # Déterminer si nous sommes en mode causal et préparer le masque
+            if key_value is None:
+                scale = self._compute_logit_scale(T, q.device, q.dtype)
+                if scale is not None:
+                    q = q * scale.view(1, 1, T, 1)
+
             is_causal = key_value is None  # Causal seulement pour self-attention
-            attn_mask = self.mask[:T, :T] if is_causal else None
+            base_mask = None
+            if is_causal:
+                base_mask = self.mask[:T, :T].to(device=q.device, dtype=working_dtype)
+            attn_mask = self._get_causal_mask(base_mask, T, q.device, working_dtype) if is_causal else None
+            mask_for_standard = attn_mask if attn_mask is not None else base_mask
             
             y = None
             # During generation or cross-attention, use SDPA instead of Flash Attention
-            if is_generation or key_value is not None:
+            if attn_mask is not None or is_generation or key_value is not None:
                 y = self._sdpa_attention(q, k, v, attn_mask, is_causal)
             else:
                 # Try Flash Attention first
@@ -333,8 +428,8 @@ class CausalSelfAttention(nn.Module):
                 att = torch.clamp(att, min=-1e4, max=1e4)
                 
                 # Appliquer le masque causal si nécessaire
-                if is_causal and attn_mask is not None:
-                    att = att + attn_mask
+                if is_causal and mask_for_standard is not None:
+                    att = att + mask_for_standard
                 
                 # Utiliser float32 pour le softmax pour plus de stabilité
                 att = F.softmax(att.float(), dim=-1).to(working_dtype)

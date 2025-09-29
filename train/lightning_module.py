@@ -8,6 +8,7 @@ import time
 import traceback
 import random
 import csv
+import shutil
 from datetime import datetime
 import wandb
 
@@ -163,6 +164,7 @@ class LLMLightningModule(pl.LightningModule):
     def _init_wandb(self):
         """Initialize wandb logging with project configuration."""
         try:
+            wandb.login(key=os.getenv('WANDB_API_KEY'))
             # Create wandb config from args
             wandb_config = {
                 'model_type': self.args.model_type,
@@ -248,6 +250,14 @@ class LLMLightningModule(pl.LightningModule):
         elif model_type == 'hse':
             config = self._create_hse_config()
             model = self._create_hse_model(config)
+        elif model_type == 'swan':
+            config = self._create_swan_config()
+            from models.models.swan_model import SWANModel
+            model = SWANModel(config)
+        elif model_type == 'swa_mla':
+            config = self._create_swa_mla_config()
+            from models.models.swa_mla_model import SWAMLAModel
+            model = SWAMLAModel(config)
         elif model_type == 'hrm':
             config = self._create_hrm_config()
             model = self._create_hrm_model(config)
@@ -1038,6 +1048,158 @@ class LLMLightningModule(pl.LightningModule):
     def _create_hse_model(self, config):
         """Create HSE model instance."""
         return HSEModel(config)
+
+    def _create_swan_config(self):
+        from models.models.swan_model import SWANConfig
+
+        size_defaults = {
+            'small': dict(n_layer=16, n_embd=1024, n_head=16),
+            'medium': dict(n_layer=24, n_embd=1536, n_head=16),
+            'large': dict(n_layer=28, n_embd=2048, n_head=24),
+            'xl': dict(n_layer=32, n_embd=4096, n_head=32),
+        }
+        size_key = getattr(self.args, 'size', 'medium')
+        size_config = size_defaults.get(size_key, size_defaults['medium'])
+
+        n_layer = getattr(self.args, 'n_layer', None)
+        if n_layer is None:
+            n_layer = size_config['n_layer']
+        n_head = getattr(self.args, 'n_head', None)
+        if n_head is None:
+            n_head = size_config['n_head']
+        n_embd = getattr(self.args, 'n_embd', None)
+        if n_embd is None:
+            n_embd = size_config['n_embd']
+
+        global_layers = getattr(self.args, 'global_layers_per_cycle', None)
+        if global_layers is None:
+            global_layers = 1
+        local_layers = getattr(self.args, 'local_layers_per_cycle', None)
+        if local_layers is None:
+            local_layers = 3
+        swa_window = getattr(self.args, 'swa_window', None)
+        if swa_window is None:
+            swa_window = 512
+
+        logit_scale_base = getattr(self.args, 'logit_scale_base', None)
+        if logit_scale_base is None:
+            logit_scale_base = 128.0
+        logit_scale_window = getattr(self.args, 'logit_scale_window', None)
+        if logit_scale_window is None:
+            logit_scale_window = 128
+        logit_scale_offset = getattr(self.args, 'logit_scale_offset', None)
+        if logit_scale_offset is None:
+            logit_scale_offset = 0
+        logit_scale_min = getattr(self.args, 'logit_scale_min', None)
+        if logit_scale_min is None:
+            logit_scale_min = 1.0
+        logit_scale_max = getattr(self.args, 'logit_scale_max', None)
+
+        config = SWANConfig(
+            vocab_size=self.args.vocab_size,
+            block_size=self.args.block_size,
+            n_layer=n_layer,
+            n_head=n_head,
+            n_embd=n_embd,
+            dropout=self.args.dropout,
+            bias=self.args.bias,
+            ratio_kv=getattr(self.args, 'ratio_kv', 1),
+            attention_backend=getattr(self.args, 'attention_backend', None),
+            use_gradient_checkpointing=getattr(self.args, 'use_gradient_checkpointing', getattr(self.args, 'gradient_checkpointing', True)),
+            global_layers_per_cycle=global_layers,
+            local_layers_per_cycle=local_layers,
+            swa_window=swa_window,
+            rope_theta=getattr(self.args, 'rope_theta', 10000.0),
+            logit_scale_base=logit_scale_base,
+            logit_scale_window=logit_scale_window,
+            logit_scale_offset=logit_scale_offset,
+            logit_scale_min=logit_scale_min,
+            logit_scale_max=logit_scale_max,
+            apply_logit_scale_during_training=getattr(self.args, 'apply_logit_scale_during_training', False),
+            label_smoothing=getattr(self.args, 'label_smoothing', 0.0),
+        )
+
+        return config
+
+    def _create_swa_mla_config(self):
+        from models.models.swa_mla_model import SWAMLAConfig
+
+        size_defaults = {
+            'small': dict(n_layer=12, n_embd=1024, n_head=16),
+            'medium': dict(n_layer=24, n_embd=1536, n_head=16),
+            'large': dict(n_layer=28, n_embd=2048, n_head=24),
+            'xl': dict(n_layer=32, n_embd=4096, n_head=32),
+        }
+        size_key = getattr(self.args, 'size', 'medium')
+        size_config = size_defaults.get(size_key, size_defaults['medium'])
+
+        n_layer = getattr(self.args, 'n_layer', None) or size_config['n_layer']
+        n_head = getattr(self.args, 'n_head', None) or size_config['n_head']
+        n_embd = getattr(self.args, 'n_embd', None) or size_config['n_embd']
+
+        swa_layers = getattr(self.args, 'swa_layers_per_cycle', None)
+        if swa_layers is None:
+            swa_layers = getattr(self.args, 'local_layers_per_cycle', 2)
+        mla_layers = getattr(self.args, 'mla_layers_per_cycle', None)
+        if mla_layers is None:
+            mla_layers = getattr(self.args, 'global_layers_per_cycle', 1)
+
+        logit_scale_base = getattr(self.args, 'logit_scale_base', None)
+        logit_scale_window = getattr(self.args, 'logit_scale_window', None)
+        if logit_scale_window is None:
+            logit_scale_window = 128
+        logit_scale_offset = getattr(self.args, 'logit_scale_offset', None)
+        if logit_scale_offset is None:
+            logit_scale_offset = 0
+        logit_scale_min = getattr(self.args, 'logit_scale_min', None)
+        if logit_scale_min is None:
+            logit_scale_min = 1.0
+        logit_scale_max = getattr(self.args, 'logit_scale_max', None)
+
+        config = SWAMLAConfig(
+            vocab_size=self.args.vocab_size,
+            block_size=self.args.block_size,
+            n_layer=n_layer,
+            n_head=n_head,
+            n_embd=n_embd,
+            dropout=self.args.dropout,
+            bias=self.args.bias,
+            ratio_kv=getattr(self.args, 'ratio_kv', 1),
+            attention_backend=getattr(self.args, 'attention_backend', None),
+            use_gradient_checkpointing=getattr(self.args, 'use_gradient_checkpointing', getattr(self.args, 'gradient_checkpointing', True)),
+            use_dyt=getattr(self.args, 'use_dyt', False),
+            dyt_alpha_init=getattr(self.args, 'dyt_alpha_init', 0.5),
+            swa_layers_per_cycle=swa_layers,
+            mla_layers_per_cycle=mla_layers,
+            swa_window=getattr(self.args, 'swa_window', 256),
+            rope_theta=getattr(self.args, 'rope_theta', 10000.0),
+            logit_scale_base=logit_scale_base,
+            logit_scale_window=logit_scale_window,
+            logit_scale_offset=logit_scale_offset,
+            logit_scale_min=logit_scale_min,
+            logit_scale_max=logit_scale_max,
+            apply_logit_scale_during_training=getattr(self.args, 'apply_logit_scale_during_training', False),
+            q_lora_rank=getattr(self.args, 'mla_q_lora_rank', 0),
+            kv_lora_rank=getattr(self.args, 'mla_kv_lora_rank', 512),
+            qk_nope_head_dim=getattr(self.args, 'mla_qk_nope_head_dim', 128),
+            qk_rope_head_dim=getattr(self.args, 'mla_qk_rope_head_dim', 64),
+            v_head_dim=getattr(self.args, 'mla_v_head_dim', 128),
+            attn_impl=getattr(self.args, 'mla_attn_impl', 'absorb'),
+            world_size=getattr(self.args, 'devices', 1) if isinstance(getattr(self.args, 'devices', -1), int) else 1,
+            rope_scaling=getattr(self.args, 'mla_rope_scaling', None),
+            rope_factor=getattr(self.args, 'mla_rope_factor', 1.0),
+            mscale=getattr(self.args, 'mla_mscale', 1.0),
+            use_fp8=getattr(self.args, 'use_fp8', False),
+            fp8_mla_params=getattr(self.args, 'fp8_mla_params', False),
+            fp8_tile_size=getattr(self.args, 'fp8_tile_size', 128),
+            label_smoothing=getattr(self.args, 'label_smoothing', 0.0),
+        )
+
+        rope_scaling = getattr(self.args, 'mla_rope_scaling', None)
+        if rope_scaling is not None and isinstance(rope_scaling, dict):
+            config.rope_scaling = rope_scaling
+
+        return config
     
     # --- End Config Creation Methods ---
 
@@ -1626,6 +1788,9 @@ class LLMLightningModule(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         t0 = time.time()
         input_ids, targets = self._unpack_batch(batch)
+        loss = None
+        router_loss = None
+        logits = None
 
         # --- Simplified Forward Pass ---
         try:
@@ -1757,7 +1922,7 @@ class LLMLightningModule(pl.LightningModule):
         # Calculate average sequence length from the same mask
         avg_seq_len = non_pad_tokens_mask.sum(dim=1).float().mean().item()
         self.log('train/avg_seq_len', avg_seq_len, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True)
-        
+
         # CSV Logging
         self._buffer_metrics_for_csv(loss_value, grad_norm, current_tokens_per_sec, avg_seq_len)
         
@@ -1989,6 +2154,36 @@ class LLMLightningModule(pl.LightningModule):
         pass
 
 
+    def on_save_checkpoint(self, checkpoint):
+        """Persist running token counters for resume."""
+        try:
+            checkpoint['total_tokens'] = float(self.total_tokens)
+            checkpoint['tokens_window_buffer'] = [
+                (float(ts), float(tok)) for ts, tok in self.tokens_window
+            ]
+        except Exception as exc:
+            print(f"Warning: failed to record token counters in checkpoint: {exc}")
+
+
+    def on_load_checkpoint(self, checkpoint):
+        """Restore token counters when resuming from checkpoint."""
+        total_tokens = checkpoint.get('total_tokens')
+        if total_tokens is not None:
+            try:
+                self.total_tokens = float(total_tokens)
+            except (TypeError, ValueError):
+                print(f"Warning: invalid total_tokens value in checkpoint: {total_tokens}")
+
+        tokens_window = checkpoint.get('tokens_window_buffer')
+        if tokens_window is not None:
+            try:
+                self.tokens_window = [
+                    (float(ts), float(tok)) for ts, tok in tokens_window
+                ]
+            except Exception as exc:
+                print(f"Warning: failed to restore tokens_window from checkpoint: {exc}")
+
+
     def generate_sample_text(self):
         """Generates sample text using the current model."""
         print("\n--- Generating Sample Text ---")
@@ -2097,33 +2292,88 @@ class LLMLightningModule(pl.LightningModule):
         # Create base filename
         base_filename = f"{model_type}_{size}_{batch_size}_{block_size}_{precision}_{compile_str}_{optimizer_str}_{dataset_str}"
         
-        # Create directory for logs if it doesn't exist
-        log_dir = os.path.join(getattr(self.args, 'out_dir', 'out'), 'metrics_logs')
+        # Ensure we always log under outputs/metrics_logs regardless of model output dir
+        default_metrics_dir = os.path.join('outputs', 'metrics_logs')
+        log_dir = getattr(self.args, 'metrics_log_dir', default_metrics_dir)
+        log_dir = os.path.abspath(log_dir)
         os.makedirs(log_dir, exist_ok=True)
-        
-        # Find a unique filename by adding timestamp and/or counter
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_filename = f"{base_filename}_{timestamp}.csv"
-        self.csv_file_path = os.path.join(log_dir, csv_filename)
-        
-        # If file exists, add a counter
-        counter = 1
-        while os.path.exists(self.csv_file_path):
-            csv_filename = f"{base_filename}_{timestamp}_{counter}.csv"
+
+        legacy_log_dir = None
+        output_root = getattr(self.args, 'output_dir', None) or getattr(self.args, 'out_dir', None)
+        if output_root:
+            legacy_log_dir = os.path.abspath(os.path.join(output_root, 'metrics_logs'))
+
+        resume_mode = getattr(self.args, 'init_from', 'scratch') == 'resume'
+        existing_file = None
+
+        if resume_mode:
+            search_dirs = [log_dir]
+            if legacy_log_dir and os.path.isdir(legacy_log_dir) and legacy_log_dir not in search_dirs:
+                search_dirs.append(legacy_log_dir)
+
+            for candidate_dir in search_dirs:
+                if not os.path.isdir(candidate_dir):
+                    continue
+
+                candidates = sorted(
+                    f for f in os.listdir(candidate_dir)
+                    if f.startswith(base_filename) and f.endswith('.csv')
+                )
+
+                if not candidates:
+                    continue
+
+                candidate_path = os.path.join(candidate_dir, candidates[-1])
+
+                if candidate_dir != log_dir:
+                    target_path = os.path.join(log_dir, os.path.basename(candidate_path))
+                    try:
+                        shutil.copy2(candidate_path, target_path)
+                        print(
+                            "Copied metrics log from legacy location to outputs/metrics_logs:"
+                            f" {candidate_path} -> {target_path}"
+                        )
+                        existing_file = target_path
+                    except IOError as e:
+                        print(f"Failed to copy legacy metrics log {candidate_path}: {e}")
+                        existing_file = None
+                else:
+                    existing_file = candidate_path
+
+                if existing_file:
+                    break
+
+        if existing_file:
+            self.csv_file_path = existing_file
+            try:
+                self.csv_file = open(self.csv_file_path, 'a', newline='')
+                self.csv_writer = csv.writer(self.csv_file)
+                print(f"CSV metrics logging resumed (appending): {self.csv_file_path}")
+            except IOError as e:
+                print(f"Error opening existing CSV for append: {e}")
+                self.csv_file = None
+                self.csv_writer = None
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            csv_filename = f"{base_filename}_{timestamp}.csv"
             self.csv_file_path = os.path.join(log_dir, csv_filename)
-            counter += 1
-        
-        # Open CSV file and write headers
-        try:
-            self.csv_file = open(self.csv_file_path, 'w', newline='')
-            self.csv_writer = csv.writer(self.csv_file)
-            self.csv_writer.writerow(['step', 'train_loss', 'val_loss', 'val_perplexity', 'learning_rate', 'tokens_per_sec', 'avg_seq_len', 'batch_size', 'block_size', 'total_tokens', 'grad_norm', 'timestamp'])
-            self.csv_file.flush()
-            print(f"CSV metrics logging initialized: {self.csv_file_path}")
-        except IOError as e:
-            print(f"Error initializing CSV logging: {e}")
-            self.csv_file = None
-            self.csv_writer = None
+
+            counter = 1
+            while os.path.exists(self.csv_file_path):
+                csv_filename = f"{base_filename}_{timestamp}_{counter}.csv"
+                self.csv_file_path = os.path.join(log_dir, csv_filename)
+                counter += 1
+
+            try:
+                self.csv_file = open(self.csv_file_path, 'w', newline='')
+                self.csv_writer = csv.writer(self.csv_file)
+                self.csv_writer.writerow(['step', 'train_loss', 'val_loss', 'val_perplexity', 'learning_rate', 'tokens_per_sec', 'avg_seq_len', 'batch_size', 'block_size', 'total_tokens', 'grad_norm', 'timestamp'])
+                self.csv_file.flush()
+                print(f"CSV metrics logging initialized: {self.csv_file_path}")
+            except IOError as e:
+                print(f"Error initializing CSV logging: {e}")
+                self.csv_file = None
+                self.csv_writer = None
 
     def _buffer_metrics_for_csv(self, loss, grad_norm, tps, avg_seq_len):
         """Helper to buffer metrics for CSV logging."""

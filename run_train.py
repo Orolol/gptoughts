@@ -40,12 +40,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train LLM models with PyTorch Lightning')
 
     # Model Parameters
-    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'sedd', 'gpt', 'mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'mdm', 'moe_mla', 'slm', 'nsa', 'hrm', 'hse'], default='gpt', help='Type of model to train')
+    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'sedd', 'gpt', 'mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'mdm', 'moe_mla', 'slm', 'nsa', 'hrm', 'hse', 'swan', 'swa_mla'], default='gpt', help='Type of model to train')
     parser.add_argument('--size', type=str, choices=['small', 'medium', 'large', 'xl'], default='small', help='Size of the model')
     parser.add_argument('--use_lightning', action='store_true', default=True, help='Use PyTorch Lightning for training')
 
     # IO Parameters
-    parser.add_argument('--output_dir', type=str, default='out_lightning', help='Output directory for checkpoints and logs')
+    parser.add_argument('--output_dir', type=str, default='ouputs/out_lightning', help='Output directory for checkpoints and logs')
     parser.add_argument('--init_from', type=str, default='scratch', choices=['scratch', 'resume'], help='Initialize from scratch or resume training')
     parser.add_argument('--resume_ckpt_path', type=str, default=None, help='Specific checkpoint path to resume from (overrides searching in output_dir)')
     parser.add_argument('--keep_checkpoints', type=int, default=3, help='Number of checkpoints to keep (-1 for all, 0 to disable checkpointing)')
@@ -107,6 +107,28 @@ def parse_args():
     parser.add_argument('--qap_per_expert', type=int, default=6, help='QAP budget per expert per step')
     parser.add_argument('--qap_max_queries', type=int, default=20, help='Max QAP queries per step')
     parser.add_argument('--ratio_kv', type=int, default=8, help='KV head ratio for GQA in standard attention')
+    # SWAN architecture overrides
+    parser.add_argument('--n_layer', type=int, default=None, help='Override number of transformer layers for SWAN models')
+    parser.add_argument('--n_head', type=int, default=None, help='Override number of attention heads for SWAN models')
+    parser.add_argument('--n_embd', type=int, default=None, help='Override embedding dimension for SWAN models')
+    parser.add_argument('--global_layers_per_cycle', type=int, default=None, help='Number of global NoPE layers per SWAN cycle')
+    parser.add_argument('--local_layers_per_cycle', type=int, default=None, help='Number of SWA-RoPE layers per SWAN cycle')
+    parser.add_argument('--swa_window', type=int, default=None, help='Sliding window size for SWA-RoPE layers in SWAN')
+    parser.add_argument('--logit_scale_base', type=float, default=None, help='Base parameter a for SWAN logit scaling log_a(a+n)')
+    parser.add_argument('--logit_scale_window', type=int, default=None, help='Token window granularity for SWAN logit scaling')
+    parser.add_argument('--logit_scale_offset', type=int, default=None, help='Offset applied before SWAN logit scaling windowing')
+    parser.add_argument('--logit_scale_min', type=float, default=None, help='Minimum SWAN logit scaling factor')
+    parser.add_argument('--logit_scale_max', type=float, default=None, help='Maximum SWAN logit scaling factor')
+    parser.add_argument('--swa_layers_per_cycle', type=int, default=None, help='Number of SWA layers per cycle for SWA+MLA hybrid')
+    parser.add_argument('--mla_layers_per_cycle', type=int, default=None, help='Number of MLA layers per cycle for SWA+MLA hybrid')
+    parser.add_argument('--mla_q_lora_rank', type=int, default=0, help='Q projection LoRA rank for MLA blocks')
+    parser.add_argument('--mla_kv_lora_rank', type=int, default=512, help='KV projection LoRA rank for MLA blocks')
+    parser.add_argument('--mla_qk_nope_head_dim', type=int, default=128, help='NoPE head dim for MLA blocks')
+    parser.add_argument('--mla_qk_rope_head_dim', type=int, default=64, help='RoPE head dim for MLA blocks')
+    parser.add_argument('--mla_v_head_dim', type=int, default=128, help='Value head dim for MLA blocks')
+    parser.add_argument('--mla_attn_impl', type=str, default='absorb', help='Attention implementation for MLA blocks')
+    parser.add_argument('--mla_rope_factor', type=float, default=1.0, help='RoPE factor for MLA scaling')
+    parser.add_argument('--mla_mscale', type=float, default=1.0, help='MSCALE factor for MLA extended contexts')
 
     # BD3-LM Specific Args (passed to LightningModule)
     parser.add_argument('--use_bd3_training', action='store_true', help='Enable BD3-LM vectorized training path for LLaDA model')
