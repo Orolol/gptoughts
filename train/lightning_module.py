@@ -117,12 +117,13 @@ class LLMLightningModule(pl.LightningModule):
             if self.args.model_type.lower() in skip_compile_models:
                 print(f"Skipping model compilation for {self.args.model_type} model (torch.compile compatibility issues with gradient checkpointing)")
             else:
+                disabled_ckpt = self._disable_gradient_checkpointing_for_compile()
+                if disabled_ckpt:
+                    print(f"Disabled gradient checkpointing for {disabled_ckpt} modules prior to torch.compile")
                 # For MLA-selective model, disable gradient checkpointing before compilation
                 if self.args.model_type.lower() == 'mla_selective':
                     print("Disabling gradient checkpointing for MLA-selective model compilation...")
-                    for module in self.model.modules():
-                        if hasattr(module, 'use_checkpoint'):
-                            module.use_checkpoint = False
+                    # Already handled in _disable_gradient_checkpointing_for_compile, keep message for clarity
                 
                 print("Compiling model with torch.compile...")
                 try:
@@ -160,6 +161,33 @@ class LLMLightningModule(pl.LightningModule):
                 wandb.watch(self.model, log=None, log_freq=100)
             except Exception as e:
                 print(f"Warning: Failed to watch model with wandb: {e}")
+
+    def _disable_gradient_checkpointing_for_compile(self):
+        """Disable checkpointing hooks that are incompatible with torch.compile."""
+        disabled = 0
+        if not hasattr(self, 'model'):
+            return disabled
+
+        for module in self.model.modules():
+            if hasattr(module, 'use_checkpoint') and getattr(module, 'use_checkpoint', False):
+                module.use_checkpoint = False
+                disabled += 1
+            if hasattr(module, 'gradient_checkpointing') and getattr(module, 'gradient_checkpointing', False):
+                try:
+                    module.gradient_checkpointing = False
+                except Exception:
+                    pass
+            if hasattr(module, 'gradient_checkpointing_enable') and callable(module.gradient_checkpointing_enable):
+                try:
+                    module.gradient_checkpointing_enable(False)
+                except Exception:
+                    pass
+
+        for attr in ('use_gradient_checkpointing', 'gradient_checkpointing'):
+            if hasattr(self.args, attr):
+                setattr(self.args, attr, False)
+
+        return disabled
 
     def _init_wandb(self):
         """Initialize wandb logging with project configuration."""
