@@ -2,7 +2,6 @@
 torch
 numpy
 transformers
-xformers
 
 # Training utilities
 wandb
