@@ -9,6 +9,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
+    from torch.utils.checkpoint import _StopRecomputationError as _CheckpointStop
+except ImportError:  # pragma: no cover - older torch versions export it elsewhere
+    _CheckpointStop = None
+
+try:
     from flash_attn import flash_attn_func as flash_attn_func_2
     FLASH_ATTENTION_AVAILABLE = True
 except ImportError as e:
@@ -449,6 +454,9 @@ class CausalSelfAttention(nn.Module):
             return output
             
         except Exception as e:
+            if _CheckpointStop is not None and isinstance(e, _CheckpointStop):
+                # Allow gradient-checkpointing internals to propagate without noisy logging.
+                raise
             print(f"Attention computation failed: {e}")
             print(traceback.format_exc())
             raise  # Re-raise the exception after printing the traceback 
