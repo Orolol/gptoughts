@@ -1052,12 +1052,16 @@ class LLMLightningModule(pl.LightningModule):
 
     def configure_optimizers(self):
         """Sets up the optimizer and learning rate scheduler."""
+        # Force foreach=False in DDP to prevent memory imbalance
+        # foreach=True can cause different memory allocation patterns per rank
+        force_foreach_false = self.trainer.world_size > 1 if hasattr(self, 'trainer') else False
+
         # Check if we should use FP8-optimized optimizer
         use_fp8_optimizer = (
-            getattr(self.args, 'use_fp8', False) and 
+            getattr(self.args, 'use_fp8', False) and
             getattr(self.args, 'optimizer_type', 'adamw') == 'adamw'
         )
-        
+
         if use_fp8_optimizer:
             # Use FP8AdamW with low-precision moments
             print("Using FP8AdamW optimizer with BF16 moments")
@@ -1115,6 +1119,9 @@ class LLMLightningModule(pl.LightningModule):
                     optimizer_kwargs['galore_quantize_proj'] = getattr(self.args, 'galore_quantize_proj', None)
             
             # For models with configure_optimizers method, use it
+            # Pass force_foreach_false to prevent DDP memory imbalance
+            optimizer_kwargs['force_foreach_false'] = force_foreach_false
+
             optimizer = self.model.configure_optimizers(
                 weight_decay=self.args.weight_decay,
                 learning_rate=self.args.learning_rate,
@@ -1126,16 +1133,18 @@ class LLMLightningModule(pl.LightningModule):
             print(f"Using optimizer configured by model: {type(optimizer).__name__}")
         else:
             # Fallback to default AdamW for models without configure_optimizers
-            print(f"Using default AdamW optimizer")
+            print(f"Using default AdamW optimizer (foreach={not force_foreach_false})")
             try:
                 optimizer = AdamW(
                     self.model.parameters(),
                     lr=self.args.learning_rate,
                     weight_decay=self.args.weight_decay,
                     betas=(self.args.beta1, self.args.beta2),
-                    fused=False
+                    fused=False,
+                    foreach=not force_foreach_false  # Disable foreach in DDP
                 )
             except TypeError:
+                # Older PyTorch versions don't have foreach parameter
                 optimizer = AdamW(
                     self.model.parameters(),
                     lr=self.args.learning_rate,

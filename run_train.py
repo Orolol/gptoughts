@@ -75,7 +75,7 @@ def parse_args():
 
     # Training Parameters (for Lightning Trainer)
     parser.add_argument('--max_iters', type=int, default=100000, help='Maximum training iterations (steps)')
-    parser.add_argument('--grad_clip', type=float, default=1.0, help='Gradient clipping value (0 for no clipping)')
+    parser.add_argument('--grad_clip', type=float, default=0.0, help='Gradient clipping value (0 for no clipping)')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='Gradient accumulation steps')
     parser.add_argument('--eval_interval_steps', type=int, default=10000, help='Validation interval in steps')
     parser.add_argument('--log_interval_steps', type=int, default=1, help='Logging interval in steps')

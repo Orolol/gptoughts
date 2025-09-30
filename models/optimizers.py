@@ -127,7 +127,8 @@ def configure_optimizer_for_gpt(
     optimizer_type: str = "adamw",
     apollo_config: Optional[Dict[str, Any]] = None,
     galore_config: Optional[Dict[str, Any]] = None,
-    galore_quantize_proj: Optional[int] = None
+    galore_quantize_proj: Optional[int] = None,
+    force_foreach_false: bool = False
 ) -> torch.optim.Optimizer:
     """
     Configure optimizer for GPT-style models.
@@ -253,19 +254,40 @@ def configure_optimizer_for_gpt(
     # Default to AdamW
     # Create optimizer based on device type
     if device_type == 'cuda':
-        optimizer = torch.optim.AdamW(
-            optimizer_groups,
-            lr=learning_rate,
-            betas=betas,
-            fused=True  # Use fused implementation for better performance
-        )
+        try:
+            optimizer = torch.optim.AdamW(
+                optimizer_groups,
+                lr=learning_rate,
+                betas=betas,
+                fused=True,  # Use fused implementation for better performance
+                foreach=not force_foreach_false  # Disable foreach in DDP
+            )
+            print(f"Using fused AdamW for GPT model (foreach={not force_foreach_false})")
+        except TypeError:
+            # Older PyTorch without foreach parameter
+            optimizer = torch.optim.AdamW(
+                optimizer_groups,
+                lr=learning_rate,
+                betas=betas,
+                fused=True
+            )
+            print("Using fused AdamW for GPT model")
     else:
-        optimizer = torch.optim.AdamW(
-            optimizer_groups,
-            lr=learning_rate,
-            betas=betas
-        )
-    
+        try:
+            optimizer = torch.optim.AdamW(
+                optimizer_groups,
+                lr=learning_rate,
+                betas=betas,
+                foreach=not force_foreach_false
+            )
+        except TypeError:
+            optimizer = torch.optim.AdamW(
+                optimizer_groups,
+                lr=learning_rate,
+                betas=betas
+            )
+        print("Using standard AdamW for GPT model (CPU)")
+
     return optimizer
 
 def configure_optimizer_for_moe(
