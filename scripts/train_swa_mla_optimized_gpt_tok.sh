@@ -12,7 +12,7 @@ OUTPUT_DIR="$OUTPUT_ROOT/$OUTPUT_NAME"
 mkdir -p "$OUTPUT_DIR"
 RESUME=${5:-false}
 OPTIMIZER=${6:-adamw}  # Default to adamw for better DDP compatibility
-STRATEGY=${7:-fsdp}  # Use FSDP by default to avoid DDP memory imbalance
+STRATEGY=${7:-ddp_find_unused_parameters_false}  # Use optimized DDP (FSDP not compatible with SWA-MLA)
 
 echo "Training SWA+MLA hybrid model..."
 echo "Model size: $MODEL_SIZE"
@@ -85,9 +85,10 @@ python run_train.py \
 # --mla_selection_head_idx 0 \
 
 # Usage examples:
-# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out_swa_mla false adamw fsdp  # FSDP strategy (default, best for multi-GPU)
-# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out_swa_mla false adamw ddp_find_unused_parameters_false  # DDP strategy
-# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out_swa_mla false lion fsdp   # Lion optimizer with FSDP
-# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out_swa_mla true adamw fsdp   # Resume training
+# ./train_swa_mla_optimized_gpt_tok.sh small 16 2048                                 # Default: AdamW + DDP optimized
+# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out false adamw               # Explicit optimizer
+# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out false lion                # Lion optimizer
+# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out true                      # Resume training
+# Note: FSDP is not compatible with SWA-MLA due to heterogeneous block signatures
 
 exit 0
