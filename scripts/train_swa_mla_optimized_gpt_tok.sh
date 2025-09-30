@@ -11,6 +11,7 @@ OUTPUT_NAME="$OUTPUT_DIR"
 OUTPUT_DIR="$OUTPUT_ROOT/$OUTPUT_NAME"
 mkdir -p "$OUTPUT_DIR"
 RESUME=${5:-false}
+OPTIMIZER=${6:-adamw}  # Default to adamw for better DDP compatibility
 
 echo "Training SWA+MLA hybrid model..."
 echo "Model size: $MODEL_SIZE"
@@ -18,9 +19,11 @@ echo "Batch size: $BATCH_SIZE"
 echo "Block size: $BLOCK_SIZE"
 echo "Output dir: $OUTPUT_DIR"
 echo "Resume: $RESUME"
+echo "Optimizer: $OPTIMIZER"
 echo ""
 echo "Multi-GPU optimizations active:"
-echo "  - broadcast_buffers=False (prevents buffer duplication on rank 1)"
+echo "  - Model initialized on CPU to prevent rank 1 duplication"
+echo "  - broadcast_buffers=False (prevents buffer duplication)"
 echo "  - gradient_as_bucket_view=True (memory optimization)"
 echo "  - static_graph=True (performance optimization)"
 echo ""
@@ -44,7 +47,7 @@ python run_train.py \
     --tokenizer_name "openai-community/gpt2" \
     --grad_clip 1.0 \
     --learning_rate 6e-5 \
-    --optimizer_type lion \
+    --optimizer_type $OPTIMIZER \
     --weight_decay 0.1 \
     --warmup_iters 400 \
     --max_iters 10000000 \
@@ -71,5 +74,10 @@ python run_train.py \
 # To use MLA Selective instead of standard MLA, add these flags:
 # --use_mla_selective \
 # --mla_selection_head_idx 0 \
+
+# Usage examples:
+# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out_swa_mla false adamw  # AdamW optimizer (default)
+# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out_swa_mla false lion   # Lion optimizer
+# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out_swa_mla true         # Resume training
 
 exit 0

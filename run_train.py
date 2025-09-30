@@ -90,7 +90,8 @@ def parse_args():
     parser.add_argument('--fp8_tile_size', type=int, default=128, help='Tile size for FP8 quantization (default: 128)')
 
     # Distributed Parameters (for Lightning Trainer)
-    parser.add_argument('--strategy', type=str, default='ddp_find_unused_parameters_false', help='Distributed strategy (e.g., ddp, ddp_find_unused_parameters_false, fsdp)')
+    parser.add_argument('--strategy', type=str, default='ddp_find_unused_parameters_false',
+                       help='Distributed strategy (e.g., ddp, ddp_find_unused_parameters_false, fsdp). Use fsdp for better memory balance.')
     parser.add_argument('--devices', type=int, default=-1, help='Number of GPUs to use (-1 for all available)')
     parser.add_argument('--device', type=str, default=None, help='Device to use for training (e.g., cpu, cuda:0)')
     parser.add_argument('--sync_batchnorm', action='store_true', help='Convert all BatchNorm layers to SyncBatchNorm for multi-GPU')
@@ -317,14 +318,34 @@ def main():
     
         # Configure Trainer with multi-GPU optimizations
         from pytorch_lightning.strategies import DDPStrategy
+        try:
+            from pytorch_lightning.strategies import FSDPStrategy
+            fsdp_available = True
+        except ImportError:
+            fsdp_available = False
 
-        # Configure DDP strategy with optimizations for multi-GPU
+        # Configure strategy for multi-GPU
         if args.devices > 1:
+            if 'fsdp' in args.strategy.lower():
+                if not fsdp_available:
+                    print("WARNING: FSDP requested but not available. Falling back to DDP.")
+                    args.strategy = 'ddp_find_unused_parameters_false'
+                else:
+                    print(f"Configuring FSDPStrategy for better memory distribution...")
+                    print(f"  - FSDP shards model parameters across GPUs")
+                    print(f"  - This should eliminate VRAM imbalance between ranks")
+                    strategy = FSDPStrategy(
+                        auto_wrap_policy={torch.nn.Linear, torch.nn.Embedding},
+                        activation_checkpointing_policy=None,
+                        state_dict_type="full",
+                    )
+
             if 'ddp' in args.strategy.lower():
                 ddp_kwargs = {
                     'find_unused_parameters': False,  # Performance optimization
                     'gradient_as_bucket_view': True,  # Memory optimization
                     'static_graph': True,  # Faster for models with static computation graphs
+                    'broadcast_buffers': False,  # Prevent buffer duplication on rank 1
                 }
 
                 # Only add find_unused_parameters if explicitly requested
@@ -332,12 +353,13 @@ def main():
                     ddp_kwargs['find_unused_parameters'] = True
                     ddp_kwargs['static_graph'] = False
 
-                # CRITICAL: Force broadcast_buffers=False to prevent buffer duplication on rank 1
-                # This is the main cause of VRAM imbalance (rank 1 getting extra copies)
-                ddp_kwargs['broadcast_buffers'] = False
+                print(f"Configuring DDPStrategy with optimizations for memory balance...")
+                print(f"  - broadcast_buffers=False")
+                print(f"  - gradient_as_bucket_view=True")
+                print(f"  - static_graph={ddp_kwargs['static_graph']}")
 
                 strategy = DDPStrategy(**ddp_kwargs)
-            else:
+            elif 'fsdp' not in args.strategy.lower():
                 strategy = args.strategy
         else:
             strategy = "auto"

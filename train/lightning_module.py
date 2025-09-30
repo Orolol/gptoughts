@@ -69,10 +69,14 @@ class LLMLightningModule(pl.LightningModule):
         if self.load_checkpoint_path and self.original_block_size:
             self._load_and_adapt_checkpoint()
 
-        # CRITICAL: Move large buffers to CPU before DDP wrapping to avoid duplication
-        # This prevents rank 1 from having extra VRAM usage
-        if hasattr(self.model, 'freqs_cis'):
-            # Keep freqs_cis on CPU, will be moved to GPU during forward pass
+        # CRITICAL FIX: Force model to CPU before DDP wrapping
+        # This prevents rank 1 from having duplicated memory (~17GB extra)
+        # Lightning/DDP will properly move it to correct GPUs
+        print(f"Moving model to CPU before DDP wrapping to avoid VRAM imbalance...")
+        self.model = self.model.cpu()
+
+        # Also move large buffers to CPU
+        if hasattr(self.model, 'freqs_cis') and self.model.freqs_cis is not None:
             self.model.freqs_cis = self.model.freqs_cis.cpu()
             
         self.timing_stats = AveragedTimingStats(print_interval=1000)
@@ -958,6 +962,15 @@ class LLMLightningModule(pl.LightningModule):
             except Exception as e:
                 print(f"Warning: Failed to log to wandb: {e}")
 
+        # Memory diagnostic after first batch (to detect early imbalances)
+        if self.global_step == 1 and self.trainer.world_size > 1:
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"[Rank {self.global_rank}] VRAM after first training step:")
+                print(f"  - Allocated: {allocated:.2f}GB")
+                print(f"  - Reserved: {reserved:.2f}GB")
+
         # Periodic tasks
         if self.global_step > 0 and self.global_step % 1000 == 0:
             if self.global_rank == 0:
@@ -1466,14 +1479,26 @@ class LLMLightningModule(pl.LightningModule):
                  if torch.cuda.is_available():
                      torch.cuda.synchronize()
 
-                 # Diagnostic: Print VRAM usage per rank to detect imbalances
+                 # Diagnostic: Print detailed VRAM usage per rank to detect imbalances
                  if torch.cuda.is_available():
                      allocated = torch.cuda.memory_allocated() / 1024**3
                      reserved = torch.cuda.memory_reserved() / 1024**3
-                     print(f"[Rank {self.global_rank}] Initial VRAM: allocated={allocated:.2f}GB, reserved={reserved:.2f}GB")
+                     max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+                     print(f"[Rank {self.global_rank}] VRAM after setup:")
+                     print(f"  - Allocated: {allocated:.2f}GB")
+                     print(f"  - Reserved: {reserved:.2f}GB")
+                     print(f"  - Max allocated: {max_allocated:.2f}GB")
+
+                     # Count model parameters on this device
+                     model_params = sum(p.numel() * p.element_size() for p in self.model.parameters()) / 1024**3
+                     print(f"  - Model params size: {model_params:.2f}GB")
 
                  if self.global_rank == 0:
-                     print(f"Multi-GPU setup completed\n")
+                     print(f"\n=== Multi-GPU setup completed ===\n")
+
+                     # Give warning if VRAM imbalance detected (will be checked after first batch)
+                     print(f"Note: VRAM usage will be monitored for imbalances.")
+                     print(f"      If GPU 1 consistently has >5GB more than GPU 0, there's an issue.\n")
 
 
     def teardown(self, stage=None):
