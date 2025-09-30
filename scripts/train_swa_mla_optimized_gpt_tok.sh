@@ -34,8 +34,8 @@ python run_train.py \
     --precision bf16-mixed \
     --optimize_attention \
     --preallocate_memory \
-    --tokenizer_name "openai-community/gpt2" \
     --attention_backend sdpa \
+    --tokenizer_name "openai-community/gpt2" \
     --grad_clip 1.0 \
     --learning_rate 6e-5 \
     --optimizer_type lion \
@@ -49,11 +49,17 @@ python run_train.py \
     --swa_layers_per_cycle 2 \
     --mla_layers_per_cycle 1 \
     --swa_window 256 \
+    --swa_sink_size 4 \
     --mla_q_lora_rank 0 \
     --mla_kv_lora_rank 256 \
     --mla_qk_nope_head_dim 128 \
     --mla_qk_rope_head_dim 64 \
     --mla_v_head_dim 128 \
+    --compile \
     "${RESUME_ARGS[@]}"
+
+# To use MLA Selective instead of standard MLA, add these flags:
+# --use_mla_selective \
+# --mla_selection_head_idx 0 \
 
 exit 0

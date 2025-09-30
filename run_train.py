@@ -129,6 +129,9 @@ def parse_args():
     parser.add_argument('--mla_attn_impl', type=str, default='absorb', help='Attention implementation for MLA blocks')
     parser.add_argument('--mla_rope_factor', type=float, default=1.0, help='RoPE factor for MLA scaling')
     parser.add_argument('--mla_mscale', type=float, default=1.0, help='MSCALE factor for MLA extended contexts')
+    parser.add_argument('--use_mla_selective', action='store_true', help='Use MLA Selective instead of standard MLA in SWA-MLA hybrid')
+    parser.add_argument('--mla_selection_head_idx', type=int, default=0, help='Which attention head to use for selection in MLA Selective')
+    parser.add_argument('--swa_sink_size', type=int, default=4, help='Number of initial tokens for attention sink in SWA blocks')
 
     # BD3-LM Specific Args (passed to LightningModule)
     parser.add_argument('--use_bd3_training', action='store_true', help='Enable BD3-LM vectorized training path for LLaDA model')

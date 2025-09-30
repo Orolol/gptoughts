@@ -1,4 +1,4 @@
-"""Hybrid model interleaving Sliding-Window Attention (SWA) and MLA blocks."""
+"""Hybrid model interleaving Sliding-Window Attention (SWA) and MLA/MLA-Selective blocks."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from models.blocks.normalization import RMSNorm, DynamicTanh
 from models.blocks.attention import CausalSelfAttention
 from models.blocks.mlp import MLP
 from models.blocks.mla_block import MLABlock
+from models.blocks.mla_selective_fast import MLASelectiveFast as MLASelective
 from models.models.mla_model import (
     precompute_freqs_cis,
     precompute_freqs_cis_with_linear_scaling,
@@ -34,6 +35,7 @@ class SWALayerConfig:
     attention_backend: Optional[str]
     use_rope: bool
     attention_window: Optional[int]
+    attention_sink_size: int  # Number of initial tokens to always attend to
     rope_theta: float
     logit_scale_base: Optional[float]
     logit_scale_window: int
@@ -103,6 +105,7 @@ class SWAMLAConfig:
     swa_layers_per_cycle: int = 2
     mla_layers_per_cycle: int = 1
     swa_window: int = 256
+    swa_sink_size: int = 4  # Number of initial tokens to always attend to (attention sink)
     rope_theta: float = 10000.0
 
     logit_scale_base: Optional[float] = None
@@ -127,6 +130,10 @@ class SWAMLAConfig:
     fp8_mla_params: bool = False
     fp8_tile_size: int = 128
 
+    # MLA Selective specific parameters
+    use_mla_selective: bool = False  # Use MLA Selective instead of standard MLA
+    selection_head_idx: int = 0  # Which attention head to use for selection
+
     label_smoothing: float = 0.0
 
     def __post_init__(self) -> None:
@@ -136,8 +143,50 @@ class SWAMLAConfig:
             raise ValueError("At least one SWA or MLA layer per cycle is required")
 
 
+class MLASelectiveBlock(nn.Module):
+    """MLA Selective block with residual MLP."""
+
+    def __init__(self, config, layer_id: int):
+        super().__init__()
+        self.config = config
+        self.layer_id = layer_id
+
+        if config.use_dyt:
+            self.norm1 = DynamicTanh(config.n_embd, alpha_init=config.dyt_alpha_init)
+            self.norm2 = DynamicTanh(config.n_embd, alpha_init=config.dyt_alpha_init)
+        else:
+            self.norm1 = RMSNorm(config.n_embd)
+            self.norm2 = RMSNorm(config.n_embd)
+
+        self.attn = MLASelective(config)
+        self.mlp = MLP(config)
+        self.use_checkpoint = config.use_gradient_checkpointing
+
+    def _attn_block(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        return self.attn(self.norm1(x), start_pos, freqs_cis, mask)
+
+    def _mlp_block(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(self.norm2(x))
+
+    def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        use_checkpoint = self.use_checkpoint and self.training
+
+        if use_checkpoint:
+            attn_out = checkpoint.checkpoint(self._attn_block, x, start_pos, freqs_cis, mask, use_reentrant=False)
+        else:
+            attn_out = self._attn_block(x, start_pos, freqs_cis, mask)
+        x = x + attn_out
+
+        if use_checkpoint:
+            mlp_out = checkpoint.checkpoint(self._mlp_block, x, use_reentrant=False)
+        else:
+            mlp_out = self._mlp_block(x)
+        x = x + mlp_out
+        return x
+
+
 class SWAMLAModel(nn.Module):
-    """Model interleaving SWA layers with MLA blocks."""
+    """Model interleaving SWA layers with MLA Selective blocks."""
 
     def __init__(self, config: SWAMLAConfig):
         super().__init__()
@@ -196,6 +245,7 @@ class SWAMLAModel(nn.Module):
                     attention_backend=config.attention_backend,
                     use_rope=True,
                     attention_window=config.swa_window,
+                    attention_sink_size=config.swa_sink_size,
                     rope_theta=config.rope_theta,
                     logit_scale_base=config.logit_scale_base,
                     logit_scale_window=logit_scale_window,
@@ -209,8 +259,12 @@ class SWAMLAModel(nn.Module):
                 )
                 block = SWALocalBlock(layer_config)
             else:
-                mla_config = _create_mla_block_config(config)
-                block = MLABlock(mla_config, layer_id=layer_idx)
+                # Choose between MLA Selective or standard MLA based on config
+                if config.use_mla_selective:
+                    block = MLASelectiveBlock(config, layer_id=layer_idx)
+                else:
+                    mla_config = _create_mla_block_config(config)
+                    block = MLABlock(mla_config, layer_id=layer_idx)
             block.use_checkpoint = config.use_gradient_checkpointing
             self.transformer.h.append(block)
 
@@ -219,7 +273,18 @@ class SWAMLAModel(nn.Module):
 
         self.apply(self._init_weights)
         self.param_count = sum(p.numel() for p in self.parameters())
-        print(f"SWAMLA Model - Number of parameters: {self.param_count / 1e6:.2f}M")
+
+        # Count SWA and MLA blocks
+        swa_count = sum(1 for block in self.transformer.h if isinstance(block, SWALocalBlock))
+        mla_selective_count = sum(1 for block in self.transformer.h if isinstance(block, MLASelectiveBlock))
+        mla_standard_count = sum(1 for block in self.transformer.h if isinstance(block, MLABlock))
+
+        model_type = "SWAMLA-Selective" if config.use_mla_selective else "SWAMLA"
+        print(f"{model_type} Model - Number of parameters: {self.param_count / 1e6:.2f}M")
+        if config.use_mla_selective:
+            print(f"  - {swa_count} SWA blocks, {mla_selective_count} MLA Selective blocks")
+        else:
+            print(f"  - {swa_count} SWA blocks, {mla_standard_count} MLA blocks")
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -249,7 +314,10 @@ class SWAMLAModel(nn.Module):
         for block in self.transformer.h:
             if isinstance(block, SWALocalBlock):
                 x = block(x)
+            elif isinstance(block, (MLASelectiveBlock, MLABlock)):
+                x = block(x, 0, freqs_cis, mask)
             else:
+                # Fallback for any other block type
                 x = block(x, 0, freqs_cis, mask)
 
         x = self.transformer.ln_f(x)
@@ -331,7 +399,8 @@ class SWAMLAModel(nn.Module):
             optimizer_type=optimizer_type or "adamw",
             **kwargs,
         )
-        print("Configured optimizer for SWAMLA model")
+        model_type = "SWAMLA-Selective" if self.config.use_mla_selective else "SWAMLA"
+        print(f"Configured optimizer for {model_type} model")
         return optimizer
 
 

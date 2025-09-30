@@ -72,6 +72,9 @@ class CausalSelfAttention(nn.Module):
         if self.attention_window is not None and self.attention_window <= 0:
             self.attention_window = None
 
+        # Attention sink: always attend to first N tokens (improves stability)
+        self.attention_sink_size = getattr(config, 'attention_sink_size', 4)
+
         scale_base = getattr(config, 'logit_scale_base', None)
         if scale_base is not None and scale_base <= 1.0:
             scale_base = None
@@ -300,14 +303,26 @@ class CausalSelfAttention(nn.Module):
             compiling = False
 
         cache = self._sliding_mask_cache if not compiling else None
-        cache_key = (T, str(device), str(dtype))
+        cache_key = (T, str(device), str(dtype), self.attention_sink_size)
         if cache is not None and cache.get('key') == cache_key:
             return cache['mask']
 
         positions = torch.arange(T, device=device)
         diff = positions.unsqueeze(1) - positions.unsqueeze(0)
         mask = torch.zeros((T, T), device=device, dtype=dtype)
+
+        # Apply sliding window mask: block attention beyond window size
         mask = mask.masked_fill(diff > window, float('-inf'))
+
+        # Attention sink: always allow attention to first N tokens
+        if self.attention_sink_size > 0:
+            # Create a mask that allows attention to sink tokens
+            # For each query position, unmask the first attention_sink_size positions
+            sink_mask = torch.arange(T, device=device).unsqueeze(0) < self.attention_sink_size
+            sink_mask = sink_mask.expand(T, T)
+            # Set mask to 0 (allow attention) for sink tokens
+            mask = torch.where(sink_mask, torch.zeros_like(mask), mask)
+
         if not compiling:
             self._sliding_mask_cache = {'key': cache_key, 'mask': mask}
         return mask
