@@ -53,7 +53,7 @@ def parse_args():
     # Data Parameters
     parser.add_argument('--batch_size', type=int, default=12, help='Batch size per device')
     parser.add_argument('--block_size', type=int, default=512, help='Context size')
-    parser.add_argument('--num_workers', type=int, default=2, help='Number of dataloader workers')
+    parser.add_argument('--num_workers', type=int, default=8, help='Number of dataloader workers')
     parser.add_argument('--dataloader_type', type=str, default='packed', choices=['original', 'dynamic', 'packed'], help='Type of dataloader to use (`dynamic` is more efficient).')
 
     # Model Config Parameters (passed to LightningModule)
@@ -316,10 +316,32 @@ def main():
                     args.init_from = 'scratch' # Fallback to scratch if no checkpoint
     
         # Configure Trainer with multi-GPU optimizations
+        from pytorch_lightning.strategies import DDPStrategy
+
+        # Configure DDP strategy with optimizations for multi-GPU
+        if args.devices > 1:
+            if 'ddp' in args.strategy.lower():
+                ddp_kwargs = {
+                    'find_unused_parameters': False,  # Performance optimization
+                    'gradient_as_bucket_view': True,  # Memory optimization
+                    'static_graph': True,  # Faster for models with static computation graphs
+                }
+
+                # Only add find_unused_parameters if explicitly requested
+                if args.strategy == 'ddp':
+                    ddp_kwargs['find_unused_parameters'] = True
+                    ddp_kwargs['static_graph'] = False
+
+                strategy = DDPStrategy(**ddp_kwargs)
+            else:
+                strategy = args.strategy
+        else:
+            strategy = "auto"
+
         trainer_kwargs = {
             'devices': args.devices,
             'accelerator': "gpu" if torch.cuda.is_available() and args.devices != 0 else "cpu",
-            'strategy': args.strategy if args.devices > 1 else "auto",
+            'strategy': strategy,
             'precision': args.precision,
             'max_steps': args.max_iters,
             'val_check_interval': args.eval_interval_steps,

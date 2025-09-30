@@ -55,6 +55,9 @@ def get_datasets(args):
         from data.data_loader_packed import PackedFinewebDataset
         print("Using PackedFinewebDataset for training (fixed shape + document packing).")
 
+        # For multi-GPU training, we need to ensure each GPU gets different data
+        # Lightning handles this automatically via DistributedSampler for non-iterable datasets
+        # For IterableDataset, we need to handle it in the dataset itself
         train_dataset = PackedFinewebDataset(
             split='train',
             max_length=args.block_size,
@@ -66,19 +69,23 @@ def get_datasets(args):
         )
         val_dataset = train_dataset
 
+        # Important: For IterableDataset with Lightning DDP, we must use:
+        # - batch_size=None (batching handled by dataset)
+        # - num_workers=0 (dataset has internal threading)
+        # - persistent_workers=False (not applicable with num_workers=0)
         train_loader = DataLoader(
             train_dataset,
-            batch_size=1,
+            batch_size=None,  # Changed from 1 to None for proper DDP handling
             num_workers=0,
             pin_memory=True,
-            collate_fn=lambda x: x[0]
+            persistent_workers=False,
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=1,
+            batch_size=None,  # Changed from 1 to None for proper DDP handling
             num_workers=0,
             pin_memory=True,
-            collate_fn=lambda x: x[0]
+            persistent_workers=False,
         )
 
     else: # 'original'

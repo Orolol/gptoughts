@@ -109,12 +109,29 @@ class PackedFinewebDataset(IterableDataset):
         self.shuffle = shuffle
         self.num_workers = max(1, num_workers)
 
+        # DDP awareness: detect if we're in a distributed environment
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                self.rank = dist.get_rank()
+                self.world_size = dist.get_world_size()
+                print(f"[PackedDataset] DDP detected: rank={self.rank}, world_size={self.world_size}")
+            else:
+                self.rank = 0
+                self.world_size = 1
+        except (ImportError, RuntimeError):
+            self.rank = 0
+            self.world_size = 1
+
+        # For DDP: each rank skips to a different starting point to avoid data overlap
+        effective_offset = start_offset + (self.rank * 1000)  # Offset each rank by 1000 examples
+
         self.dataset = load_dataset(
             "HuggingFaceFW/fineweb-edu",
             name="CC-MAIN-2024-10",
             split=split,
             streaming=True,
-        ).skip(start_offset)
+        ).skip(effective_offset)
 
         if tokenizer is not None:
             self.tokenizer = tokenizer
@@ -142,10 +159,14 @@ class PackedFinewebDataset(IterableDataset):
         }
 
         self._closed = False
-        
+
         # Register this dataset for cleanup
         _active_datasets.add(self)
-        
+
+        # Log DDP sharding info
+        if self.world_size > 1:
+            print(f"[PackedDataset Rank {self.rank}] Will process every {self.world_size}th example starting from offset {effective_offset}")
+
         self._start_producer()
 
     def _tokenize_text(self, text: str) -> torch.Tensor:
@@ -228,14 +249,24 @@ class PackedFinewebDataset(IterableDataset):
             it = iter(self.dataset)
             docs: List[torch.Tensor] = []
             docs_deque: deque = deque()
+            example_count = 0  # Counter for DDP sharding
 
             while not self.should_stop.is_set():
                 # Fill documents buffer
                 while len(docs) < self.buffer_docs and not self.should_stop.is_set():
                     try:
                         ex = next(it)
+                        example_count += 1
+
+                        # DDP sharding: only process examples assigned to this rank
+                        # This ensures each GPU gets different data without overlap
+                        if self.world_size > 1:
+                            if example_count % self.world_size != self.rank:
+                                continue  # Skip this example, it belongs to another rank
+
                     except StopIteration:
                         it = iter(self.dataset)
+                        example_count = 0  # Reset counter on dataset restart
                         continue
                     ids = self._tokenize_text(ex["text"])  # [T]
                     chunks = self._split_long(ids)
