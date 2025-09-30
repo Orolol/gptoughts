@@ -334,8 +334,27 @@ def main():
                     print(f"Configuring FSDPStrategy for better memory distribution...")
                     print(f"  - FSDP shards model parameters across GPUs")
                     print(f"  - This should eliminate VRAM imbalance between ranks")
+
+                    # Custom wrapping policy: don't wrap embedding/lm_head that share weights
+                    from functools import partial
+                    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+                    # Import the transformer block classes that should be wrapped
+                    try:
+                        from models.models.swa_mla_model import SWALocalBlock
+                        from models.blocks.mla_block import MLABlock
+                        transformer_layer_cls = {SWALocalBlock, MLABlock}
+                    except:
+                        # Fallback if imports fail
+                        transformer_layer_cls = {torch.nn.TransformerEncoderLayer, torch.nn.TransformerDecoderLayer}
+
+                    my_auto_wrap_policy = partial(
+                        transformer_auto_wrap_policy,
+                        transformer_layer_cls=transformer_layer_cls,
+                    )
+
                     strategy = FSDPStrategy(
-                        auto_wrap_policy={torch.nn.Linear, torch.nn.Embedding},
+                        auto_wrap_policy=my_auto_wrap_policy,
                         activation_checkpointing_policy=None,
                         state_dict_type="full",
                     )
