@@ -799,6 +799,7 @@ class LLMLightningModule(pl.LightningModule):
         try:
             with self.timing_stats.track("forward"):
                 # Run the unified forward pass under autocast
+                # Keep tensors on their original device to avoid unnecessary transfers
                 input_ids_detached = input_ids
                 targets_detached = targets
 
@@ -1433,7 +1434,7 @@ class LLMLightningModule(pl.LightningModule):
                  print(f"Global batch size: {self.args.batch_size * self.trainer.world_size * self.trainer.accumulate_grad_batches}")
                  print(f"Gradient accumulation steps: {self.trainer.accumulate_grad_batches}")
                  print(f"Using precision: {self.trainer.precision}")
-                 
+
                  # Setup progressive training if enabled
                  if self.progressive_training:
                      print(f"Progressive training enabled:")
@@ -1441,6 +1442,26 @@ class LLMLightningModule(pl.LightningModule):
                      print(f"  Epochs per stage: {self.progressive_epochs_per_stage}")
                      print(f"  LR scale at transitions: {self.progressive_lr_scale}")
                      self.setup_progressive_training()
+
+             # Multi-GPU optimizations
+             if self.trainer.world_size > 1:
+                 if self.global_rank == 0:
+                     print(f"\n=== Multi-GPU Setup ===")
+                     print(f"Number of GPUs: {self.trainer.world_size}")
+                     print(f"Strategy: {self.trainer.strategy.__class__.__name__}")
+                     print(f"Per-GPU batch size: {self.args.batch_size}")
+                     print(f"Effective global batch size: {self.args.batch_size * self.trainer.world_size * self.trainer.accumulate_grad_batches}")
+
+                 # Ensure model is properly distributed
+                 if hasattr(self.model, 'train'):
+                     self.model.train()
+
+                 # Synchronize all processes
+                 if torch.cuda.is_available():
+                     torch.cuda.synchronize()
+
+                 if self.global_rank == 0:
+                     print(f"Multi-GPU setup completed\n")
 
 
     def teardown(self, stage=None):

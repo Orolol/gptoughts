@@ -90,9 +90,10 @@ def parse_args():
     parser.add_argument('--fp8_tile_size', type=int, default=128, help='Tile size for FP8 quantization (default: 128)')
 
     # Distributed Parameters (for Lightning Trainer)
-    parser.add_argument('--strategy', type=str, default='ddp', help='Distributed strategy (e.g., ddp, fsdp)')
+    parser.add_argument('--strategy', type=str, default='ddp_find_unused_parameters_false', help='Distributed strategy (e.g., ddp, ddp_find_unused_parameters_false, fsdp)')
     parser.add_argument('--devices', type=int, default=-1, help='Number of GPUs to use (-1 for all available)')
     parser.add_argument('--device', type=str, default=None, help='Device to use for training (e.g., cpu, cuda:0)')
+    parser.add_argument('--sync_batchnorm', action='store_true', help='Convert all BatchNorm layers to SyncBatchNorm for multi-GPU')
 
     # MoE Parameters (passed to LightningModule)
     parser.add_argument('--router_z_loss_coef', type=float, default=0.001, help='Router loss coefficient')
@@ -314,25 +315,31 @@ def main():
                     print(f"Resume requested but no checkpoint found in {args.output_dir}. Starting from scratch.")
                     args.init_from = 'scratch' # Fallback to scratch if no checkpoint
     
-        # Configure Trainer
-        trainer = pl.Trainer(
-            devices=args.devices,
-            accelerator="gpu" if torch.cuda.is_available() and args.devices != 0 else "cpu",
-            strategy=args.strategy if args.devices > 1 else "auto",
-            precision=args.precision,
-            max_steps=args.max_iters,
-            val_check_interval=args.eval_interval_steps, # Check validation every N steps
-            check_val_every_n_epoch=None, # Disable epoch-based validation checking
-            log_every_n_steps=args.log_interval_steps,
-            accumulate_grad_batches=args.gradient_accumulation_steps,
-            gradient_clip_val=args.grad_clip if args.grad_clip > 0 else 0,
-            logger=logger,
-            callbacks=callbacks,
-            enable_checkpointing=(args.keep_checkpoints != 0),
-            # deterministic=False, # For performance
-            benchmark=True, # Enable cudnn benchmarking
-            limit_val_batches=50, # Limit validation batches to reduce validation time
-        )
+        # Configure Trainer with multi-GPU optimizations
+        trainer_kwargs = {
+            'devices': args.devices,
+            'accelerator': "gpu" if torch.cuda.is_available() and args.devices != 0 else "cpu",
+            'strategy': args.strategy if args.devices > 1 else "auto",
+            'precision': args.precision,
+            'max_steps': args.max_iters,
+            'val_check_interval': args.eval_interval_steps,
+            'check_val_every_n_epoch': None,
+            'log_every_n_steps': args.log_interval_steps,
+            'accumulate_grad_batches': args.gradient_accumulation_steps,
+            'gradient_clip_val': args.grad_clip if args.grad_clip > 0 else 0,
+            'logger': logger,
+            'callbacks': callbacks,
+            'enable_checkpointing': (args.keep_checkpoints != 0),
+            'benchmark': True,
+            'limit_val_batches': 50,
+        }
+
+        # Add sync_batchnorm for multi-GPU if requested
+        if args.devices > 1 and getattr(args, 'sync_batchnorm', False):
+            trainer_kwargs['sync_batchnorm'] = True
+            print("Enabling SyncBatchNorm for multi-GPU training")
+
+        trainer = pl.Trainer(**trainer_kwargs)
     
         # --- Start Training with Lightning ---
         if args.eval_only:
