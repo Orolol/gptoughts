@@ -332,6 +332,10 @@ def main():
                     ddp_kwargs['find_unused_parameters'] = True
                     ddp_kwargs['static_graph'] = False
 
+                # CRITICAL: Force broadcast_buffers=False to prevent buffer duplication on rank 1
+                # This is the main cause of VRAM imbalance (rank 1 getting extra copies)
+                ddp_kwargs['broadcast_buffers'] = False
+
                 strategy = DDPStrategy(**ddp_kwargs)
             else:
                 strategy = args.strategy

@@ -18,6 +18,12 @@ echo "Batch size: $BATCH_SIZE"
 echo "Block size: $BLOCK_SIZE"
 echo "Output dir: $OUTPUT_DIR"
 echo "Resume: $RESUME"
+echo ""
+echo "Multi-GPU optimizations active:"
+echo "  - broadcast_buffers=False (prevents buffer duplication on rank 1)"
+echo "  - gradient_as_bucket_view=True (memory optimization)"
+echo "  - static_graph=True (performance optimization)"
+echo ""
 
 RESUME_ARGS=()
 if [ "$RESUME" = "true" ] || [ "$RESUME" = "1" ]; then

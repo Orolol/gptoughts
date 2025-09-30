@@ -309,7 +309,9 @@ class SWAMLAModel(nn.Module):
         if t > 1:
             mask = torch.full((t, t), float("-inf"), device=device)
             mask = torch.triu(mask, diagonal=1)
-        freqs_cis = self.freqs_cis[:t].detach()
+
+        # Move freqs_cis to the correct device on-demand to avoid VRAM duplication in DDP
+        freqs_cis = self.freqs_cis[:t].to(device, non_blocking=True).detach()
 
         for block in self.transformer.h:
             if isinstance(block, SWALocalBlock):

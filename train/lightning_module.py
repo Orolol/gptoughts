@@ -64,10 +64,16 @@ class LLMLightningModule(pl.LightningModule):
         except Exception:
             pass
         self.model = self._build_model()
-        
+
         # Handle checkpoint loading with block size adaptation if needed
         if self.load_checkpoint_path and self.original_block_size:
             self._load_and_adapt_checkpoint()
+
+        # CRITICAL: Move large buffers to CPU before DDP wrapping to avoid duplication
+        # This prevents rank 1 from having extra VRAM usage
+        if hasattr(self.model, 'freqs_cis'):
+            # Keep freqs_cis on CPU, will be moved to GPU during forward pass
+            self.model.freqs_cis = self.model.freqs_cis.cpu()
             
         self.timing_stats = AveragedTimingStats(print_interval=1000)
         self.train_start_time = time.time()
@@ -1459,6 +1465,12 @@ class LLMLightningModule(pl.LightningModule):
                  # Synchronize all processes
                  if torch.cuda.is_available():
                      torch.cuda.synchronize()
+
+                 # Diagnostic: Print VRAM usage per rank to detect imbalances
+                 if torch.cuda.is_available():
+                     allocated = torch.cuda.memory_allocated() / 1024**3
+                     reserved = torch.cuda.memory_reserved() / 1024**3
+                     print(f"[Rank {self.global_rank}] Initial VRAM: allocated={allocated:.2f}GB, reserved={reserved:.2f}GB")
 
                  if self.global_rank == 0:
                      print(f"Multi-GPU setup completed\n")
