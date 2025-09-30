@@ -12,6 +12,7 @@ OUTPUT_DIR="$OUTPUT_ROOT/$OUTPUT_NAME"
 mkdir -p "$OUTPUT_DIR"
 RESUME=${5:-false}
 OPTIMIZER=${6:-adamw}  # Default to adamw for better DDP compatibility
+STRATEGY=${7:-fsdp}  # Use FSDP by default to avoid DDP memory imbalance
 
 echo "Training SWA+MLA hybrid model..."
 echo "Model size: $MODEL_SIZE"
@@ -20,12 +21,20 @@ echo "Block size: $BLOCK_SIZE"
 echo "Output dir: $OUTPUT_DIR"
 echo "Resume: $RESUME"
 echo "Optimizer: $OPTIMIZER"
+echo "Strategy: $STRATEGY"
 echo ""
-echo "Multi-GPU optimizations active:"
-echo "  - Model initialized on CPU to prevent rank 1 duplication"
-echo "  - broadcast_buffers=False (prevents buffer duplication)"
-echo "  - gradient_as_bucket_view=True (memory optimization)"
-echo "  - static_graph=True (performance optimization)"
+if [ "$STRATEGY" = "fsdp" ]; then
+    echo "Using FSDP (Fully Sharded Data Parallel):"
+    echo "  - Shards model parameters across GPUs"
+    echo "  - Eliminates VRAM imbalance between ranks"
+    echo "  - Better memory efficiency than DDP"
+else
+    echo "Multi-GPU DDP optimizations active:"
+    echo "  - Model initialized on CPU to prevent rank 1 duplication"
+    echo "  - broadcast_buffers=False (prevents buffer duplication)"
+    echo "  - bucket_cap_mb=10 (reduced gradient buckets)"
+    echo "  - gradient_as_bucket_view=True (memory optimization)"
+fi
 echo ""
 
 RESUME_ARGS=()
@@ -64,7 +73,7 @@ python run_train.py \
     --mla_qk_nope_head_dim 128 \
     --mla_qk_rope_head_dim 64 \
     --mla_v_head_dim 128 \
-    --strategy ddp_find_unused_parameters_false \
+    --strategy $STRATEGY \
     "${RESUME_ARGS[@]}"
 
 # Note: --compile removed for better DDP compatibility
@@ -76,8 +85,9 @@ python run_train.py \
 # --mla_selection_head_idx 0 \
 
 # Usage examples:
-# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out_swa_mla false adamw  # AdamW optimizer (default)
-# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out_swa_mla false lion   # Lion optimizer
-# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out_swa_mla true         # Resume training
+# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out_swa_mla false adamw fsdp  # FSDP strategy (default, best for multi-GPU)
+# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out_swa_mla false adamw ddp_find_unused_parameters_false  # DDP strategy
+# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out_swa_mla false lion fsdp   # Lion optimizer with FSDP
+# ./train_swa_mla_optimized_gpt_tok.sh medium 16 2048 out_swa_mla true adamw fsdp   # Resume training
 
 exit 0

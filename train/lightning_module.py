@@ -967,9 +967,30 @@ class LLMLightningModule(pl.LightningModule):
             if torch.cuda.is_available():
                 allocated = torch.cuda.memory_allocated() / 1024**3
                 reserved = torch.cuda.memory_reserved() / 1024**3
-                print(f"[Rank {self.global_rank}] VRAM after first training step:")
+                max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+                print(f"\n[Rank {self.global_rank}] VRAM after first training step:")
                 print(f"  - Allocated: {allocated:.2f}GB")
                 print(f"  - Reserved: {reserved:.2f}GB")
+                print(f"  - Max allocated: {max_allocated:.2f}GB")
+
+                # Check for large tensors on this device
+                import gc
+                large_tensors = []
+                for obj in gc.get_objects():
+                    try:
+                        if torch.is_tensor(obj):
+                            if obj.device.type == 'cuda' and obj.device.index == self.global_rank:
+                                size_gb = obj.element_size() * obj.nelement() / 1024**3
+                                if size_gb > 0.5:  # Only show tensors > 0.5GB
+                                    large_tensors.append((size_gb, obj.shape, obj.dtype))
+                    except:
+                        pass
+
+                if large_tensors:
+                    large_tensors.sort(reverse=True)
+                    print(f"  - Large tensors (>0.5GB) on GPU {self.global_rank}:")
+                    for size_gb, shape, dtype in large_tensors[:5]:  # Top 5
+                        print(f"    {size_gb:.2f}GB: shape={shape}, dtype={dtype}")
 
         # Periodic tasks
         if self.global_step > 0 and self.global_step % 1000 == 0:
