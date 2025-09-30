@@ -1512,6 +1512,7 @@ class LLMLightningModule(pl.LightningModule):
                  # Force empty cache to free reserved memory after DDP setup
                  # This helps balance VRAM reserved between ranks
                  if torch.cuda.is_available():
+                     torch.cuda.set_device(self.global_rank)
                      torch.cuda.empty_cache()
                      torch.cuda.synchronize()
                      if self.global_rank == 0:
