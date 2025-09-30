@@ -1488,6 +1488,14 @@ class LLMLightningModule(pl.LightningModule):
                  if torch.cuda.is_available():
                      torch.cuda.synchronize()
 
+                 # Force empty cache to free reserved memory after DDP setup
+                 # This helps balance VRAM reserved between ranks
+                 if torch.cuda.is_available():
+                     torch.cuda.empty_cache()
+                     torch.cuda.synchronize()
+                     if self.global_rank == 0:
+                         print("  - Cleared CUDA cache to balance reserved memory")
+
                  # Diagnostic: Print detailed VRAM usage per rank to detect imbalances
                  if torch.cuda.is_available():
                      allocated = torch.cuda.memory_allocated() / 1024**3

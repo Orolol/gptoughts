@@ -346,6 +346,9 @@ def main():
                     'gradient_as_bucket_view': True,  # Memory optimization
                     'static_graph': True,  # Faster for models with static computation graphs
                     'broadcast_buffers': False,  # Prevent buffer duplication on rank 1
+                    'bucket_cap_mb': 10,  # Reduce from default 25MB to balance VRAM reserved between ranks
+                    'ddp_comm_state_dict_type': 'full',  # Force uniform buffer allocation
+                    'ddp_comm_hook': None,  # Disable custom comm hooks
                 }
 
                 # Only add find_unused_parameters if explicitly requested
@@ -357,6 +360,7 @@ def main():
                 print(f"  - broadcast_buffers=False")
                 print(f"  - gradient_as_bucket_view=True")
                 print(f"  - static_graph={ddp_kwargs['static_graph']}")
+                print(f"  - bucket_cap_mb={ddp_kwargs['bucket_cap_mb']} (reduced from 25MB default)")
 
                 strategy = DDPStrategy(**ddp_kwargs)
             elif 'fsdp' not in args.strategy.lower():
