@@ -631,7 +631,7 @@ while True:
                     loss = F.cross_entropy(
                         shift_logits.view(-1, shift_logits.size(-1)),
                         shift_labels.view(-1),
-                        ignore_index=-1
+                        ignore_index=-100
                     )
                     
                     batch_tokens = input_ids.ne(tokenizer.pad_token_id).sum().item()

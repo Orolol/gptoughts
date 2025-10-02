@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 # Import components from blocks
 from models.blocks.mla import MLA
+from models.blocks.mla_fp8 import MLA_FP8
 from models.blocks.mla_block import MLABlock
 from models.blocks.normalization import RMSNorm, DynamicTanh
 from models.blocks.positional_encoding import RoPE
@@ -61,6 +62,8 @@ class MLAModelConfig:
     # Précision
     fp8_params: bool = True
     fp8_mla_params: bool = False  # Gardez MLA en FP16 pour la stabilité numérique
+    use_fp8: bool = False  # Master switch for FP8 usage
+    fp8_tile_size: int = 128  # Tile size for FP8 quantization
     
     # Dropout et régularisation
     dropout: float = 0.0
@@ -80,37 +83,8 @@ class MLAModelConfig:
         if self.n_inner is None:
             self.n_inner = 4 * self.n_embd
 
-class FP8Module(nn.Module):
-    """Module wrapper that manages FP8 precision for specific parameters."""
-    def __init__(self, module, exclude_patterns=None):
-        super().__init__()
-        self.module = module
-        self.exclude_patterns = exclude_patterns or []
-        
-        # Convert eligible parameters to FP8
-        self._convert_params_to_fp8()
-    
-    def _convert_params_to_fp8(self):
-        for name, param in self.module.named_parameters():
-            should_exclude = any(pattern in name for pattern in self.exclude_patterns)
-            
-            if not should_exclude and hasattr(torch, 'float8_e4m3fn'):
-                # Convert to FP8 precision if supported
-                param.data = param.data.to(torch.float8_e4m3fn)
-                print(f"Converted {name} to FP8 precision")
-    
-    def forward(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
-    
-    def to(self, device_or_dtype):
-        # Special handling for converting to device or dtype
-        if isinstance(device_or_dtype, torch.dtype):
-            # Don't change dtype of FP8 parameters
-            # This is a no-op for FP8 parameters
-            pass
-        return super().to(device_or_dtype)
-
-# MoE removed - using only dense model
+# FP8Module removed - FP8 will only be used during computation, not for parameter storage
+# This ensures compatibility with standard optimizers like Adam/AdamW
 
 class MLAModelBlock(nn.Module):
     """
@@ -130,7 +104,13 @@ class MLAModelBlock(nn.Module):
             self.norm2 = RMSNorm(config.n_embd)
         
         # Multi-head Latent Attention
-        self.attn = MLA(config)
+        # Use FP8 MLA if use_fp8 is enabled (regardless of fp8_mla_params which controls the linear layer type)
+        if getattr(config, 'use_fp8', False):
+            print("Using FP8 MLA")
+            self.attn = MLA_FP8(config)
+        else:
+            print("Using standard MLA")
+            self.attn = MLA(config)
         
         # Regular MLP (all layers are dense)
         self.ffn = MLP(config)
@@ -234,13 +214,17 @@ class MLAModel(nn.Module):
         # Initialize weights
         self.apply(self._init_weights)
         
-        # Note: FP8 parameter storage is not compatible with optimizers like Adam
-        # Instead, FP8 should be used only during forward pass computations
-        # We'll rely on mixed precision training (fp16/bf16) for memory savings
+        # FP8 configuration handling
         if config.fp8_params:
-            print("Warning: FP8 parameter storage is not compatible with most optimizers.")
-            print("Using BFloat16 mixed precision training instead for memory efficiency.")
-            print("FP8 can be used in forward pass computations with transformer_engine if available.")
+            print("Note: FP8 parameter storage requested but is not compatible with most optimizers.")
+            print("FP8 will be used only during forward pass computations if transformer_engine is available.")
+            print("Model parameters will remain in BFloat16/Float32 for optimizer compatibility.")
+            # Set flag to use FP8 in forward pass but not for parameter storage
+            self.use_fp8_compute = True
+            # Disable fp8_params to prevent parameter conversion
+            config.fp8_params = False
+        else:
+            self.use_fp8_compute = False
         
         # Parameter count
         self.param_count = sum(p.numel() for p in self.parameters())
@@ -300,39 +284,35 @@ class MLAModel(nn.Module):
         return n_params
 
     def forward(self, idx, targets=None):
-        # Always ensure we're in training mode when doing a forward pass
+        # Always ensure we're in training mode when doing a forward pass during training
         # This prevents KV caching which causes memory leaks
         if self.training:
             self._set_inference_mode(False)
         
-        # Completely isolate input tensors to ensure no connections to previous computation graphs
-        with torch.no_grad():
-            idx = idx.detach().clone().requires_grad_(False)
-            if targets is not None:
-                targets = targets.detach().clone().requires_grad_(False)
-
+        # Don't isolate inputs - we need gradient flow!
+        # The previous implementation was breaking gradient computation
+        
         # Use the context manager to prevent backward reuse
         with prevent_backward_reuse():
             device = idx.device
             b, t = idx.size()
             assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
             
-            # Generate position indices - no grad needed
-            with torch.no_grad():
-                pos = torch.arange(0, t, dtype=torch.long, device=device)
+            # Generate position indices
+            pos = torch.arange(0, t, dtype=torch.long, device=device)
             
             # Forward the MLA model
             tok_emb = self.transformer.wte(idx)
             x = self.transformer.drop(tok_emb)
             
-            # Prepare attention mask if needed (for causal attention) - no grad needed
-            with torch.no_grad():
-                mask = None
-                if t > 1:
-                    mask = torch.full((t, t), float("-inf"), device=device).triu_(1)
-                
-                # Extract rotary embeddings for this sequence length
-                freqs_cis = self.freqs_cis[:t].detach().clone()
+            # Prepare attention mask if needed (for causal attention)
+            mask = None
+            if t > 1:
+                # Create mask without requiring gradients
+                mask = torch.full((t, t), float("-inf"), device=device, requires_grad=False).triu_(1)
+            
+            # Extract rotary embeddings for this sequence length (no gradient needed)
+            freqs_cis = self.freqs_cis[:t].detach()
             
             # Process through layers while maintaining gradient flow
             for i, block in enumerate(self.transformer.h):
@@ -379,32 +359,15 @@ class MLAModel(nn.Module):
                     loss = (loss * mask.view(-1)).sum() / mask.sum()
                 else:
                     # Standard loss without label smoothing
-                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
                 
             else:
                 # Inference-time optimization: only compute logits for last position
                 logits = self.lm_head(x[:, [-1], :])
                 loss = None
         
-        # Create fresh tensor outputs with no connections to the previous graph
-        # Create copies that properly preserve gradient flow
-        if loss is not None:
-            final_loss = loss.clone()  # Keep the gradient connection
-        else:
-            final_loss = None
-            
-        final_logits = logits.clone()  # Keep the gradient connection
-        
-        # Clean up intermediate tensors to prevent memory leaks
-        del x, logits
-        if loss is not None:
-            del loss
-        
-        # REMOVED: torch.cuda.empty_cache() at end of forward pass
-        # PyTorch's memory allocator handles this more efficiently
-        # Manual calls were causing performance issues and VRAM fluctuations
-        
-        return final_logits, final_loss
+        # Return outputs directly - no need to clone as we're not breaking gradient flow
+        return logits, loss
     
     def _set_inference_mode(self, use_inference=True):
         """Set the MLA blocks to inference mode for KV caching"""
@@ -425,6 +388,18 @@ class MLAModel(nn.Module):
         except Exception as e:
             print(f"Error setting inference mode: {e}")
             # Continue without failing if there's an issue
+    
+    def clear_cache(self):
+        """Clear all KV caches in MLA attention layers to free memory"""
+        for name, module in self.named_modules():
+            if isinstance(module, MLA):
+                # Force clear any existing caches
+                module.set_inference_mode(False)
+                # Ensure cache attributes exist but are None
+                module.k_cache = None
+                module.v_cache = None
+                module.kv_cache = None
+                module.pe_cache = None
     
     @torch.no_grad()
     def generate(self, idx, max_new_tokens=None, temperature=1.0, top_k=None, prompt=None, gen_length=None):
@@ -513,13 +488,16 @@ class MLAModel(nn.Module):
         
         # Extract GaLore configuration from kwargs if present
         galore_config = None
-        if optimizer_type in ["galore", "galore-8bit"]:
+        galore_quantize_proj = None
+        if optimizer_type in ["galore", "galore-8bit", "galore2"]:
             galore_config = {
                 "rank": kwargs.get("galore_rank", 128),
                 "update_proj_gap": kwargs.get("galore_update_proj_gap", 200),
                 "scale": kwargs.get("galore_scale", 0.25),
                 "proj_type": kwargs.get("galore_proj_type", "std")
             }
+            if optimizer_type == "galore2":
+                galore_quantize_proj = kwargs.get("galore_quantize_proj", None)
         
         # Use the GPT optimizer configuration which supports multiple optimizers
         # MLA models work well with the same optimizer configurations as GPT models
@@ -530,7 +508,8 @@ class MLAModel(nn.Module):
             betas=betas,
             device_type=device_type,
             optimizer_type=optimizer_type,
-            galore_config=galore_config
+            galore_config=galore_config,
+            galore_quantize_proj=galore_quantize_proj
         )
         
         print(f"Configured {optimizer_type} optimizer for MLA model")

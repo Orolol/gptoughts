@@ -140,30 +140,24 @@ class LLaDAExpertGroup(ExpertGroup):
                 # Create output tensor with optimal memory layout
                 combined_output = torch.zeros_like(shared_output)
                 
-                # Process each expert
+                # Process each expert (removed data-dependent branching for torch.compile compatibility)
                 for i in range(self.num_experts):
                     # Get mask for this expert
                     expert_mask = expert_weights[:, :, i] > 0
-                    if not expert_mask.any():
-                        continue
+                    expert_weight = expert_weights[:, :, i]
                     
-                    # Get tokens for this expert
-                    expert_x = x[expert_mask]
-                    
-                    # Skip if no tokens
-                    if expert_x.numel() == 0:
-                        continue
-                    
-                    # Forward through expert-specific adapter
-                    expert_hidden = self.shared_mlp.pre_adapt(expert_x)
+                    # Use masked computation instead of conditional branching
+                    # This processes all tokens but only the masked ones will contribute
+                    expert_hidden = self.shared_mlp.pre_adapt(x)
                     adapted = self.expert_adapters[i](expert_hidden)
                     
                     # Project through shared projections
                     expert_proj_output = self.expert_proj(adapted)
                     expert_output = self.output_proj(expert_proj_output)
                     
-                    # Add to output tensor
-                    combined_output[expert_mask] = expert_output
+                    # Apply expert weights to select which tokens this expert processes
+                    weighted_output = expert_output * expert_weight.unsqueeze(-1)
+                    combined_output = combined_output + weighted_output
             
             # Add expert outputs to shared output
             return shared_output + 0.1 * combined_output 

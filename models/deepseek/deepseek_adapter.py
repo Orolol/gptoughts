@@ -226,7 +226,7 @@ class DeepSeekMini(nn.Module):
                     loss = torch.nn.functional.cross_entropy(
                         shift_logits.reshape(-1, shift_logits.size(-1)),
                         shift_targets.reshape(-1),
-                        ignore_index=-1,
+                        ignore_index=-100,
                         reduction='mean',
                         label_smoothing=0.01  # Légère régularisation pour stabilité
                     )
@@ -239,7 +239,7 @@ class DeepSeekMini(nn.Module):
                     loss = torch.nn.functional.cross_entropy(
                         shift_logits.view(-1, shift_logits.size(-1)),
                         shift_targets.view(-1),
-                        ignore_index=-1,
+                        ignore_index=-100,
                         reduction='mean',
                         label_smoothing=0.01  # Légère régularisation pour stabilité
                     )

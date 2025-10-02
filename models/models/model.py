@@ -170,7 +170,7 @@ class GPT(nn.Module):
                 loss = (loss * mask.view(-1)).sum() / mask.sum()
             else:
                 # Loss standard sans label smoothing
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
 
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
@@ -425,7 +425,7 @@ class EncoderDecoderGPT(nn.Module):
                 loss = (loss * mask.view(-1)).sum() / mask.sum()
             else:
                 # Loss standard sans label smoothing
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
             
             # Ajouter la régularisation pour DDP si en mode training
             if self.training:

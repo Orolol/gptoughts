@@ -161,7 +161,7 @@ class MTPModule(nn.Module):
                 loss = F.cross_entropy(
                     shift_logits.reshape(-1, shift_logits.size(-1)),
                     shift_targets.reshape(-1),
-                    ignore_index=-1
+                    ignore_index=-100
                 )
                 
                 # Check for NaN loss

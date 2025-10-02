@@ -1,0 +1,767 @@
+import torch
+from torch.utils.data import IterableDataset
+from datasets import load_dataset
+from transformers import AutoTokenizer
+import threading
+import random
+import os
+import time
+from collections import deque
+import heapq
+from typing import List, Dict, Any, Optional, Tuple
+import numpy as np
+from datetime import datetime
+import signal
+import atexit
+import weakref
+
+# Global registry to track active datasets for cleanup
+_active_datasets = weakref.WeakSet()
+
+def _cleanup_all_datasets(signum=None, frame=None):
+    """Signal handler to clean up all active datasets"""
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Received interrupt signal, cleaning up datasets...")
+    for dataset in list(_active_datasets):
+        try:
+            dataset.close()
+        except Exception as e:
+            print(f"Error closing dataset: {e}")
+    
+    # Re-raise KeyboardInterrupt for proper exit
+    if signum == signal.SIGINT:
+        raise KeyboardInterrupt
+
+# Register signal handlers
+signal.signal(signal.SIGINT, _cleanup_all_datasets)
+signal.signal(signal.SIGTERM, _cleanup_all_datasets)
+atexit.register(_cleanup_all_datasets)
+
+class DynamicBatchBuffer:
+    """Efficient buffer for dynamic batching with priority queue for size-based grouping"""
+    
+    def __init__(self, prefetch_size: int = 100, max_buffer_size: int = 500):
+        self.prefetch_size = prefetch_size
+        self.max_buffer_size = max_buffer_size
+        self.tokenized_docs = []
+        self.lock = threading.Lock()
+        self.not_empty = threading.Condition(self.lock)
+        self.not_full = threading.Condition(self.lock)
+        self.is_closed = False
+        self.total_docs_processed = 0
+        self.last_cleanup_count = 0
+        
+    def add_documents(self, documents: List[Dict[str, torch.Tensor]]):
+        """Add tokenized documents to the buffer"""
+        start_time = time.time()
+        with self.lock:
+            while len(self.tokenized_docs) >= self.max_buffer_size and not self.is_closed:
+                self.not_full.wait(timeout=1.0)
+                if self.is_closed:
+                    return False
+            
+            if self.is_closed:
+                return False
+            
+            self.tokenized_docs.extend(documents)
+            self.total_docs_processed += len(documents)
+            
+            # Periodic cleanup to prevent excessive memory usage
+            if self.total_docs_processed - self.last_cleanup_count > 1000:
+                # Ensure we don't have too many docs in buffer
+                if len(self.tokenized_docs) > self.max_buffer_size * 2:
+                    # Remove oldest docs if buffer is too large
+                    self.tokenized_docs = self.tokenized_docs[-self.max_buffer_size:]
+                self.last_cleanup_count = self.total_docs_processed
+                # Force garbage collection periodically
+                if torch.cuda.is_available() and self.total_docs_processed % 5000 == 0:
+                    torch.cuda.empty_cache()
+            
+            self.not_empty.notify_all()
+            return True
+    
+    def get_batch(self, batch_size: int, max_tokens: Optional[int] = None, wait: bool = True) -> Optional[List[Dict[str, torch.Tensor]]]:
+        """Get a batch of documents optimized for similar lengths
+        
+        Args:
+            batch_size: Number of documents to get
+            max_tokens: Maximum tokens per batch
+            wait: If True, wait for documents. If False, return None immediately if not enough docs.
+        """
+        start_time = time.time()
+        wait_logged = False
+        with self.lock:
+            # Non-blocking mode: return immediately if not enough documents
+            if not wait and len(self.tokenized_docs) < batch_size:
+                return None
+            
+            while len(self.tokenized_docs) < batch_size and not self.is_closed:
+                # Only log during initial phase or when really stuck
+                self.not_empty.wait(timeout=1.0)
+                if self.is_closed and len(self.tokenized_docs) < batch_size:
+                    # Return remaining documents if buffer is closing
+                    if self.tokenized_docs:
+                        batch = self.tokenized_docs[:]
+                        self.tokenized_docs = []
+                        self.not_full.notify()
+                        return batch
+                    return None
+            
+            if len(self.tokenized_docs) < batch_size:
+                return None
+            
+            # Sort documents by length for better batching
+            self.tokenized_docs.sort(key=lambda x: x['length'])
+            
+            # Select batch with similar lengths
+            if max_tokens:
+                # Dynamic batch size based on max tokens
+                batch = []
+                current_tokens = 0
+                max_length_in_batch = 0
+                
+                for doc in self.tokenized_docs:
+                    doc_length = doc['length']
+                    # Update max length if this doc is added
+                    new_max_length = max(max_length_in_batch, doc_length)
+                    # Calculate total tokens if this doc is added
+                    new_total_tokens = (len(batch) + 1) * new_max_length
+                    
+                    if new_total_tokens <= max_tokens and len(batch) < batch_size:
+                        batch.append(doc)
+                        max_length_in_batch = new_max_length
+                        current_tokens = new_total_tokens
+                    else:
+                        break
+                
+                if not batch:
+                    # If no documents fit, take at least one
+                    batch = [self.tokenized_docs[0]]
+                
+                # Remove selected documents from buffer
+                self.tokenized_docs = self.tokenized_docs[len(batch):]
+            else:
+                # Fixed batch size with similar lengths
+                # Try to select documents with similar lengths for better padding efficiency
+                if len(self.tokenized_docs) >= batch_size * 2:
+                    # We have enough docs to be selective
+                    # Take a window of 2x batch_size and select the most similar ones
+                    window = self.tokenized_docs[:batch_size * 2]
+                    window_avg = sum(d['length'] for d in window) // len(window)
+                    
+                    # Sort by distance from average
+                    window.sort(key=lambda x: abs(x['length'] - window_avg))
+                    
+                    # Take the batch_size most similar docs
+                    batch = window[:batch_size]
+                    
+                    # Remove selected docs from buffer
+                    remaining = window[batch_size:]
+                    self.tokenized_docs = remaining + self.tokenized_docs[batch_size * 2:]
+                else:
+                    # Not enough docs, just take what we have
+                    batch = self.tokenized_docs[:batch_size]
+                    self.tokenized_docs = self.tokenized_docs[batch_size:]
+            
+            self.not_full.notify()
+            return batch
+    
+    def close(self):
+        """Close the buffer"""
+        with self.lock:
+            self.is_closed = True
+            self.not_empty.notify_all()
+            self.not_full.notify_all()
+    
+    def __len__(self):
+        with self.lock:
+            return len(self.tokenized_docs)
+
+
+class DynamicFinewebDataset(IterableDataset):
+    """Dynamic batching dataset with efficient async prefetching and size-based grouping"""
+    
+    def __init__(
+        self,
+        split: str = 'train',
+        max_length: int = 2048,
+        max_sequences_per_batch: int = None,  # Matches datasets.py naming
+        buffer_size: int = 16,  # Matches datasets.py naming
+        prefetch_size: int = 10000,
+        max_tokens_per_batch: Optional[int] = None,
+        shuffle: bool = True,
+        start_offset: int = 0,
+        tokenizer: Optional[Any] = None,
+        gradient_accumulation_steps: int = 1,
+        num_tokenizer_workers: int = 2,
+        max_iterations: Optional[int] = None,  # Maximum iterations before stopping
+        use_fixed_padding: bool = False,  # Use fixed padding for torch.compile compatibility
+        padding_bucket_size: int = 512,  # Bucket size for padding (reduces recompilations)
+        use_dynamic_batch_size: bool = True,  # Adjust batch size based on actual padding
+        dynamic_batch_safety_factor: float = 0.8,  # Safety factor to avoid OOM (0.8 = use 80% of theoretical max)
+        dynamic_batch_max_multiplier: float = 2.0,  # Max multiplier over base batch size to avoid extreme cases
+        # Backward compatibility
+        batch_size: int = None,  # Legacy parameter
+        **kwargs
+    ):
+        super().__init__()
+        
+        # Handle backward compatibility for batch_size parameter
+        if max_sequences_per_batch is None and batch_size is not None:
+            max_sequences_per_batch = batch_size
+        elif max_sequences_per_batch is None:
+            max_sequences_per_batch = 4  # Default value
+        
+        # Dataset configuration
+        self.dataset = load_dataset(
+            "HuggingFaceFW/fineweb-edu",
+            name="CC-MAIN-2024-10",
+            split=split,
+            streaming=True
+        ).skip(start_offset)
+        
+        # Tokenizer setup
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+        else:
+            access_token = os.getenv('HF_TOKEN')
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                "meta-llama/Llama-3.2-1B-Instruct",
+                use_fast=True,
+                access_token=access_token
+            )
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Batching parameters
+        self.max_length = max_length
+        self.batch_size = max_sequences_per_batch  # Base batch size
+        self.prefetch_size = prefetch_size
+        self.max_buffer_size = buffer_size * max_sequences_per_batch  # Scale buffer by batch size
+        self.max_tokens_per_batch = max_tokens_per_batch
+        self.shuffle = shuffle
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.num_workers = num_tokenizer_workers
+        self.use_fixed_padding = use_fixed_padding  # For torch.compile compatibility
+        self.padding_bucket_size = padding_bucket_size  # Bucket size for reducing compilations
+        self.use_dynamic_batch_size = use_dynamic_batch_size  # Dynamic batch sizing
+        self.dynamic_batch_safety_factor = dynamic_batch_safety_factor
+        self.dynamic_batch_max_multiplier = dynamic_batch_max_multiplier
+        
+        # Calculate max tokens for dynamic batch sizing
+        # This represents the maximum GPU memory we can use
+        self.max_total_tokens = self.batch_size * self.max_length
+        
+        # Maximum allowed batch size to prevent OOM
+        self.max_allowed_batch_size = int(self.batch_size * self.dynamic_batch_max_multiplier)
+        
+        # Buffers and threading - reduce queue size to limit memory
+        self.doc_buffer = DynamicBatchBuffer(prefetch_size, self.max_buffer_size)
+        self.batch_queue = deque(maxlen=10)  # Reduced to limit memory usage
+        self.batch_queue_lock = threading.Lock()
+        self.batch_queue_not_empty = threading.Condition(self.batch_queue_lock)
+        
+        # Worker threads
+        self.tokenizer_threads = []
+        self.batch_builder_thread = None
+        self.should_stop = threading.Event()
+        self.exception = None
+        
+        # Iteration control
+        self.max_iterations = max_iterations
+        self.iteration_count = 0
+        
+        # Statistics
+        self.stats = {
+            'docs_tokenized': 0,
+            'batches_created': 0,
+            'batches_served': 0,
+            'avg_padding_ratio': 0.0,
+            'total_padding_tokens': 0,
+            'total_tokens': 0
+        }
+        
+        # Start workers
+        # Simplified initialization message
+        print(f"Initializing dynamic data loader (batch_size={self.batch_size}, max_length={self.max_length})")
+        
+        self._initialized = False
+        self._workers_started = False
+        self._closed = False
+        
+        # Register this dataset for cleanup
+        _active_datasets.add(self)
+        
+        # Start workers immediately for better startup time
+        self._start_workers()
+    
+    def _tokenize_document(self, text: str) -> Dict[str, torch.Tensor]:
+        """Tokenize a single document"""
+        # Tokenize with truncation only (no padding yet)
+        try:
+            tokens = self.tokenizer(
+                text,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors='pt',
+                padding=False
+            )
+            
+            input_ids = tokens['input_ids'].squeeze(0)
+            actual_length = len(input_ids)
+            
+            # Move to CPU immediately to avoid GPU memory accumulation
+            return {
+                'input_ids': input_ids.cpu(),
+                'length': actual_length,
+                # Don't keep text snippets - they accumulate memory
+            }
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Error tokenizing document: {e}")
+            raise
+    
+    def _tokenizer_worker(self, worker_id: int):
+        """Worker thread that tokenizes documents"""
+        try:
+            dataset_iter = iter(self.dataset)
+            
+            local_buffer = []
+            batch_count = 0
+            docs_processed = 0
+            
+            while not self.should_stop.is_set():
+                try:
+                    # Wait if buffer is too full to avoid excessive memory usage
+                    buffer_size = len(self.doc_buffer.tokenized_docs) if hasattr(self.doc_buffer, 'tokenized_docs') else 0
+                    if buffer_size > self.max_buffer_size // 2:
+                        if docs_processed == 0:  # Log only first time
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] Worker {worker_id}: Buffer full, waiting...")
+                        while buffer_size > self.max_buffer_size // 2 and not self.should_stop.is_set():
+                            self.should_stop.wait(0.1)  # Use wait instead of sleep for faster response
+                            if self.should_stop.is_set():
+                                break
+                            buffer_size = len(self.doc_buffer.tokenized_docs) if hasattr(self.doc_buffer, 'tokenized_docs') else 0
+                    
+                    if self.should_stop.is_set():
+                        break
+                        
+                    # Collect documents
+                    collect_start = time.time()
+                    docs_to_collect = self.prefetch_size // self.num_workers
+                    
+                    for i in range(docs_to_collect):
+                        if self.should_stop.is_set():
+                            break
+                        
+                        example = next(dataset_iter)
+                        tokenized = self._tokenize_document(example['text'])
+                        local_buffer.append(tokenized)
+                        docs_processed += 1
+                        
+                        with self.batch_queue_lock:
+                            self.stats['docs_tokenized'] += 1
+                    
+                    # Add to main buffer
+                    if local_buffer and not self.should_stop.is_set():
+                        if self.shuffle:
+                            random.shuffle(local_buffer)
+                        
+                        add_result = self.doc_buffer.add_documents(local_buffer)
+                        
+                        if not add_result:
+                            break  # Buffer closed
+                        
+                        batch_count += 1
+                        local_buffer = []
+                
+                except StopIteration:
+                    # Dataset exhausted - this is normal, just restart from beginning
+                    if local_buffer:
+                        self.doc_buffer.add_documents(local_buffer)
+                        local_buffer = []
+                    # Restart the dataset iterator for continuous streaming
+                    dataset_iter = iter(self.dataset)
+                    time.sleep(0.5)  # Brief pause before restarting
+                
+                except Exception as e:
+                    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Error in tokenizer worker {worker_id}: {e}")
+                    self.exception = e
+                    break
+        
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Fatal error in tokenizer worker {worker_id}: {e}")
+            self.exception = e
+        
+        finally:
+            # Worker finished - don't restart
+            pass
+    
+    def _create_padded_batch(self, documents: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        """Create a padded batch from documents with dynamic or fixed padding"""
+        start_time = time.time()
+        if not documents:
+            return None
+        
+        # Determine padding length
+        if self.use_fixed_padding:
+            # Use fixed padding for torch.compile compatibility
+            max_len = self.max_length
+        else:
+            # Find max length in this batch (dynamic padding)
+            actual_max = max(doc['length'] for doc in documents)
+            
+            # Apply bucketing if padding_bucket_size is set and we're using torch.compile
+            if self.padding_bucket_size > 0:
+                # Round up to the nearest bucket size
+                max_len = ((actual_max + self.padding_bucket_size - 1) // self.padding_bucket_size) * self.padding_bucket_size
+                # Cap at max_length
+                max_len = min(max_len, self.max_length)
+            else:
+                max_len = actual_max
+        
+        # Prepare tensors on CPU first
+        batch_size = len(documents)
+        input_ids = torch.full((batch_size, max_len), self.tokenizer.pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long)
+        
+        # Fill tensors
+        for i, doc in enumerate(documents):
+            doc_len = doc['length']
+            input_ids[i, :doc_len] = doc['input_ids']
+            attention_mask[i, :doc_len] = 1
+            # Clear the document's tensor reference after use
+            doc['input_ids'] = None
+        
+        # Create labels for autoregressive training
+        labels = input_ids.clone()
+        labels[:, :-1] = input_ids[:, 1:]
+        labels[:, -1] = self.tokenizer.pad_token_id
+        labels[input_ids == self.tokenizer.pad_token_id] = -100
+        
+        # Update padding statistics
+        total_tokens = batch_size * max_len
+        actual_tokens = sum(doc['length'] for doc in documents)
+        padding_tokens = total_tokens - actual_tokens
+        padding_ratio = padding_tokens / total_tokens if total_tokens > 0 else 0
+        
+        with self.batch_queue_lock:
+            self.stats['total_tokens'] += total_tokens
+            self.stats['total_padding_tokens'] += padding_tokens
+            if self.stats['total_tokens'] > 0:
+                self.stats['avg_padding_ratio'] = self.stats['total_padding_tokens'] / self.stats['total_tokens']
+        
+        # Track padding stats silently
+        
+        return {
+            'input_ids': input_ids.contiguous(),
+            'attention_mask': attention_mask.contiguous(),
+            'decoder_input_ids': input_ids.clone().contiguous(),
+            'decoder_attention_mask': attention_mask.clone().contiguous(),
+            'labels': labels.contiguous()
+        }
+    
+    def _batch_builder_worker(self):
+        """Worker thread that builds batches from tokenized documents"""
+        batch_count = 0
+        last_status_time = time.time()
+        consecutive_none = 0
+        last_memory_check = 0
+        try:
+            while not self.should_stop.is_set():
+                # Don't build too many batches ahead
+                queue_len = len(self.batch_queue)
+                if queue_len >= self.batch_queue.maxlen - 2:
+                    if batch_count == 0:  # Log only first time
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] Batch builder: Queue full ({queue_len}/{self.batch_queue.maxlen}), waiting...")
+                    while len(self.batch_queue) >= self.batch_queue.maxlen - 2 and not self.should_stop.is_set():
+                        self.should_stop.wait(0.1)  # Use wait instead of sleep for faster response
+                
+                if self.should_stop.is_set():
+                    break
+                
+                # Calculate dynamic batch size based on actual document sizes
+                if self.use_dynamic_batch_size and len(self.doc_buffer.tokenized_docs) > 0:
+                    # Peek at the documents to estimate their average length
+                    sample_size = min(20, len(self.doc_buffer.tokenized_docs))
+                    with self.doc_buffer.lock:
+                        sample_docs = self.doc_buffer.tokenized_docs[:sample_size]
+                        avg_length = sum(d['length'] for d in sample_docs) // len(sample_docs)
+                    
+                    # Apply bucketing if enabled
+                    if self.padding_bucket_size > 0:
+                        padded_length = ((avg_length + self.padding_bucket_size - 1) // self.padding_bucket_size) * self.padding_bucket_size
+                        padded_length = min(padded_length, self.max_length)
+                    else:
+                        padded_length = avg_length
+                    
+                    # Calculate how many sequences we can fit
+                    # Formula: dynamic_batch_size = max_total_tokens / padded_length
+                    theoretical_batch_size = self.max_total_tokens // padded_length
+                    
+                    # Apply safety factor to avoid OOM (accounts for activations, gradients, optimizer states)
+                    safe_batch_size = int(theoretical_batch_size * self.dynamic_batch_safety_factor)
+                    
+                    # Apply maximum multiplier cap to avoid extreme cases
+                    dynamic_batch_size = min(safe_batch_size, self.max_allowed_batch_size)
+                    dynamic_batch_size = max(1, dynamic_batch_size)  # At least 1
+                    
+                    # Log dynamic sizing occasionally
+                    if batch_count % 100 == 0:
+                        print(f"Dynamic batch sizing: padded_length={padded_length}, batch_size={dynamic_batch_size} "
+                              f"(theoretical={theoretical_batch_size}, base={self.batch_size}, safety={self.dynamic_batch_safety_factor})")
+                else:
+                    dynamic_batch_size = self.batch_size
+                
+                # Get documents for a batch (always wait for the first batch)
+                docs = self.doc_buffer.get_batch(
+                    dynamic_batch_size,  # Use dynamic batch size
+                    self.max_tokens_per_batch,
+                    wait=True  # Always wait for primary batch
+                )
+                
+                if docs is None:
+                    consecutive_none += 1
+                    if consecutive_none > 10:  # Allow some failures before giving up
+                        time.sleep(0.5)  # Wait longer if we're not getting docs
+                    continue
+                    
+                # Successfully got documents
+                consecutive_none = 0
+                
+                # Create padded batch
+                batch = self._create_padded_batch(docs)
+                
+                if batch is not None:
+                    # Build gradient accumulation group
+                    batch_group = [batch]
+                    
+                    # Try to get additional batches for gradient accumulation (non-blocking)
+                    for ga_idx in range(self.gradient_accumulation_steps - 1):
+                        # Try to get additional batch without waiting
+                        # Use the same dynamic batch size for consistency
+                        additional_docs = self.doc_buffer.get_batch(
+                            dynamic_batch_size,  # Use same dynamic batch size
+                            self.max_tokens_per_batch,
+                            wait=False  # Don't wait for additional batches
+                        )
+                        
+                        if additional_docs:
+                            additional_batch = self._create_padded_batch(additional_docs)
+                            if additional_batch:
+                                batch_group.append(additional_batch)
+                        else:
+                            break  # Use partial gradient accumulation
+                    
+                    # Add to batch queue
+                    with self.batch_queue_lock:
+                        # Limit queue size to prevent memory accumulation
+                        if len(self.batch_queue) >= self.batch_queue.maxlen:
+                            # Remove oldest batch group if queue is full
+                            old_group = self.batch_queue.popleft()
+                            del old_group  # Explicitly delete
+                        
+                        self.batch_queue.append(batch_group)
+                        self.stats['batches_created'] += len(batch_group)
+                        batch_count += 1
+                        
+                        # # Periodic GPU memory cleanup
+                        # if batch_count - last_memory_check > 100:
+                        #     if torch.cuda.is_available():
+                        #         torch.cuda.empty_cache()
+                        #     last_memory_check = batch_count
+                        
+                        self.batch_queue_not_empty.notify()
+        
+        except Exception as e:
+            print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] Error in batch builder: {e}")
+            self.exception = e
+    
+    def _start_workers(self):
+        """Start all worker threads"""
+        # Only start workers once
+        if self._workers_started:
+            return
+        self._workers_started = True
+        self.should_stop.clear()
+        self.exception = None
+        
+        # Start tokenizer workers
+        for i in range(self.num_workers):
+            thread = threading.Thread(
+                target=self._tokenizer_worker,
+                args=(i,),
+                daemon=False,  # Make non-daemon for proper cleanup
+                name=f"TokenizerWorker-{i}"
+            )
+            thread.start()
+            self.tokenizer_threads.append(thread)
+        
+        # Start batch builder
+        self.batch_builder_thread = threading.Thread(
+            target=self._batch_builder_worker,
+            daemon=False,  # Make non-daemon to ensure proper cleanup
+            name="BatchBuilder"
+        )
+        self.batch_builder_thread.start()
+    
+    def _wait_for_initial_batches(self):
+        """Wait for initial batches to be ready"""
+        timeout = 30  # Give more time for initial batches
+        start_time = time.time()
+        check_count = 0
+        
+        while time.time() - start_time < timeout:
+            with self.batch_queue_lock:
+                check_count += 1
+                queue_size = len(self.batch_queue)
+                
+                if queue_size > 0:
+                    # First batch ready
+                    return
+            
+            # Check buffer size too
+            buffer_size = len(self.doc_buffer) if hasattr(self, 'doc_buffer') else 0
+            if buffer_size > 0 or queue_size > 0:
+                # Some progress is being made
+                time.sleep(0.5)
+                continue
+                
+            if self.exception:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Exception detected: {self.exception}")
+                raise self.exception
+            
+            time.sleep(0.1)
+        
+        # Timeout reached - continue anyway as workers might be slow to start
+        # Don't print warnings in production
+    
+    def __iter__(self):
+        """Return iterator"""
+        # Start workers if not already started (backup in case __init__ didn't)
+        if not self._workers_started:
+            self._start_workers()
+        
+        # Wait for initial batches only on first real iteration
+        if not self._initialized:
+            self._wait_for_initial_batches()
+            self._initialized = True
+        
+        self.current_batch_group = None
+        self.current_batch_index = 0
+        return self
+    
+    def __next__(self):
+        """Get next batch"""
+        # Check if we've reached max iterations
+        if self.max_iterations is not None and self.iteration_count >= self.max_iterations:
+            raise StopIteration
+            
+        # Check for exceptions
+        if self.exception:
+            raise self.exception
+        
+        # Return next batch from current group
+        if self.current_batch_group and self.current_batch_index < len(self.current_batch_group):
+            batch = self.current_batch_group[self.current_batch_index]
+            self.current_batch_index += 1
+            self.stats['batches_served'] += 1
+            self.iteration_count += 1
+            # Clear previous batch from group to free memory
+            if self.current_batch_index > 1:
+                self.current_batch_group[self.current_batch_index - 2] = None
+            return batch
+        
+        # Get new batch group
+        with self.batch_queue_lock:
+            while len(self.batch_queue) == 0:
+                if self.exception:
+                    raise self.exception
+                
+                # Check if workers are done
+                all_done = all(not t.is_alive() for t in self.tokenizer_threads)
+                if all_done and len(self.batch_queue) == 0:
+                    raise StopIteration
+                
+                self.batch_queue_not_empty.wait(timeout=1.0)
+            
+            # Clear old batch group before getting new one
+            if self.current_batch_group is not None:
+                self.current_batch_group = None
+                # Force garbage collection of GPU memory
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            self.current_batch_group = self.batch_queue.popleft()
+        
+        # Return first batch from new group
+        self.current_batch_index = 1
+        self.stats['batches_served'] += 1
+        self.iteration_count += 1
+        # Log progress occasionally
+        if self.stats['batches_served'] % 1000 == 0:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Served {self.stats['batches_served']} batches")
+        return self.current_batch_group[0]
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get current statistics"""
+        with self.batch_queue_lock:
+            return self.stats.copy()
+    
+    def close(self):
+        """Clean shutdown"""
+        if self._closed:
+            return  # Already closed
+        
+        self._closed = True
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Closing dynamic data loader")
+        
+        if hasattr(self, 'should_stop'):
+            # Print stats before closing
+            try:
+                stats = self.get_stats()
+                print(f"\n{'='*60}")
+                print(f"Data Loader Final Statistics:")
+                print(f"  - Documents tokenized: {stats['docs_tokenized']:,}")
+                print(f"  - Batches created: {stats['batches_created']:,}")
+                print(f"  - Batches served: {stats['batches_served']:,}")
+                print(f"  - Average padding ratio: {stats['avg_padding_ratio']:.2%}")
+                print(f"{'='*60}\n")
+            except Exception as e:
+                print(f"Error printing stats: {e}")
+            
+            # Signal all threads to stop
+            self.should_stop.set()
+            
+            # Close the buffer immediately to unblock any waiting threads
+            if hasattr(self, 'doc_buffer'):
+                self.doc_buffer.close()
+            
+            # Wake up any threads that might be waiting
+            with self.batch_queue_lock:
+                self.batch_queue_not_empty.notify_all()
+            
+            # Give threads a moment to exit cleanly
+            time.sleep(0.1)
+            
+            # Join threads with timeout
+            if hasattr(self, 'tokenizer_threads'):
+                for i, thread in enumerate(self.tokenizer_threads):
+                    if thread.is_alive():
+                        thread.join(timeout=1.0)
+                        if thread.is_alive():
+                            print(f"Warning: TokenizerWorker-{i} did not terminate")
+            
+            if hasattr(self, 'batch_builder_thread') and self.batch_builder_thread:
+                if self.batch_builder_thread.is_alive():
+                    self.batch_builder_thread.join(timeout=1.0)
+                    if self.batch_builder_thread.is_alive():
+                        print(f"Warning: BatchBuilder thread did not terminate")
+            
+            # Remove from active datasets
+            _active_datasets.discard(self)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Dynamic data loader closed successfully")
+    
+    def __del__(self):
+        """Destructor"""
+        try:
+            self.close()
+        except Exception:
+            pass  # Suppress errors during cleanup

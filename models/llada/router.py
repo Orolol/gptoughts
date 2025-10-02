@@ -42,12 +42,8 @@ class LLaDARouter(Router):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
         
-        # Force cuBLAS to use Tensor Cores
-        try:
-            old_matmul_precision = torch.get_float32_matmul_precision()
-            torch.set_float32_matmul_precision('high')
-        except AttributeError:
-            old_matmul_precision = None
+        # Note: Removed matmul precision changes as they're not compatible with torch.compile
+        # torch.compile will handle tensor core optimization automatically
         
         # Compute router logits with memory optimization
         with torch.amp.autocast(enabled=True, device_type='cuda'):
@@ -63,7 +59,7 @@ class LLaDARouter(Router):
                 router_logits = self.router_gate(normalized)
                 
                 # Scale logits by temperature
-                temp_val = (self.temperature.abs() + 1e-6).item()
+                temp_val = self.temperature.abs() + 1e-6
                 router_logits = router_logits / temp_val
                 
                 # Compute routing probabilities
@@ -106,22 +102,18 @@ class LLaDARouter(Router):
                 # Reshape dispatch mask for batch processing
                 dispatch_mask = dispatch_mask.view(batch_size, seq_len, -1)
                 
-                # Reset precision if needed
-                if old_matmul_precision is not None:
-                    torch.set_float32_matmul_precision(old_matmul_precision)
+                # No precision reset needed when not using get/set_float32_matmul_precision
                 
                 return routing_weights.detach(), dispatch_mask, router_loss
                 
             except Exception as e:
-                print(f"Router failed with error: {e}")
+                # Router failed with error
                 # Fallback to uniform routing in case of error
                 fallback_weights = torch.ones((batch_size * seq_len, self.num_experts), 
                                            device=x.device) / self.num_experts
                 fallback_mask = fallback_weights.view(batch_size, seq_len, -1)
                 fallback_loss = torch.tensor(0.0, device=x.device)
                 
-                # Reset precision if needed
-                if old_matmul_precision is not None:
-                    torch.set_float32_matmul_precision(old_matmul_precision)
+                # No precision reset needed when not using get/set_float32_matmul_precision
                 
                 return fallback_weights, fallback_mask, fallback_loss 

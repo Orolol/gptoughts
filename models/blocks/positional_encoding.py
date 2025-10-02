@@ -127,4 +127,23 @@ class AlibiPositionalBias(nn.Module):
         self.register_buffer('alibi', alibi)
         
     def get_bias(self, T: int, device: torch.device) -> torch.Tensor:
-        return self.alibi.to(device)[:, :T, :T] 
+        return self.alibi.to(device)[:, :T, :T]
+
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+    """Precompute the frequency tensor for complex exponentials (RoPE)."""
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
+
+def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    """Apply rotary embeddings to input tensors."""
+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    freqs_cis = freqs_cis.to(x_complex.device)
+    x_rotated = x_complex * freqs_cis
+    x_out = torch.view_as_real(x_rotated).flatten(3)
+    return x_out.type_as(x)
+ 

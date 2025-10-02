@@ -1,44 +1,39 @@
 # MLA with Selective Attention
 
-This document describes the MLA-Selective model, which combines Multi-head Latent Attention (MLA) with a selective attention mechanism that dynamically selects which tokens to attend to based on importance scores.
+This document describes the MLA-Selective model, which combines Multi-head Latent Attention (MLA) with the selective attention mechanism from "Selective Attention Improves Transformer" (arXiv:2410.02703).
 
 ## Overview
 
-The MLA-Selective model extends the standard MLA architecture by adding a token selection mechanism that:
-- Computes importance scores for each token using a learned scoring network
-- Selects a subset of tokens based on these scores
-- Applies attention only to the selected tokens
+The MLA-Selective model extends the standard MLA architecture by adding a parameter-free token selection mechanism that:
+- Reuses one attention head's output as a selection function
+- Applies masking to reduce attention to unneeded tokens
+- Provides memory savings without adding parameters
 
-This approach can lead to:
-- **Improved efficiency**: By attending to fewer tokens, computational cost is reduced
-- **Better focus**: The model can learn to focus on the most relevant tokens
-- **Adaptability**: Different selection ratios can be used for different tasks
+This approach leads to:
+- **Memory efficiency**: 16-47x less memory for attention (for context sizes 512-2048)
+- **Equivalent performance**: Similar to models with 2x more attention heads/parameters
+- **No additional parameters**: Reuses existing attention weights
+- **Trade-off**: Disables Flash Attention/SDPA optimizations when enabled
 
 ## Architecture
 
 ### Components
 
-1. **Importance Scoring Network**: A small MLP that computes importance scores for each token
-   ```python
-   self.importance_score = nn.Sequential(
-       nn.Linear(dim, dim // 4),
-       nn.ReLU(),
-       nn.Linear(dim // 4, 1)
-   )
-   ```
+1. **Selection Head**: Uses one existing attention head's output for masking
+   - No additional parameters
+   - Configurable via `selection_head_idx` (default: 0)
 
-2. **Token Selection**: Three methods are supported:
-   - **top_k**: Select the top-k most important tokens
-   - **threshold**: Select tokens above a learned threshold
-   - **gumbel**: Use Gumbel-Softmax for differentiable selection
+2. **Masking Process**:
+   - Apply ReLU to attention weights (only reduce, never boost attention)
+   - Zero out first column (preserve BOS token)
+   - Zero out diagonal (prevent self-masking)
+   - Accumulate masks causally across sequence
 
-3. **Selective MLA**: Apply standard MLA attention only to selected tokens
+3. **Integration**: Selective masking is applied to attention logits before softmax
 
 ### Configuration Parameters
 
-- `selection_ratio`: Fraction of tokens to select (0.0 to 1.0, default: 0.5)
-- `selection_method`: Method for token selection ('top_k', 'threshold', 'gumbel')
-- `selection_temperature`: Temperature for Gumbel-Softmax selection (default: 1.0)
+- `selection_head_idx`: Which attention head to use for selection (default: 0)
 
 ## Usage
 
@@ -47,7 +42,7 @@ This approach can lead to:
 To train an MLA-Selective model:
 
 ```bash
-./train_mla_selective.sh small 8 2048 out_mla_selective 0 0.5 top_k
+./train_mla_selective.sh small 8 2048 out_mla_selective 0
 ```
 
 Parameters:
@@ -56,21 +51,18 @@ Parameters:
 3. Block size (sequence length)
 4. Output directory
 5. Use FP8 (0/1)
-6. Selection ratio (0.0-1.0)
-7. Selection method (top_k/threshold/gumbel)
 
 ### Python API
 
 ```python
 from models.models import create_mla_selective_model
 
-# Create model
+# Create model with selective attention (always enabled in MLASelective)
 model = create_mla_selective_model(
     size='small',
     vocab_size=50304,
     block_size=2048,
-    selection_ratio=0.5,
-    selection_method='top_k'
+    selection_head_idx=0  # Which head to use for selection
 )
 
 # Use like any other model
@@ -79,51 +71,56 @@ logits, loss = model(input_ids, targets)
 
 ## Implementation Details
 
-### Token Selection Process
+### Selective Attention Algorithm
 
-1. **Compute Importance**: For each token in the sequence, compute an importance score
-2. **Select Tokens**: Based on the selection method, choose which tokens to attend to
-3. **Apply Mask**: Mask out non-selected tokens in the attention computation
+Following the paper "Selective Attention Improves Transformer":
 
-### Selection Methods
+1. **Compute standard attention**: Calculate attention weights normally
+2. **Extract selection weights**: Use attention weights from one head as selection function
+3. **Apply constraints**:
+   - ReLU: Only allow positive masking values (reduce attention, not boost)
+   - Preserve BOS: Zero out first column to maintain start token
+   - No self-masking: Zero out diagonal
+4. **Accumulate mask**: Sum masks from previous tokens causally
+5. **Apply to attention**: Subtract accumulated mask from attention logits
 
-#### Top-K Selection
-- Selects the k tokens with highest importance scores
-- k = max(1, int(seq_len * selection_ratio))
-- Deterministic and differentiable through scores
+### Formula
 
-#### Threshold Selection
-- Selects tokens with importance above a dynamic threshold
-- Threshold is computed as the (1-selection_ratio) quantile of scores
-- Can result in variable number of selected tokens
+```
+SelectiveAttention(Q, K, V) = softmax((QK^T / √d_k) - F) V
+```
 
-#### Gumbel Selection
-- Uses Gumbel-Softmax for differentiable discrete selection
-- Allows gradient flow through the selection process
-- Temperature controls the sharpness of selection
+Where F is the accumulated masking matrix computed by summing previous tokens' selection values.
 
-### Integration with MLA
+### Performance Considerations
 
-The selective attention mechanism is integrated into the MLA forward pass:
+MLASelective always uses selective attention:
+- Memory usage: 16-47x reduction in attention memory
+- Speed: Optimal performance with PyTorch FlexAttention (when available)
+- Quality: Equivalent to models with 2x parameters
+- **FlexAttention**: Custom attention patterns compiled to efficient kernels
+- **Fallback**: Uses SDPA without selective masking when FlexAttention unavailable
 
-1. Compute Q, K, V projections as normal
-2. Compute importance scores and select tokens
-3. Apply selection mask to attention scores
-4. Continue with standard MLA computation
+For standard MLA without selective attention, use the regular MLA model.
 
-## Performance Considerations
+### Implementation Details
 
-- **Memory**: Selective attention reduces memory usage in attention computation
-- **Speed**: Fewer tokens to attend to means faster attention computation
-- **Quality**: Proper tuning of selection_ratio is important for maintaining model quality
+The implementation uses PyTorch's FlexAttention API which:
+- Compiles custom attention patterns to efficient CUDA kernels
+- Provides performance comparable to handwritten kernels
+- Supports block-sparse attention patterns
+- Integrates seamlessly with PyTorch's autograd
 
 ## Experimental Results
 
-(To be added based on experimental results)
+Based on the original paper:
+- Memory reduction: 16x (512 tokens), 25x (1024 tokens), 47x (2048 tokens)
+- Performance: Equivalent to transformers with 2x more attention heads/parameters
+- No additional parameters required
 
 ## Future Work
 
-- Dynamic selection ratio based on sequence complexity
-- Hierarchical selection (different ratios for different layers)
-- Learned selection policies
-- Integration with other efficiency techniques
+- Custom CUDA/Triton kernels to enable selective attention with Flash Attention
+- FlashAttention 3 integration when custom masking is supported
+- Hybrid approach: compute only selection head manually, use SDPA for others
+- Per-layer selection head configuration

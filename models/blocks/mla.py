@@ -7,27 +7,6 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 from .positional_encoding import RoPE
 
-
-try:
-    from flash_attn import flash_attn_func
-    FLASH_ATTENTION_AVAILABLE = True
-except ImportError:
-    FLASH_ATTENTION_AVAILABLE = False
-
-try:
-    import xformers.ops as xops
-    XFORMERS_AVAILABLE = True
-except ImportError:
-    XFORMERS_AVAILABLE = False
-
-# Attention backends available
-ATTENTION_BACKENDS = {
-    'flash_attn_2': FLASH_ATTENTION_AVAILABLE,
-    'xformers': XFORMERS_AVAILABLE,
-    'sdpa': hasattr(F, 'scaled_dot_product_attention'),
-    'standard': True
-}
-
 class MLA(nn.Module):
     """
     Multi-Head Latent Attention (MLA) Layer.
@@ -109,12 +88,18 @@ class MLA(nn.Module):
         self.max_seq_len = getattr(config, 'max_seq_len', 4096)
         self.attn_impl = getattr(config, 'attn_impl', "absorb")
         
-                # Initialize RoPE before anything else
+        # Initialize RoPE before anything else
         self.rope = RoPE(self.qk_rope_head_dim, self.max_seq_len)
         
         # Only create caches for inference, not for training
         # This prevents memory leaks during training
         self.inference_mode = False
+        
+        # Initialize cache attributes to None to prevent attribute errors
+        self.k_cache = None
+        self.v_cache = None
+        self.kv_cache = None
+        self.pe_cache = None
         
     def set_inference_mode(self, mode=True):
         """
@@ -161,10 +146,6 @@ class MLA(nn.Module):
         
 
 
-        # No need to create caches here now that we have set_inference_mode
-        # If this is an inference context, initialize the caches
-        if not self.training:
-            self.set_inference_mode(True)
     
 
     
@@ -181,6 +162,10 @@ class MLA(nn.Module):
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
+        # IMPORTANT: Always use training mode during training to prevent cache memory leaks
+        if self.training and self.inference_mode:
+            self.set_inference_mode(False)
+        
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
         
@@ -299,7 +284,10 @@ class MLA(nn.Module):
             
             # For keys, we need to reconstruct from low-rank space
             k_nope_full = torch.einsum("btc,hdc->bthd", kv_to_use, wkv_b[:, :self.qk_nope_head_dim])
-            k_full = torch.cat([k_nope_full, pe_to_use.unsqueeze(2).expand(-1, -1, self.n_heads, -1)], dim=-1)
+            # Properly expand pe_to_use from [B, T, D] to [B, T, H, D] where each head gets the same RoPE
+            # This ensures consistent rotary positional encoding across all attention heads
+            pe_expanded = pe_to_use.unsqueeze(2).expand(-1, -1, self.n_heads, -1)
+            k_full = torch.cat([k_nope_full, pe_expanded], dim=-1)
             k_sdpa = k_full.transpose(1, 2)  # [B, H, T, D]
             v_sdpa = v.transpose(1, 2)  # [B, H, T, D]
             
@@ -332,3 +320,13 @@ class MLA(nn.Module):
         x = self.resid_dropout(x)
         
         return x
+    
+    def clear_cache(self):
+        """Explicitly clear all caches - useful for memory management during training"""
+        self.k_cache = None
+        self.v_cache = None
+        self.kv_cache = None
+        self.pe_cache = None
+        # Force garbage collection of any remaining references
+        if hasattr(self, '_cache_tensors'):
+            del self._cache_tensors

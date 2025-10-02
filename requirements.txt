@@ -28,3 +28,4 @@ tensorboardX
 galore_torch
 apollo_torch
 lion_pytorch
+runpod

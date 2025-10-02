@@ -1,5 +1,7 @@
 """Mixture of Experts components for transformer models."""
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,10 +36,9 @@ class Router(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
-        combined_batch_size = batch_size * seq_len
         
         # Compute router logits
-        router_logits = self.router(x.view(-1, self.input_dim))
+        router_logits = self.router(x.reshape(batch_size * seq_len, self.input_dim))
         
         # Scale logits by learned temperature
         router_logits = router_logits / (self.temperature.abs() + 1e-6)
@@ -50,14 +51,6 @@ class Router(nn.Module):
         
         # Normalize top-k weights
         top_k_weights = top_k_weights / (top_k_weights.sum(dim=-1, keepdim=True) + 1e-6)
-        
-        # Create dispatch mask.
-        dispatch_mask = torch.zeros_like(routing_weights)
-        dispatch_mask.scatter_(
-            dim=-1,
-            index=top_k_indices,
-            src=top_k_weights
-        )
         
         # Compute load balancing loss
         # Ideal load would be uniform distribution across experts
@@ -79,10 +72,10 @@ class Router(nn.Module):
             self.load_balance_coef * load_balance_loss
         )
         
-        # Reshape dispatch mask for batch processing
-        dispatch_mask = dispatch_mask.view(batch_size, seq_len, -1)
-        
-        return routing_weights.detach(), dispatch_mask, router_loss
+        top_k_weights = top_k_weights.view(batch_size, seq_len, self.k)
+        top_k_indices = top_k_indices.view(batch_size, seq_len, self.k)
+
+        return top_k_weights, top_k_indices, router_loss
 
 class SharedExpertMLP(nn.Module):
     """
@@ -148,213 +141,95 @@ class SharedExpertMLP(nn.Module):
         nn.init.normal_(self.adapt_proj.weight, mean=0.0, std=adapt_scale)
 
 class ExpertGroup(nn.Module):
-    """
-    A group of experts that share some weights but maintain unique characteristics
-    through adaptation layers.
-    """
+    """Expert group with shared trunk and vectorised expert-specific adapters."""
+
     def __init__(self, config, num_experts: int):
         super().__init__()
         self.num_experts = num_experts
         self.config = config
-        
-        # Define dimensions 
-        # Note: SharedExpertMLP uses 4*config.n_embd for hidden_dim
-        # We need to match that here
+
+        # Shared trunk (common to all experts)
         self.shared_mlp = SharedExpertMLP(config)
         self.hidden_dim = self.shared_mlp.hidden_dim  # 4 * config.n_embd
         self.adapt_dim = self.shared_mlp.adapt_dim
-        
-        # Expert-specific adaptation with parallel computation
-        self.expert_adapters = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(self.adapt_dim, self.adapt_dim, bias=False),
-                nn.LayerNorm(self.adapt_dim)
-            ) for _ in range(num_experts)
-        ])
-        
-        # Projections for dimension matching
+
+        # Expert-specific adapter parameters stored as tensors for easy batching
+        self.adapter_weight = nn.Parameter(torch.empty(num_experts, self.adapt_dim, self.adapt_dim))
+        self.adapter_ln_weight = nn.Parameter(torch.ones(num_experts, self.adapt_dim))
+        self.adapter_ln_bias = nn.Parameter(torch.zeros(num_experts, self.adapt_dim))
+        self.norm_eps = 1e-5
+
+        # Projections back to model dimension (shared across experts)
         self.expert_proj = nn.Linear(self.adapt_dim, self.hidden_dim, bias=False)
-        # Use the shared_mlp's hidden_dim as input to output_proj
         self.output_proj = nn.Linear(self.hidden_dim, config.n_embd, bias=False)
-        
-        # Enable parallel computation
-        self.parallel_adapters = True
-        
-        # Initialize with small values
+
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
         adapt_scale = 0.01 / (self.adapt_dim ** 0.5)
-        for adapter in self.expert_adapters:
-            nn.init.normal_(adapter[0].weight, mean=0.0, std=adapt_scale)
+        nn.init.kaiming_uniform_(self.adapter_weight, a=math.sqrt(5))
+        nn.init.ones_(self.adapter_ln_weight)
+        nn.init.zeros_(self.adapter_ln_bias)
         nn.init.normal_(self.expert_proj.weight, mean=0.0, std=adapt_scale)
         nn.init.normal_(self.output_proj.weight, mean=0.0, std=adapt_scale)
 
-    def forward(self, x: torch.Tensor, expert_weights: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, hidden_dim = x.shape
-        
-        # Get shared representations
-        shared_output = self.shared_mlp(x)
-        
-        if self.parallel_adapters:
-            # Process all experts in parallel
-            expert_outputs = []
-            masks = []
-            
-            # Ensure expert_weights has correct shape [batch_size, seq_len, num_experts]
-            if expert_weights.dim() == 2:
-                expert_weights = expert_weights.view(batch_size, seq_len, -1)
-            
-            # Create masks for each expert
-            for i in range(self.num_experts):
-                mask = expert_weights[:, :, i] > 0
-                if mask.any():
-                    masks.append(mask)
-                    expert_x = x[mask]
-                    # Process through adapter and projections
-                    expert_hidden = self.shared_mlp.pre_adapt(expert_x)
-                    
-                    # Store dimensions for debugging
-                    pre_adapt_shape = expert_hidden.shape
-                    
-                    # Check if dimensions match what experts expect
-                    if hasattr(self.expert_adapters[i][0], 'in_features') and \
-                       expert_hidden.shape[-1] != self.expert_adapters[i][0].in_features:
-                        print(f"Adapter dimension mismatch: {expert_hidden.shape[-1]} vs {self.expert_adapters[i][0].in_features}")
-                        # Resize the tensor to match what the adapter expects
-                        if expert_hidden.shape[-1] < self.expert_adapters[i][0].in_features:
-                            # Pad
-                            pad_size = self.expert_adapters[i][0].in_features - expert_hidden.shape[-1]
-                            expert_hidden = torch.nn.functional.pad(expert_hidden, (0, pad_size))
-                        else:
-                            # Truncate
-                            expert_hidden = expert_hidden[..., :self.expert_adapters[i][0].in_features]
-                    
-                    expert_hidden = self.expert_adapters[i](expert_hidden)
-                    
-                    # Check if dimensions match what expert_proj expects
-                    if hasattr(self.expert_proj, 'in_features') and \
-                       expert_hidden.shape[-1] != self.expert_proj.in_features:
-                        # Resize
-                        if expert_hidden.shape[-1] < self.expert_proj.in_features:
-                            pad_size = self.expert_proj.in_features - expert_hidden.shape[-1]
-                            expert_hidden = torch.nn.functional.pad(expert_hidden, (0, pad_size))
-                        else:
-                            expert_hidden = expert_hidden[..., :self.expert_proj.in_features]
-                    
-                    expert_hidden = self.expert_proj(expert_hidden)
-                    
-                    # Check if dimensions match what output_proj expects
-                    if hasattr(self.output_proj, 'in_features') and \
-                       expert_hidden.shape[-1] != self.output_proj.in_features:
-                        # Resize
-                        if expert_hidden.shape[-1] < self.output_proj.in_features:
-                            pad_size = self.output_proj.in_features - expert_hidden.shape[-1]
-                            expert_hidden = torch.nn.functional.pad(expert_hidden, (0, pad_size))
-                        else:
-                            expert_hidden = expert_hidden[..., :self.output_proj.in_features]
-                            
-                    expert_hidden = self.output_proj(expert_hidden)
-                    
-                    # Check that output shape matches input shape (which is what would be assigned back to masked positions)
-                    if expert_hidden.shape[-1] != x.shape[-1]:
-                        if expert_hidden.shape[-1] < x.shape[-1]:
-                            # Pad to match input dimensions
-                            pad_size = x.shape[-1] - expert_hidden.shape[-1]
-                            expert_hidden = torch.nn.functional.pad(expert_hidden, (0, pad_size))
-                        else:
-                            # Truncate to match input dimensions
-                            expert_hidden = expert_hidden[..., :x.shape[-1]]
-                    
-                    expert_outputs.append(expert_hidden)
-            
-            # Combine expert outputs efficiently
-            if expert_outputs:
-                # Create a properly shaped tensor for the combined output
-                # Match the shape of the input
-                combined_output = torch.zeros_like(x)
-                
-                # Project shared output down to the original input dimension
-                # Using an MLP projection instead of simple reshaping
-                reshaped_shared = self.output_proj(shared_output)
-                if reshaped_shared.shape != x.shape:
-                    print(f"Projecting shared output from shape {shared_output.shape} to {x.shape}, got {reshaped_shared.shape}")
-                    # In case the output projection didn't get us to the right dimension, adjust
-                    if reshaped_shared.shape[-1] < x.shape[-1]:
-                        pad_size = x.shape[-1] - reshaped_shared.shape[-1]
-                        reshaped_shared = torch.nn.functional.pad(reshaped_shared, (0, pad_size))
-                    else:
-                        reshaped_shared = reshaped_shared[..., :x.shape[-1]]
-                
-                for i, (mask, expert_output) in enumerate(zip(masks, expert_outputs)):
-                    # Make sure dimensions match before assignment
-                    if expert_output.shape[-1] != combined_output.shape[-1]:
-                        # Resize if needed (in case the dimensions don't match)
-                        if expert_output.shape[-1] < combined_output.shape[-1]:
-                            # Pad the expert output
-                            pad_size = combined_output.shape[-1] - expert_output.shape[-1]
-                            expert_output = torch.nn.functional.pad(expert_output, (0, pad_size))
-                        else:
-                            # Truncate the expert output
-                            expert_output = expert_output[..., :combined_output.shape[-1]]
-                    
-                    # Get the mask in flattened format for indexing
-                    flattened_mask = mask.view(-1)
-                    # Count non-zero elements in the flattened mask
-                    total_elements = flattened_mask.sum().item()
-                    
-                    # Make sure expert_output has the right number of samples for the mask
-                    if expert_output.shape[0] != total_elements:
-                        # Try reshaping the expert_output to match the number of masked elements
-                        if total_elements > 0:
-                            # We need to ensure we have enough elements
-                            if expert_output.numel() >= total_elements * expert_output.shape[-1]:
-                                # Reshape to match the required number of elements
-                                expert_output = expert_output.reshape(total_elements, expert_output.shape[-1])
-                            else:
-                                # Skip this assignment to avoid a runtime error
-                                continue
-                        else:
-                            # Skip this assignment since there are no masked elements
-                            continue
-                    
-                    try:
-                        # Use flattened view for assignment to ensure shapes match
-                        reshaped_output = combined_output.reshape(-1, combined_output.shape[-1])
-                        
-                        # Make sure the dtype matches
-                        if combined_output.dtype != expert_output.dtype:
-                            expert_output = expert_output.to(dtype=combined_output.dtype)
-                        
-                        reshaped_output[flattened_mask] = expert_output
-                    except Exception as e:
-                        # Try an alternative method for assignment
-                        try:
-                            # Get the indices where the mask is True
-                            flat_indices = torch.nonzero(flattened_mask).squeeze(-1)
-                            
-                            # Manual loop for assignment (slower but more reliable)
-                            for j, idx in enumerate(flat_indices):
-                                if j < expert_output.shape[0]:  # Ensure we don't go out of bounds
-                                    # Ensure the dtype matches
-                                    exp_output = expert_output[j].to(dtype=combined_output.dtype)
-                                    reshaped_output[idx] = exp_output
-                        except:
-                            # If all attempts fail, we'll just continue without this expert's output
-                            pass
-                
-                return reshaped_shared + 0.1 * combined_output
-        
-        # For the case where no parallel adapter is used or no expert matches
-        # Project shared output down to the original input dimension
-        reshaped_shared = self.output_proj(shared_output)
-        if reshaped_shared.shape != x.shape:
-            print(f"Projecting shared output from shape {shared_output.shape} to {x.shape}, got {reshaped_shared.shape}")
-            # In case the output projection didn't get us to the right dimension, adjust
-            if reshaped_shared.shape[-1] < x.shape[-1]:
-                pad_size = x.shape[-1] - reshaped_shared.shape[-1]
-                reshaped_shared = torch.nn.functional.pad(reshaped_shared, (0, pad_size))
-            else:
-                reshaped_shared = reshaped_shared[..., :x.shape[-1]]
-        
-        return reshaped_shared
+    def compute_shared(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute shared trunk outputs and adapter inputs."""
+        shared_output = self.shared_mlp(x)            # [B, S, hidden_dim]
+        shared_proj = self.output_proj(shared_output) # [B, S, n_embd]
+        pre_adapt = self.shared_mlp.pre_adapt(x)      # [B, S, adapt_dim]
+        return shared_proj, pre_adapt
+
+    def mix_experts(
+        self,
+        pre_adapt: torch.Tensor,
+        topk_indices: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dispatch tokens to their experts and aggregate specialised outputs."""
+
+        batch_size, seq_len, _ = pre_adapt.shape
+        device = pre_adapt.device
+        dtype = pre_adapt.dtype
+        k = topk_indices.size(-1)
+
+        total_tokens = batch_size * seq_len
+        if total_tokens == 0:
+            return torch.zeros(batch_size, seq_len, self.output_proj.out_features, device=device, dtype=dtype)
+
+        # Flatten token positions and expert assignments
+        token_positions = torch.arange(total_tokens, device=device, dtype=torch.long)
+        token_positions = token_positions.unsqueeze(-1).expand(-1, k).reshape(-1)
+        expert_indices = topk_indices.reshape(-1)
+        weights = topk_weights.reshape(-1)
+
+        # Gather adapter inputs for the dispatched tokens
+        flat_pre = pre_adapt.reshape(total_tokens, self.adapt_dim)
+        inputs = flat_pre.index_select(0, token_positions)  # [N, adapt_dim]
+
+        # Select adapter weights/biases for the corresponding experts
+        adapter_weight = self.adapter_weight.index_select(0, expert_indices).to(inputs.dtype)
+        ln_weight = self.adapter_ln_weight.index_select(0, expert_indices).to(inputs.dtype)
+        ln_bias = self.adapter_ln_bias.index_select(0, expert_indices).to(inputs.dtype)
+
+        # Linear adapter + normalisation per dispatched token (batched)
+        adapted = torch.bmm(inputs.unsqueeze(1), adapter_weight.transpose(1, 2)).squeeze(1)
+        mean = adapted.mean(dim=-1, keepdim=True)
+        var = adapted.var(dim=-1, unbiased=False, keepdim=True)
+        adapted = (adapted - mean) / torch.sqrt(var + self.norm_eps)
+        adapted = adapted * ln_weight + ln_bias
+
+        # Shared projections back to model dimension
+        hidden = self.expert_proj(adapted)
+        specialised = self.output_proj(hidden)
+
+        # Weight by router assignment and scatter back to token positions
+        weighted = specialised * weights.to(specialised.dtype).unsqueeze(-1)
+
+        mixed = torch.zeros(total_tokens, specialised.size(-1), device=specialised.device, dtype=specialised.dtype)
+        mixed.index_add_(0, token_positions, weighted)
+
+        return mixed.reshape(batch_size, seq_len, -1)
 
 class MoELayer(nn.Module):
     """
@@ -389,13 +264,14 @@ class MoELayer(nn.Module):
         # Normalize input
         normalized = self.norm(x)
         
-        # Get routing weights and dispatch mask
-        routing_weights, dispatch_mask, router_loss = self.router(normalized)
-        
-        # Process through expert group
-        expert_output = self.expert_group(normalized, dispatch_mask)
-        
+        # Routing (top-k) and expert dispatch
+        topk_weights, topk_indices, router_loss = self.router(normalized)
+        shared_proj, pre_adapt = self.expert_group.compute_shared(normalized)
+        specialised = self.expert_group.mix_experts(pre_adapt, topk_indices, topk_weights)
+
+        expert_output = shared_proj + 0.1 * specialised.to(shared_proj.dtype)
+
         # Add scaled residual connection
-        output = residual + self.residual_scale * expert_output
-        
+        output = residual + self.residual_scale * expert_output.to(residual.dtype)
+
         return output, router_loss 

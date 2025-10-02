@@ -40,6 +40,7 @@ ENV/
 # Project specific
 temp/
 out/
+ouputs/
 wandb/
 *.pt
 *.bin
@@ -62,3 +63,7 @@ install.txt
 .clinerules-code
 
 *.ckpt
+
+out_*/
+grid_search*/
+outputs/

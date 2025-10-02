@@ -18,7 +18,9 @@ from typing import Optional, Dict, List, Tuple, Union, Any
 from dataclasses import dataclass
 
 # Import components from blocks
-from models.blocks.mla_selective import MLASelective
+# from models.blocks.mla_selective import MLASelective
+from models.blocks.mla_selective_fast import MLASelectiveFast as MLASelective
+# from models.blocks.mla_selective_pruned import MLASelectivePruned as MLASelective
 from models.blocks.mla_block import MLABlock
 from models.blocks.normalization import RMSNorm, DynamicTanh
 from models.blocks.positional_encoding import RoPE
@@ -47,9 +49,7 @@ class MLASelectiveModelConfig:
     v_head_dim: int = 128
     
     # Selective attention parameters
-    selection_ratio: float = 0.5  # Ratio of tokens to select
-    selection_method: str = 'top_k'  # Method for token selection
-    selection_temperature: float = 1.0  # Temperature for Gumbel selection
+    selection_head_idx: int = 0  # Which attention head to use for selection
     
     # Méthodes d'attention
     attention_backend: Optional[str] = None  # Si None, utilisera automatiquement le meilleur backend
@@ -76,6 +76,8 @@ class MLASelectiveModelConfig:
     # Dynamic Tanh (DyT) options
     use_dyt: bool = False  # Whether to use Dynamic Tanh (DyT) instead of RMSNorm
     dyt_alpha_init: float = 0.5  # Initial value for DyT alpha parameter
+    
+    
     
     def __post_init__(self):
         # Set inner dimension if not provided
@@ -379,7 +381,7 @@ class MLASelectiveModel(nn.Module):
                     loss = (loss * mask.view(-1)).sum() / mask.sum()
                 else:
                     # Standard loss without label smoothing
-                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
                 
             else:
                 # Inference-time optimization: only compute logits for last position
@@ -572,9 +574,7 @@ def create_mla_selective_model(
     block_size: int = 4096,
     dropout: float = 0.0,
     fp8_params: bool = True,
-    selection_ratio: float = 0.5,
-    selection_method: str = 'top_k',
-    selection_temperature: float = 1.0,
+    selection_head_idx: int = 0,
     **kwargs
 ):
     """
@@ -589,9 +589,7 @@ def create_mla_selective_model(
         block_size: Maximum sequence length
         dropout: Dropout probability
         fp8_params: Whether to use FP8 precision for eligible parameters
-        selection_ratio: Ratio of tokens to select
-        selection_method: Method for token selection
-        selection_temperature: Temperature for Gumbel selection
+        selection_head_idx: Which attention head to use for selection (default: 0)
         **kwargs: Additional configuration arguments
     
     Returns:
@@ -641,9 +639,7 @@ def create_mla_selective_model(
         'block_size': block_size,
         'dropout': dropout,
         'fp8_params': fp8_params,
-        'selection_ratio': selection_ratio,
-        'selection_method': selection_method,
-        'selection_temperature': selection_temperature,
+        'selection_head_idx': selection_head_idx,
     })
     
     # Add any additional parameters

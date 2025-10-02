@@ -93,7 +93,10 @@ def calculate_perplexity(loss):
     Returns:
         float: Perplexity value
     """
-    return torch.exp(torch.tensor(loss)).item()
+    if isinstance(loss, torch.Tensor):
+        return torch.exp(loss).item()
+    else:
+        return math.exp(loss)
 
 def get_lr(current_iter, warmup_iters, lr_decay_iters, learning_rate, min_lr):
     """
@@ -491,52 +494,57 @@ def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8, top_
     output_tokens = None # Initialize
     try:
         with torch.no_grad(): # No need for gradients during generation
-            # Check if the model has a generate method (standard for HF-like models)
-            if hasattr(model, 'generate') and callable(getattr(model, 'generate')):
-                # Explicitly pass input_ids and other relevant args
-                # Remove tokenizer from this call as it's not a direct model.generate param for all models
-                generate_kwargs = {
-                    "max_new_tokens": max_new_tokens,
-                    "temperature": temperature,
-                    "top_k": top_k
-                }
-                # Some models might return more than just tokens (e.g. scores), capture them if so.
-                # Assuming the first returned item is the sequence of tokens.
-                returned_from_generate = model.generate(
-                    input_ids=encoder_input, 
-                    **generate_kwargs
+            # Check for SEDD model first
+            model_instance = model.module if hasattr(model, 'module') else model
+            if hasattr(model_instance, '__class__') and 'SEDD' in model_instance.__class__.__name__:
+                # SEDD model generation
+                output_tokens = model.generate(
+                    input_ids=encoder_input,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_k=top_k
                 )
-                if isinstance(returned_from_generate, tuple):
-                    output_tokens = returned_from_generate[0]
-                else:
-                    output_tokens = returned_from_generate
+            # Prefer explicit LLaDA handling first to avoid mis-calling with input_ids
+            elif LLaDAModel is not None and isinstance(model_instance, LLaDAModel):
+                # Use BD3 block-by-block generation (new LLaDA API)
+                # Returns (tokens, None)
+                output_tokens, _ = model.generate(
+                    prompt=encoder_input,
+                    gen_length=max_new_tokens,
+                    temperature=temperature,
+                    top_k=top_k
+                )
+            elif hasattr(model_instance, 'generation_forward'):
+                # MLA-LLaDA diffusion generation path
+                output = model_instance.generation_forward(
+                    input_ids=encoder_input,
+                    attention_mask=None,
+                    num_diffusion_steps=25
+                )
+                output_tokens = output.get('generated_ids')
+            elif hasattr(model, 'generate') and callable(getattr(model, 'generate')):
+                # Standard HF-like path
+                returned_from_generate = model.generate(
+                    input_ids=encoder_input,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_k=top_k
+                )
+                output_tokens = returned_from_generate[0] if isinstance(returned_from_generate, tuple) else returned_from_generate
             else:
-                # Check if it's the LLaDA model and call the appropriate generate method
-                if LLaDAModel is not None and isinstance(model.module if hasattr(model, 'module') else model, LLaDAModel):
-                    # Call the original LLaDA generation method
-                    # Ensure arguments match generate_original_llada signature
-                    # Note: generate_original_llada might return (tokens, None) or (tokens, error)
+                # Fallback to original LLaDA iterative demasking if exposed
+                if hasattr(model, 'generate_original_llada'):
                     output_tokens, error_info = model.generate_original_llada(
                         prompt=encoder_input,
-                        steps=32,  # Keep original steps argument if needed by this method
+                        steps=32,
                         gen_length=max_new_tokens,
-                        block_length=max_new_tokens, # Or a different block length if appropriate
+                        block_length=max_new_tokens,
                         temperature=temperature,
                         tokenizer=tokenizer,
-                        remasking='low_confidence' 
+                        remasking='low_confidence'
                     )
-                    if error_info is not None: print(f"Original LLaDA generation returned error: {error_info}")
-                    # output_text_from_generate remains None here as generate_original_llada doesn't return decoded text
-                else:
-                    # Standard generate call for other models (e.g., GPT) OR LLaDA if isinstance fails
-                    # Assuming they have a generate method compatible with these args
-                    # The new LLaDA generate returns (tokens, None)
-                    output_tokens, _ = model.generate( # Use _ to ignore the second return value
-                        prompt=encoder_input, # Use 'prompt' as it's expected by new LLaDA generate
-                        gen_length=max_new_tokens, # Match new LLaDA generate signature
-                        temperature=temperature,
-                        top_k=top_k
-                    )
+                    if error_info is not None:
+                        print(f"Original LLaDA generation returned error: {error_info}")
     
     except Exception as e:
         print(f"Error during text generation: {e}")
@@ -646,7 +654,10 @@ def calculate_perplexity(loss):
     Returns:
         float: Perplexity value
     """
-    return torch.exp(torch.tensor(loss)).item()
+    if isinstance(loss, torch.Tensor):
+        return torch.exp(loss).item()
+    else:
+        return math.exp(loss)
 
 def get_lr(current_iter, warmup_iters, lr_decay_iters, learning_rate, min_lr):
     """
@@ -1045,26 +1056,65 @@ def generate_text(model, encoder_input, max_new_tokens=50, temperature=0.8, top_
             output_tokens = None
             output_text_from_generate = None # Store text if generate provides it directly
 
-            # Check if it's the LLaDA model and call the appropriate generate method
-            if LLaDAModel is not None and isinstance(model.module if hasattr(model, 'module') else model, LLaDAModel):
-                # Call the original LLaDA generation method
-                # Ensure arguments match generate_original_llada signature
-                # Note: generate_original_llada might return (tokens, None) or (tokens, error)
-                output_tokens, error_info = model.generate_original_llada(
-                    prompt=encoder_input,
-                    steps=32,  # Keep original steps argument if needed by this method
-                    gen_length=max_new_tokens,
-                    block_length=max_new_tokens, # Or a different block length if appropriate
+            # Check for SEDD model first
+            model_instance = model.module if hasattr(model, 'module') else model
+            if hasattr(model_instance, '__class__') and 'SEDD' in model_instance.__class__.__name__:
+                # SEDD model generation
+                output_tokens = model.generate(
+                    input_ids=encoder_input,
+                    max_new_tokens=max_new_tokens,
                     temperature=temperature,
-                    tokenizer=tokenizer,
-                    remasking='low_confidence' 
+                    top_k=top_k
                 )
-                if error_info is not None: print(f"Original LLaDA generation returned error: {error_info}")
-                # output_text_from_generate remains None here as generate_original_llada doesn't return decoded text
+            # Check if it's the LLaDA model and use its generate method
+            elif LLaDAModel is not None and isinstance(model_instance, LLaDAModel):
+                # Use the new BD3-based generation method
+                # The new generate method returns (tokens, None)
+                output_tokens, _ = model.generate(
+                    prompt=encoder_input,
+                    gen_length=max_new_tokens,
+                    temperature=temperature,
+                    top_k=top_k
+                )
+                # output_text_from_generate remains None here as generate doesn't return decoded text
             else:
                 # Check which parameters the model's generate method accepts
-                if model.__class__.__name__ == 'MLAModel':
+                # Handle OptimizedModule wrapper from torch.compile
+                model_class_name = model.__class__.__name__
+                if hasattr(model, '_orig_mod'):
+                    # This is a compiled model, check the original module
+                    model_class_name = model._orig_mod.__class__.__name__
+                elif hasattr(model, 'module'):
+                    # This might be a DDP wrapped model
+                    model_class_name = model.module.__class__.__name__
+                
+                if model_class_name == 'MLALLaDAModel':
+                    # Use simple autoregressive generation for MLA-LLaDA during training
+                    if hasattr(model, 'generate_simple'):
+                        output_tokens = model.generate_simple(
+                            idx=encoder_input,
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature,
+                            top_k=top_k
+                        )
+                    else:
+                        # Fallback to standard generate
+                        output_tokens, _ = model.generate(
+                            idx=encoder_input,
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature,
+                            top_k=top_k
+                        )
+                elif model_class_name == 'MLAModel' or 'MLA' in model_class_name:
                     # MLAModel expects 'idx' as the primary parameter
+                    output_tokens, _ = model.generate(
+                        idx=encoder_input,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_k=top_k
+                    )
+                elif model_class_name == 'NSAModel' or 'NSA' in model_class_name:
+                    # NSAModel expects 'idx' as the primary parameter
                     output_tokens, _ = model.generate(
                         idx=encoder_input,
                         max_new_tokens=max_new_tokens,

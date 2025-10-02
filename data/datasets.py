@@ -4,51 +4,119 @@ Centralized dataset loading functions to avoid circular imports.
 
 from torch.utils.data import DataLoader
 
-def get_datasets(block_size, batch_size, tokenizer=None, num_workers=4):
+def get_datasets(args):
     """
-    Returns the training and validation DataLoaders.
-    Uses FinewebDataset if available, otherwise falls back to alternatives.
+    Returns the training and validation DataLoaders based on the specified dataloader type.
     """
-    from data.data_loader_original import FinewebDataset
-    print("Using FinewebDataset for training")
+    dataloader_type = getattr(args, 'dataloader_type', 'original')
 
-    # Note: FinewebDataset seems to handle batching internally.
-    # We wrap it in a simple identity dataloader or adjust its usage.
-    # For IterableDatasets, DataLoader typically just manages workers.
-    train_dataset = FinewebDataset(
-        split='train',
-        max_length=block_size,
-        buffer_size=batch_size * 10, # Larger buffer for better shuffling
-        shuffle=True,
-        tokenizer=tokenizer,
-        batch_size=batch_size # Dataset yields batches directly
-    )
+    if dataloader_type == 'dynamic':
+        from data.data_loader_dynamic import DynamicFinewebDataset
+        print("Using FinewebDatasetDynamic (stable) for training.")
+        
+        # Enable fixed padding when using torch.compile for compatibility
+        use_fixed_padding = getattr(args, 'compile', False)
+        if use_fixed_padding:
+            print("Note: Using fixed padding for torch.compile compatibility")
 
-    val_dataset = FinewebDataset(
-        split='train', # Use validation split if available
-        max_length=block_size,
-        buffer_size=batch_size * 2,
-        shuffle=False,
-        tokenizer=tokenizer,
-        batch_size=batch_size # Dataset yields batches directly
-    )
+        train_dataset = DynamicFinewebDataset(
+            split='train',
+            max_length=args.block_size,
+            buffer_size=args.batch_size * 4,
+            shuffle=True,
+            tokenizer=args.tokenizer,
+            max_sequences_per_batch=args.batch_size,
+            gradient_accumulation_steps=getattr(args, 'gradient_accumulation_steps', 1),
+            use_fixed_padding=use_fixed_padding,
+            use_dynamic_batch_size=True,  # Enable dynamic batch sizing for optimal GPU usage
+            dynamic_batch_safety_factor=getattr(args, 'dynamic_batch_safety_factor', 0.7),  # Conservative default
+            dynamic_batch_max_multiplier=getattr(args, 'dynamic_batch_max_multiplier', 1.5)  # Max 1.5x base batch size
+            # No max_iterations for training - let Lightning handle epoch control
+        )
+        val_dataset = train_dataset
 
-    # Since FinewebDataset yields batches, DataLoader might just need num_workers
-    # If it's NOT an IterableDataset yielding batches, DataLoader handles batching.
-    # Assuming FinewebDataset IS an IterableDataset yielding batches:
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=1, # Batching is done inside dataset
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=lambda x: x[0] # Identity collate since dataset yields batches
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=1, # Batching is done inside dataset
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=lambda x: x[0] # Identity collate
-    )
+        # The dynamic loader uses internal threading, so we need num_workers=0
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=1, # Batching is handled inside the dataset
+            num_workers=0,  # Dynamic loader has its own threading
+            pin_memory=True,
+            collate_fn=lambda x: x[0]
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=1, # Batching is handled inside the dataset
+            num_workers=0,  # Dynamic loader has its own threading
+            pin_memory=True,
+            collate_fn=lambda x: x[0]
+        )
+
+    elif dataloader_type == 'packed':
+        from data.data_loader_packed import PackedFinewebDataset
+        print("Using PackedFinewebDataset for training (fixed shape + document packing).")
+
+        # For multi-GPU training, we need to ensure each GPU gets different data
+        # Lightning handles this automatically via DistributedSampler for non-iterable datasets
+        # For IterableDataset, we need to handle it in the dataset itself
+        train_dataset = PackedFinewebDataset(
+            split='train',
+            max_length=args.block_size,
+            batch_size=args.batch_size,
+            tokenizer=args.tokenizer,
+            prefetch_batches=16,
+            buffer_docs=max(2048, args.batch_size * args.block_size),
+            shuffle=True,
+        )
+        val_dataset = train_dataset
+
+        # Important: For IterableDataset with Lightning DDP, we must use:
+        # - batch_size=None (batching handled by dataset)
+        # - num_workers=0 (dataset has internal threading)
+        # - persistent_workers=False (not applicable with num_workers=0)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=None,  # Changed from 1 to None for proper DDP handling
+            num_workers=0,
+            pin_memory=True,
+            persistent_workers=False,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=None,  # Changed from 1 to None for proper DDP handling
+            num_workers=0,
+            pin_memory=True,
+            persistent_workers=False,
+        )
+
+    else: # 'original'
+        from data.data_loader_original import FinewebDataset
+        print("Using FinewebDataset (original) for training.")
+
+        train_dataset = FinewebDataset(
+            split='train',
+            max_length=args.block_size,
+            buffer_size=args.batch_size * 4,
+            shuffle=True,
+            tokenizer=args.tokenizer,
+            batch_size=args.batch_size,
+            gradient_accumulation_steps=getattr(args, 'gradient_accumulation_steps', 1)
+        )
+        val_dataset = train_dataset
+        
+        # The original dataloader yields pre-formed batches, so we use an identity collate.
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=1, # Batching is handled inside the dataset
+            num_workers=4,
+            pin_memory=True,
+            collate_fn=lambda x: x[0]
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=1, # Batching is handled inside the dataset
+            num_workers=4,
+            pin_memory=True,
+            collate_fn=lambda x: x[0]
+        )
 
     return train_loader, val_loader
