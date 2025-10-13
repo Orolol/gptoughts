@@ -120,7 +120,7 @@ class Trainer:
         # Distributed setup
         self.ddp = int(os.environ.get('RANK', -1)) != -1
         if self.ddp:
-            self.ddp_rank, self.ddp_local_rank, self.ddp_world_size, self.device = setup_distributed(backend=self.args.backend)
+            self.ddp_rank, self.ddp_local_rank, self.ddp_world_size, self.device = setup_distributed(backend='nccl')
             self.master_process = self.ddp_rank == 0
             self.seed_offset = self.ddp_rank
         else:
@@ -1655,49 +1655,52 @@ class Trainer:
                         # Backward pass avec optimisations
                         with self.timing_stats.track("backward"):
                             if loss is not None:
+                                # CRITICAL: Save unscaled loss for logging (same as Lightning)
+                                unscaled_loss = loss.item()
+
                                 # Scale loss for gradient accumulation
                                 loss = loss / self.args.gradient_accumulation_steps
-                                
+
                                 # Add auxiliary loss if available
                                 if balance_loss != 0:
+                                    unscaled_balance_loss = balance_loss.item() if torch.is_tensor(balance_loss) else balance_loss
                                     balance_loss = balance_loss / self.args.gradient_accumulation_steps
-                                    
-                                    # Track MTP loss separately for logging
+
+                                    # Combine losses (match Lightning logic exactly)
                                     if model_type == 'deepseek' and getattr(self.args, 'use_mtp', True):
-                                        total_mtp_loss += balance_loss.item()
+                                        # DeepSeek MTP: loss already includes mtp_loss internally, just track it
+                                        total_mtp_loss += unscaled_balance_loss
+                                        combined_loss = loss  # MTP already combined by model
                                     elif model_type == 'llada':
                                         # Use router loss coefficient for LLaDA
                                         router_loss_coef = getattr(self.args, 'router_z_loss_coef', 0.0001)
-                                        total_router_loss += balance_loss.item()
+                                        total_router_loss += unscaled_balance_loss
                                         combined_loss = loss + router_loss_coef * balance_loss
                                     else:
                                         # Default behavior
                                         router_loss_coef = getattr(self.args, 'router_z_loss_coef', 0.001)
+                                        total_router_loss += unscaled_balance_loss
                                         combined_loss = loss + router_loss_coef * balance_loss
                                 else:
                                     combined_loss = loss
-                                
+
                                 # Check for NaN values before backward pass
                                 if torch.isnan(combined_loss).any():
                                     print(f"WARNING: NaN detected in loss at iteration {self.iter_num}")
                                     skip_optimizer_step = True
                                     # Skip backward to avoid corrupting the model
                                     continue
-                                
+
                                 # Backward pass with or without scaler
                                 if self.scaler.is_enabled():
                                     scaled_loss = self.scaler.scale(combined_loss)
-                                    scaled_loss.backward(retain_graph=False)  # Changed to False to reduce memory usage
+                                    scaled_loss.backward(retain_graph=False)
                                 else:
                                     # Direct backward for bfloat16 which has sufficient dynamic range
-                                    # Now we can use retain_graph=False for all models including MLA
-                                    # since we've fixed the router loss handling
                                     combined_loss.backward(retain_graph=False)
-                                    
-                                # Track losses
-                                total_loss += loss.item()
-                                if balance_loss != 0:
-                                    total_router_loss += balance_loss.item()
+
+                                # Track unscaled losses for logging (same as Lightning)
+                                total_loss += unscaled_loss
                                 
                                 # Clean up
                                 del loss
