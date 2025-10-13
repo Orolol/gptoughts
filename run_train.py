@@ -370,7 +370,7 @@ def main():
 
                 # Only add find_unused_parameters if explicitly requested
                 if args.strategy == 'ddp':
-                    ddp_kwargs['find_unused_parameters'] = True
+                    ddp_kwargs['find_unused_parameters'] = False # Default to False for performance
                     ddp_kwargs['static_graph'] = False
 
                 print(f"Configuring DDPStrategy with optimizations for memory balance...")
