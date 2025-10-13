@@ -293,6 +293,10 @@ class LLMLightningModule(pl.LightningModule):
             config = create_swa_mla_config(self.args)
             from models.models.swa_mla_model import SWAMLAModel
             model = SWAMLAModel(config)
+        elif model_type == 'swa_mla_moe':
+            config = create_swa_mla_moe_config(self.args)
+            from models.models.swa_mla_moe_model import SWAMLAMOEModel
+            model = SWAMLAMOEModel(config)
         elif model_type == 'hrm':
             config = create_hrm_config(self.args)
             model = create_hrm_model(config)

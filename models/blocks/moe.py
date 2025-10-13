@@ -30,9 +30,9 @@ class Router(nn.Module):
         # Increased temperature for softer routing decisions
         self.temperature = nn.Parameter(torch.ones(1) * 0.1)
         
-        # Adjusted loss coefficients
-        self.router_z_loss_coef = 0.01  # Increased from 0.001
-        self.load_balance_coef = 0.01   # Increased from 0.001
+        # Reduced loss coefficients for memory efficiency
+        self.router_z_loss_coef = 0.001  # Small coefficient to reduce memory overhead
+        self.load_balance_coef = 0.001   # Small coefficient to reduce memory overhead
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
@@ -85,9 +85,9 @@ class SharedExpertMLP(nn.Module):
         super().__init__()
         self.config = config
         
-        # Define dimensions with increased capacity
+        # Define dimensions (reduced for memory efficiency)
         self.hidden_dim = 4 * config.n_embd
-        self.adapt_dim = self.hidden_dim // 16
+        self.adapt_dim = self.hidden_dim // 32  # Reduced from //16 for less memory
         
         # Up projection with parallel computation
         self.up_proj = nn.Linear(config.n_embd, self.hidden_dim, bias=False)
@@ -221,13 +221,18 @@ class ExpertGroup(nn.Module):
 
         # Shared projections back to model dimension
         hidden = self.expert_proj(adapted)
+        del adapted  # Free memory immediately
         specialised = self.output_proj(hidden)
+        output_dim = specialised.size(-1)
+        del hidden  # Free memory immediately
 
         # Weight by router assignment and scatter back to token positions
         weighted = specialised * weights.to(specialised.dtype).unsqueeze(-1)
+        del specialised  # Free memory immediately
 
-        mixed = torch.zeros(total_tokens, specialised.size(-1), device=specialised.device, dtype=specialised.dtype)
+        mixed = torch.zeros(total_tokens, output_dim, device=weighted.device, dtype=weighted.dtype)
         mixed.index_add_(0, token_positions, weighted)
+        del weighted  # Free memory immediately
 
         return mixed.reshape(batch_size, seq_len, -1)
 
@@ -260,12 +265,15 @@ class MoELayer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         residual = x
-        
+
         # Normalize input
         normalized = self.norm(x)
-        
+
         # Routing (top-k) and expert dispatch
+        # CRITICAL: Detach indices to prevent gradient computation through routing
         topk_weights, topk_indices, router_loss = self.router(normalized)
+        topk_indices = topk_indices.detach()  # Don't backprop through routing decisions
+
         shared_proj, pre_adapt = self.expert_group.compute_shared(normalized)
         specialised = self.expert_group.mix_experts(pre_adapt, topk_indices, topk_weights)
 
@@ -274,4 +282,5 @@ class MoELayer(nn.Module):
         # Add scaled residual connection
         output = residual + self.residual_scale * expert_output.to(residual.dtype)
 
-        return output, router_loss 
+        # Detach router_loss to prevent it from keeping the computation graph
+        return output, router_loss.detach() 

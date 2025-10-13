@@ -11,7 +11,7 @@ from .mla_configs import (
 from .moe_configs import create_moe_mla_config, create_moe_mla_model
 from .gpt_config import create_gpt_config
 from .mdm_config import create_mdm_config, create_mdm_model
-from .swan_configs import create_swan_config, create_swa_mla_config
+from .swan_configs import create_swan_config, create_swa_mla_config, create_swa_mla_moe_config
 from .specialized_configs import (
     create_slm_config, create_slm_model,
     create_nsa_config, create_nsa_model,
@@ -45,6 +45,7 @@ __all__ = [
     # SWAN and SWA_MLA
     'create_swan_config',
     'create_swa_mla_config',
+    'create_swa_mla_moe_config',
     # Specialized models
     'create_slm_config',
     'create_slm_model',
