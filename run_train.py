@@ -1,5 +1,6 @@
 import os
 import sys
+import subprocess
 import argparse
 import torch
 from transformers import AutoTokenizer
@@ -218,6 +219,35 @@ def main():
         print(f"Detected {args.devices} GPUs.")
         if args.devices > 0:
              print_gpu_stats() # Print initial stats
+
+    # Auto-launch with torchrun for multi-GPU native PyTorch training
+    # Lightning handles this internally, but native PyTorch needs torchrun
+    if not args.use_lightning and args.devices > 1:
+        # Check if we're already running under torchrun/DDP
+        if 'RANK' not in os.environ and 'LOCAL_RANK' not in os.environ:
+            print(f"\n{'='*60}")
+            print(f"Multi-GPU training detected ({args.devices} GPUs)")
+            print(f"Relaunching with torchrun for DDP...")
+            print(f"{'='*60}\n")
+
+            # Build torchrun command
+            torchrun_cmd = [
+                sys.executable, '-m', 'torch.distributed.run',
+                '--standalone',
+                '--nnodes=1',
+                f'--nproc_per_node={args.devices}',
+            ] + sys.argv
+
+            # Execute torchrun and exit
+            try:
+                result = subprocess.run(torchrun_cmd, check=True)
+                sys.exit(result.returncode)
+            except subprocess.CalledProcessError as e:
+                print(f"Error during torchrun execution: {e}")
+                sys.exit(e.returncode)
+            except KeyboardInterrupt:
+                print("\nTraining interrupted by user")
+                sys.exit(0)
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)

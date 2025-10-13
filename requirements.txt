@@ -30,3 +30,4 @@ apollo_torch
 lion_pytorch
 runpod
 hf_transfer
+transformer_engine
