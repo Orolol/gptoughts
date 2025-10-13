@@ -406,7 +406,8 @@ class Trainer:
             'weight_decay': self.args.weight_decay,
             'learning_rate': self.args.learning_rate,
             'betas': (self.args.beta1, self.args.beta2),
-            'device_type': self.device_type
+            'device_type': self.device_type,
+            'force_foreach_false': self.ddp  # Disable foreach in multi-GPU for consistency with Lightning
         }
         
         # Ajouter le type d'optimiseur s'il est spécifié
@@ -1606,7 +1607,7 @@ class Trainer:
                                 targets = batch.to(self.device, non_blocking=True)
                         
                         # Forward pass avec optimisations
-                        with self.timing_stats.track("forward"), torch.amp.autocast(enabled=True, device_type=self.device_type):
+                        with self.timing_stats.track("forward"), torch.amp.autocast(enabled=True, device_type=self.device_type, dtype=self.ptdtype):
                             # Synchroniser avant le forward pass pour s'assurer que les données sont sur le GPU
                             if torch.cuda.is_available():
                                 torch.cuda.synchronize()
@@ -1911,7 +1912,7 @@ class Trainer:
         print("\nText Generation:")
         
         try:
-            with torch.no_grad(), torch.amp.autocast(enabled=True, device_type=self.device_type):
+            with torch.no_grad(), torch.amp.autocast(enabled=True, device_type=self.device_type, dtype=self.ptdtype):
                 # Generate text
                 raw_model = self.model.module if self.ddp else self.model
                 prompt, input_tokens = self.get_prompt()
