@@ -2031,11 +2031,12 @@ class Trainer:
 
         print("Validation")
         # Use utility function for loss estimation
+        eval_iters = getattr(self.args, 'eval_iters', 200)  # Default to 200 if not specified
         losses = estimate_loss(
             self.model,
             self.train_dataset,
             self.val_dataset,
-            self.args.eval_iters,
+            eval_iters,
             self.device,
             self.ddp,
             self.ddp_world_size

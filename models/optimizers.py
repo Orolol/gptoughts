@@ -255,23 +255,24 @@ def configure_optimizer_for_gpt(
     # Create optimizer based on device type
     if device_type == 'cuda':
         try:
+            # Note: fused and foreach cannot both be True
+            # fused is faster, so we use it and don't set foreach
             optimizer = torch.optim.AdamW(
                 optimizer_groups,
                 lr=learning_rate,
                 betas=betas,
-                fused=True,  # Use fused implementation for better performance
-                foreach=not force_foreach_false  # Disable foreach in DDP
-            )
-            print(f"Using fused AdamW for GPT model (foreach={not force_foreach_false})")
-        except TypeError:
-            # Older PyTorch without foreach parameter
-            optimizer = torch.optim.AdamW(
-                optimizer_groups,
-                lr=learning_rate,
-                betas=betas,
-                fused=True
+                fused=True  # Use fused implementation for better performance
             )
             print("Using fused AdamW for GPT model")
+        except (TypeError, RuntimeError) as e:
+            # Fallback if fused is not supported
+            print(f"Fused AdamW not available ({e}), using standard AdamW")
+            optimizer = torch.optim.AdamW(
+                optimizer_groups,
+                lr=learning_rate,
+                betas=betas
+            )
+            print("Using standard AdamW for GPT model")
     else:
         try:
             optimizer = torch.optim.AdamW(
