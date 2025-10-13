@@ -42,7 +42,7 @@ def parse_args():
     # Model Parameters
     parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'sedd', 'gpt', 'mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'mdm', 'moe_mla', 'slm', 'nsa', 'hrm', 'hse', 'swan', 'swa_mla', 'swa_mla_moe'], default='gpt', help='Type of model to train')
     parser.add_argument('--size', type=str, choices=['small', 'medium', 'large', 'xl'], default='small', help='Size of the model')
-    parser.add_argument('--use_lightning', action='store_true', default=True, help='Use PyTorch Lightning for training')
+    parser.add_argument('--use_lightning', action='store_true', default=False, help='Use PyTorch Lightning for training')
 
     # IO Parameters
     parser.add_argument('--output_dir', type=str, default='ouputs/out_lightning', help='Output directory for checkpoints and logs')

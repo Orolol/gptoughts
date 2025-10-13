@@ -13,6 +13,10 @@ import threading
 import argparse
 import traceback
 import random
+import csv
+import shutil
+from datetime import datetime
+import wandb
 
 
 import torch
@@ -53,9 +57,23 @@ except ImportError:
 from train.train_utils import (
     get_gpu_count, setup_distributed, reduce_metrics, calculate_perplexity,
     get_lr, cleanup_old_checkpoints, ensure_model_dtype,
-    save_checkpoint, load_checkpoint, find_latest_checkpoint, 
+    save_checkpoint, load_checkpoint, find_latest_checkpoint,
     get_context_manager, AveragedTimingStats, generate_text
 )
+
+# Import model configs
+from train.model_configs import *
+
+# Import models
+from models.sedd.model import SEDDModel
+
+# Import FP8 optimizer
+try:
+    from optimization.fp8_deepseek_trainer import FP8AdamW, FP8MixedPrecisionTrainer
+    FP8_AVAILABLE = True
+except ImportError:
+    FP8_AVAILABLE = False
+    print("FP8 training not available (fp8_deepseek_trainer not found)")
 
 class Trainer:
     """
@@ -64,11 +82,34 @@ class Trainer:
     def __init__(self, args):
         """
         Initialise le trainer avec les arguments fournis.
-        
+
         Args:
             args: Arguments de configuration pour l'entraînement
         """
         self.args = args
+
+        # Progressive training parameters
+        self.progressive_training = getattr(args, 'progressive_training', False)
+        self.progressive_block_sizes = getattr(args, 'progressive_block_sizes', [512, 1024, 2048, 4096])
+        self.progressive_epochs_per_stage = getattr(args, 'progressive_epochs_per_stage', 5)
+        self.progressive_current_stage = 0
+        self.progressive_lr_scale = getattr(args, 'progressive_lr_scale', 0.5)
+
+        # Block size adaptation parameters
+        self.load_checkpoint_path = getattr(args, 'load_checkpoint_path', None)
+        self.original_block_size = getattr(args, 'original_block_size', None)
+
+        # CSV logging attributes
+        self.metrics_buffer = []
+        self.csv_file_path = None
+        self.csv_writer = None
+        self.csv_file = None
+        self.last_val_loss = None
+        self.last_val_perplexity = None
+
+        # Wandb
+        self.use_wandb = getattr(args, 'use_wandb', True)
+
         self.setup_environment()
         self.setup_model()
         self.setup_datasets()
@@ -177,11 +218,62 @@ class Trainer:
         if torch.cuda.is_available():
             # Réserver un pourcentage plus élevé de la mémoire pour PyTorch
             torch.cuda.set_per_process_memory_fraction(0.95)
-            
+
             # Configurer l'allocateur CUDA pour une meilleure gestion de la mémoire
             if hasattr(torch.cuda, 'memory_stats'):
                 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.8"
-        
+
+        # Initialize wandb if enabled
+        if self.use_wandb and self.master_process:
+            self._init_wandb()
+
+    def _init_wandb(self):
+        """Initialize wandb logging with project configuration."""
+        try:
+            wandb.login(key=os.getenv('WANDB_API_KEY'))
+            # Create wandb config from args
+            wandb_config = {
+                'model_type': self.args.model_type,
+                'size': self.args.size,
+                'batch_size': self.args.batch_size,
+                'block_size': self.args.block_size,
+                'learning_rate': self.args.learning_rate,
+                'dropout': getattr(self.args, 'dropout', 0.1),
+                'vocab_size': self.args.vocab_size,
+                'weight_decay': getattr(self.args, 'weight_decay', 0.01),
+                'warmup_iters': getattr(self.args, 'warmup_iters', 2000),
+                'lr_decay_iters': getattr(self.args, 'lr_decay_iters', 600000),
+                'min_lr': getattr(self.args, 'min_lr', 6e-5),
+                'beta1': getattr(self.args, 'beta1', 0.9),
+                'beta2': getattr(self.args, 'beta2', 0.95),
+                'grad_clip': getattr(self.args, 'grad_clip', 1.0),
+                'compile': getattr(self.args, 'compile', False),
+                'use_fp8': getattr(self.args, 'use_fp8', False),
+                'optimizer_type': getattr(self.args, 'optimizer_type', 'adamw'),
+                'dataset': getattr(self.args, 'dataset', 'apollo-mini'),
+            }
+
+            # Add model-specific configs
+            if hasattr(self.args, 'num_experts'):
+                wandb_config['num_experts'] = self.args.num_experts
+            if hasattr(self.args, 'experts_per_token'):
+                wandb_config['experts_per_token'] = self.args.experts_per_token
+            if hasattr(self.args, 'shared_weight_ratio'):
+                wandb_config['shared_weight_ratio'] = self.args.shared_weight_ratio
+
+            # Initialize wandb
+            wandb.init(
+                project=getattr(self.args, 'wandb_project', 'gptoughts-training'),
+                name=getattr(self.args, 'wandb_run_name', f"{self.args.model_type}_{self.args.size}"),
+                config=wandb_config,
+                tags=[self.args.model_type, self.args.size],
+                resume=getattr(self.args, 'wandb_resume', None)
+            )
+            print("Wandb initialized successfully")
+        except Exception as e:
+            print(f"Warning: Failed to initialize wandb: {e}")
+            self.use_wandb = False
+
     def setup_model(self):
         """Initialise le modèle en fonction du type spécifié"""
         # Determine model type and initialize
@@ -236,7 +328,60 @@ class Trainer:
             # Create config based on model size
             config = self.create_mla_llada_config()
             self.model = MLALLaDAModel(config)
-            
+
+        elif model_type == 'sedd':
+            # SEDD model
+            config = create_sedd_config(self.args)
+            self.model = SEDDModel(config)
+
+        elif model_type == 'mdm':
+            # MDM model
+            config = create_mdm_config(self.args)
+            self.model = create_mdm_model(config)
+
+        elif model_type == 'moe_mla':
+            # MoE MLA model
+            config = create_moe_mla_config(self.args)
+            self.model = create_moe_mla_model(config)
+
+        elif model_type == 'slm':
+            # SLM model
+            config = create_slm_config(self.args)
+            self.model = create_slm_model(config)
+
+        elif model_type == 'nsa':
+            # NSA model
+            config = create_nsa_config(self.args)
+            self.model = create_nsa_model(config)
+
+        elif model_type == 'hse':
+            # HSE model
+            config = create_hse_config(self.args)
+            self.model = create_hse_model(config)
+
+        elif model_type == 'swan':
+            # SWAN model
+            config = create_swan_config(self.args)
+            from models.models.swan_model import SWANModel
+            self.model = SWANModel(config)
+
+        elif model_type == 'swa_mla':
+            # SWA_MLA model
+            config = create_swa_mla_config(self.args)
+            from models.models.swa_mla_model import SWAMLAModel
+            self.model = SWAMLAModel(config)
+
+        elif model_type == 'swa_mla_moe':
+            # SWA_MLA_MoE model
+            config = create_swa_mla_moe_config(self.args)
+            from models.models.swa_mla_moe_model import SWAMLAMOEModel
+            self.model = SWAMLAMOEModel(config)
+
+        elif model_type == 'hrm':
+            # HRM model
+            config = create_hrm_config(self.args)
+            self.model = create_hrm_model(config)
+
         else:
             from models.models.model import GPT, GPTConfig
             # Create config based on model size
@@ -245,7 +390,14 @@ class Trainer:
         
         # Store config for checkpointing
         self.config = config
-        
+
+        # Critical multi-GPU optimization: Force model to CPU first
+        # This prevents VRAM imbalance across GPUs in DDP
+        if self.ddp and torch.cuda.is_available():
+            print("Forcing model to CPU before DDP to prevent VRAM imbalance...")
+            self.model = self.model.cpu()
+            cleanup_memory()
+
         # Move model to device
         self.model = self.model.to(self.device)
         
@@ -652,7 +804,457 @@ class Trainer:
             )
         
         return config
-    
+
+    def _clean_checkpoint_keys(self, state_dict):
+        """
+        Clean checkpoint keys to handle different formats:
+        - Remove _orig_mod prefix from torch.compile()
+        - Remove model. prefix from Lightning checkpoints
+        - Handle other common prefixes
+        """
+        cleaned_state_dict = {}
+
+        # Analyze the key patterns to choose the best cleaning strategy
+        sample_keys = list(state_dict.keys())[:10]
+        print(f"Sample checkpoint keys: {sample_keys}")
+
+        # Detect the pattern
+        has_model_prefix = any(key.startswith('model.') for key in sample_keys)
+        has_orig_mod_prefix = any('_orig_mod.' in key for key in sample_keys)
+
+        print(f"Key pattern analysis: model.={has_model_prefix}, _orig_mod.={has_orig_mod_prefix}")
+
+        for key, value in state_dict.items():
+            clean_key = key
+
+            # Apply cleaning in order based on detected patterns
+            if has_orig_mod_prefix and '_orig_mod.' in clean_key:
+                # Handle model._orig_mod.xxx or _orig_mod.xxx
+                if clean_key.startswith('model._orig_mod.'):
+                    clean_key = clean_key.replace('model._orig_mod.', '')
+                elif clean_key.startswith('_orig_mod.'):
+                    clean_key = clean_key.replace('_orig_mod.', '')
+            elif has_model_prefix and clean_key.startswith('model.'):
+                # Simple Lightning checkpoint format
+                clean_key = clean_key.replace('model.', '')
+
+            # Additional prefixes
+            if clean_key.startswith('_forward_module.'):
+                clean_key = clean_key.replace('_forward_module.', '')
+
+            cleaned_state_dict[clean_key] = value
+
+        return cleaned_state_dict
+
+    def _is_model_compiled(self, state_dict):
+        """Check if the model state dict is from a compiled model."""
+        return any(key.startswith('_orig_mod.') for key in state_dict.keys())
+
+    def _add_compile_prefix_to_state_dict(self, state_dict):
+        """Add _orig_mod prefix to all keys in state dict for compiled models."""
+        compiled_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('model.'):
+                # Replace model. with model._orig_mod.
+                new_key = key.replace('model.', 'model._orig_mod.')
+            elif not key.startswith('_orig_mod.'):
+                # Add _orig_mod prefix if not already present
+                new_key = f'_orig_mod.{key}' if not key.startswith('model.') else key.replace('model.', 'model._orig_mod.')
+            else:
+                new_key = key
+            compiled_state_dict[new_key] = value
+        return compiled_state_dict
+
+    def adapt_to_new_block_size(self, model, old_block_size, new_block_size):
+        """
+        Adapts a model trained on old_block_size to work with new_block_size.
+        Handles different types of position encoding (fixed embeddings, RoPE, etc.)
+        """
+        if old_block_size == new_block_size:
+            print(f"Block size unchanged ({new_block_size}), no adaptation needed")
+            return model
+
+        print(f"Adapting model from block_size {old_block_size} to {new_block_size}")
+        model_type = self.args.model_type.lower()
+
+        if model_type in ['gpt', 'mdm']:
+            self._adapt_fixed_position_embeddings(model, old_block_size, new_block_size)
+        elif model_type in ['mla', 'mla_selective', 'parscale_mla', 'moe_mla', 'slm', 'nsa', 'swan', 'swa_mla', 'swa_mla_moe']:
+            self._adapt_rope_position_encoding(model, old_block_size, new_block_size)
+        elif model_type == 'llada':
+            self._adapt_llada_position_encoding(model, old_block_size, new_block_size)
+        elif model_type in ['deepseek']:
+            self._adapt_deepseek_position_encoding(model, old_block_size, new_block_size)
+        elif model_type == 'sedd':
+            self._adapt_sedd_position_encoding(model, old_block_size, new_block_size)
+        elif model_type == 'hrm':
+            self._adapt_rope_position_encoding(model, old_block_size, new_block_size)
+        else:
+            print(f"Warning: No specific adaptation implemented for model type {model_type}")
+
+        return model
+
+    def _adapt_fixed_position_embeddings(self, model, old_size, new_size):
+        """Adapt models with fixed position embeddings (nn.Embedding)."""
+        print(f"Adapting fixed position embeddings from {old_size} to {new_size}")
+
+        if hasattr(model, 'transformer') and hasattr(model.transformer, 'wpe'):
+            old_pos_embed = model.transformer.wpe
+            old_weights = old_pos_embed.weight.data.clone()
+
+            # Create new position embedding layer
+            new_pos_embed = torch.nn.Embedding(new_size, old_pos_embed.embedding_dim)
+
+            if new_size > old_size:
+                # Extend: copy old weights and interpolate new positions
+                new_pos_embed.weight.data[:old_size] = old_weights
+
+                # Interpolate remaining positions
+                for i in range(old_size, new_size):
+                    # Linear interpolation from the last few positions
+                    if old_size >= 4:
+                        # Use weighted average of last 4 positions
+                        weights = torch.tensor([0.1, 0.2, 0.3, 0.4])
+                        interpolated = torch.sum(old_weights[-4:] * weights.unsqueeze(1), dim=0)
+                    else:
+                        # If too few positions, just use the last one with noise
+                        interpolated = old_weights[-1] + torch.randn_like(old_weights[-1]) * 0.02
+
+                    new_pos_embed.weight.data[i] = interpolated
+
+            else:
+                # Truncate: just take the first new_size positions
+                new_pos_embed.weight.data = old_weights[:new_size]
+
+            # Replace the old embedding
+            model.transformer.wpe = new_pos_embed
+            print(f"Position embeddings adapted: {old_size} -> {new_size}")
+
+        elif hasattr(model, 'position_embedding'):
+            # For models like MDM
+            old_pos_embed = model.position_embedding
+            old_weights = old_pos_embed.weight.data.clone()
+
+            new_pos_embed = torch.nn.Embedding(new_size, old_pos_embed.embedding_dim)
+
+            if new_size > old_size:
+                new_pos_embed.weight.data[:old_size] = old_weights
+                # Interpolate remaining positions
+                for i in range(old_size, new_size):
+                    if old_size >= 4:
+                        weights = torch.tensor([0.1, 0.2, 0.3, 0.4])
+                        interpolated = torch.sum(old_weights[-4:] * weights.unsqueeze(1), dim=0)
+                    else:
+                        interpolated = old_weights[-1] + torch.randn_like(old_weights[-1]) * 0.02
+                    new_pos_embed.weight.data[i] = interpolated
+            else:
+                new_pos_embed.weight.data = old_weights[:new_size]
+
+            model.position_embedding = new_pos_embed
+            print(f"Position embeddings adapted: {old_size} -> {new_size}")
+
+    def _adapt_rope_position_encoding(self, model, old_size, new_size):
+        """Adapt models with RoPE position encoding."""
+        print(f"Adapting RoPE encoding from {old_size} to {new_size}")
+
+        # For RoPE, we need to extend the cached cos/sin values
+        def extend_rope_cache(module):
+            if hasattr(module, 'rope'):
+                rope = module.rope
+                if hasattr(rope, '_extend_cos_sin_cache'):
+                    rope._extend_cos_sin_cache(new_size)
+                    print(f"Extended RoPE cache in {module.__class__.__name__} to {new_size}")
+                elif hasattr(rope, 'max_seq_len') and rope.max_seq_len < new_size:
+                    # Recreate RoPE with new max_seq_len
+                    from models.blocks.positional_encoding import RoPE
+                    new_rope = RoPE(rope.dim, max_seq_len=new_size, base=rope.base)
+                    module.rope = new_rope
+                    print(f"Recreated RoPE in {module.__class__.__name__} with max_seq_len={new_size}")
+
+        # Recursively find and update RoPE modules
+        def update_rope_recursive(module):
+            extend_rope_cache(module)
+            for child in module.children():
+                update_rope_recursive(child)
+
+        update_rope_recursive(model)
+
+        # Apply position interpolation for better generalization
+        if new_size > old_size and hasattr(self.args, 'use_position_interpolation') and self.args.use_position_interpolation:
+            self._apply_position_interpolation(model, old_size, new_size)
+
+    def _adapt_llada_position_encoding(self, model, old_size, new_size):
+        """Adapt LLaDA model position encoding."""
+        print(f"Adapting LLaDA position encoding from {old_size} to {new_size}")
+
+        # LLaDA uses RoPE in attention layers
+        self._adapt_rope_position_encoding(model, old_size, new_size)
+
+        # Update BD3 block length if needed
+        if hasattr(model, 'config'):
+            if hasattr(model.config, 'bd3_block_length'):
+                # Scale BD3 block length proportionally
+                old_bd3_block = getattr(model.config, 'bd3_block_length', old_size // 4)
+                new_bd3_block = int(old_bd3_block * new_size / old_size)
+                model.config.bd3_block_length = max(32, new_bd3_block)  # Minimum sensible block size
+                print(f"Updated BD3 block length: {old_bd3_block} -> {model.config.bd3_block_length}")
+
+    def _adapt_deepseek_position_encoding(self, model, old_size, new_size):
+        """Adapt DeepSeek model position encoding."""
+        print(f"Adapting DeepSeek position encoding from {old_size} to {new_size}")
+
+        # DeepSeek uses RoPE
+        self._adapt_rope_position_encoding(model, old_size, new_size)
+
+        # Update max_position_embeddings in config if present
+        if hasattr(model, 'config') and hasattr(model.config, 'max_position_embeddings'):
+            model.config.max_position_embeddings = new_size
+            print(f"Updated max_position_embeddings to {new_size}")
+
+    def _adapt_sedd_position_encoding(self, model, old_size, new_size):
+        """Adapt SEDD model position encoding."""
+        print(f"Adapting SEDD position encoding from {old_size} to {new_size}")
+
+        # SEDD uses RoPE in transformer blocks
+        self._adapt_rope_position_encoding(model, old_size, new_size)
+
+    def _apply_position_interpolation(self, model, old_size, new_size):
+        """
+        Apply Position Interpolation (PI) to RoPE frequencies.
+        Scales the frequencies to maintain learned positional relationships.
+        """
+        print(f"Applying position interpolation: scaling factor = {new_size/old_size:.2f}")
+
+        def interpolate_rope_freqs(module):
+            if hasattr(module, 'rope'):
+                rope = module.rope
+                if hasattr(rope, 'base'):
+                    # Calculate new base frequency
+                    scale_factor = new_size / old_size
+                    new_base = rope.base * (scale_factor ** (rope.dim / (rope.dim - 2)))
+
+                    # Recreate RoPE with interpolated frequencies
+                    from models.blocks.positional_encoding import RoPE
+                    new_rope = RoPE(rope.dim, max_seq_len=new_size, base=new_base)
+                    module.rope = new_rope
+                    print(f"Applied PI to {module.__class__.__name__}: base {rope.base:.0f} -> {new_base:.0f}")
+
+        def apply_pi_recursive(module):
+            interpolate_rope_freqs(module)
+            for child in module.children():
+                apply_pi_recursive(child)
+
+        apply_pi_recursive(model)
+
+    def setup_progressive_training(self):
+        """Setup progressive training if enabled."""
+        if not self.progressive_training:
+            return
+
+        # Start with the smallest block size
+        if len(self.progressive_block_sizes) > 0:
+            initial_block_size = self.progressive_block_sizes[0]
+            if initial_block_size != self.args.block_size:
+                print(f"Progressive training: starting with block_size={initial_block_size}")
+                old_block_size = self.args.block_size
+                self.args.block_size = initial_block_size
+
+                # Adapt model if needed
+                if hasattr(self.model, 'config'):
+                    self.model.config.block_size = initial_block_size
+                if hasattr(self, 'config'):
+                    self.config.block_size = initial_block_size
+
+                # Adapt the model to the smaller size if coming from larger
+                if old_block_size > initial_block_size:
+                    self.model = self.adapt_to_new_block_size(self.model, old_block_size, initial_block_size)
+
+    def should_progress_to_next_stage(self):
+        """Check if we should move to the next progressive training stage."""
+        if not self.progressive_training:
+            return False
+
+        # Check if we've completed enough iterations for current stage
+        # Estimate iterations per stage based on epochs_per_stage
+        iters_per_stage = self.progressive_epochs_per_stage * 1000  # Rough estimate
+
+        iters_in_stage = self.iter_num - (self.progressive_current_stage * iters_per_stage)
+
+        return (iters_in_stage >= iters_per_stage and
+                self.progressive_current_stage < len(self.progressive_block_sizes) - 1)
+
+    def progress_to_next_stage(self):
+        """Progress to next stage in progressive training."""
+        if not self.progressive_training or self.progressive_current_stage >= len(self.progressive_block_sizes) - 1:
+            return False
+
+        old_stage = self.progressive_current_stage
+        old_block_size = self.progressive_block_sizes[old_stage]
+
+        self.progressive_current_stage += 1
+        new_block_size = self.progressive_block_sizes[self.progressive_current_stage]
+
+        print(f"\n=== Progressive Training: Stage {old_stage} -> {self.progressive_current_stage} ===")
+        print(f"Transitioning from block_size {old_block_size} to {new_block_size}")
+
+        # Update args and configs
+        self.args.block_size = new_block_size
+        if hasattr(self.model, 'config'):
+            self.model.config.block_size = new_block_size
+        if hasattr(self, 'config'):
+            self.config.block_size = new_block_size
+
+        # Adapt model to new block size
+        self.model = self.adapt_to_new_block_size(self.model, old_block_size, new_block_size)
+
+        # Scale learning rate down for stability
+        for param_group in self.optimizer.param_groups:
+            old_lr = param_group['lr']
+            param_group['lr'] = old_lr * self.progressive_lr_scale
+            print(f"Scaled learning rate: {old_lr:.2e} -> {param_group['lr']:.2e}")
+
+        print(f"=== Stage transition completed ===\n")
+
+        # Log to wandb if available
+        if self.use_wandb and self.master_process:
+            try:
+                wandb.log({
+                    'progressive_training/stage': self.progressive_current_stage,
+                    'progressive_training/block_size': new_block_size,
+                    'progressive_training/transition_iter': self.iter_num
+                }, step=self.iter_num)
+            except Exception as e:
+                print(f"Warning: Failed to log progressive training to wandb: {e}")
+
+        # Save checkpoint after transition
+        if self.master_process:
+            checkpoint_path = f"progressive_stage_{self.progressive_current_stage}_iter_{self.iter_num}.ckpt"
+            self.save_training_checkpoint()
+            print(f"Saved checkpoint after stage transition")
+
+        return True
+
+    def _init_csv_logging(self):
+        """Initialize CSV logging with a unique filename."""
+        if not self.master_process:
+            return
+
+        # Build filename from model parameters
+        model_type = self.args.model_type
+        size = self.args.size
+        batch_size = self.args.batch_size
+        block_size = self.args.block_size
+
+        # Add precision info
+        precision = "fp32"
+        if hasattr(self.args, 'use_fp8') and self.args.use_fp8:
+            precision = "fp8"
+        elif hasattr(self, 'dtype'):
+            if 'bfloat16' in str(self.dtype):
+                precision = "bf16"
+            elif 'float16' in str(self.dtype):
+                precision = "fp16"
+
+        # Add compile info
+        compile_str = "compile" if hasattr(self.args, 'compile') and self.args.compile else "no-compile"
+
+        # Add optimizer info
+        optimizer_str = getattr(self.args, 'optimizer_type', 'adamw')
+
+        # Add dataset info if available
+        dataset_str = getattr(self.args, 'dataset', 'apollo-mini')
+
+        # Create base filename
+        base_filename = f"{model_type}_{size}_{batch_size}_{block_size}_{precision}_{compile_str}_{optimizer_str}_{dataset_str}"
+
+        # Ensure we always log under outputs/metrics_logs
+        default_metrics_dir = os.path.join('outputs', 'metrics_logs')
+        log_dir = getattr(self.args, 'metrics_log_dir', default_metrics_dir)
+        log_dir = os.path.abspath(log_dir)
+        os.makedirs(log_dir, exist_ok=True)
+
+        # Check for existing CSV to resume
+        resume_mode = getattr(self.args, 'init_from', 'scratch') == 'resume'
+        existing_file = None
+
+        if resume_mode:
+            candidates = sorted(
+                f for f in os.listdir(log_dir)
+                if f.startswith(base_filename) and f.endswith('.csv')
+            )
+            if candidates:
+                existing_file = os.path.join(log_dir, candidates[-1])
+
+        if existing_file:
+            self.csv_file_path = existing_file
+            try:
+                self.csv_file = open(self.csv_file_path, 'a', newline='')
+                self.csv_writer = csv.writer(self.csv_file)
+                print(f"CSV metrics logging resumed (appending): {self.csv_file_path}")
+            except IOError as e:
+                print(f"Error opening existing CSV for append: {e}")
+                self.csv_file = None
+                self.csv_writer = None
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            csv_filename = f"{base_filename}_{timestamp}.csv"
+            self.csv_file_path = os.path.join(log_dir, csv_filename)
+
+            counter = 1
+            while os.path.exists(self.csv_file_path):
+                csv_filename = f"{base_filename}_{timestamp}_{counter}.csv"
+                self.csv_file_path = os.path.join(log_dir, csv_filename)
+                counter += 1
+
+            try:
+                self.csv_file = open(self.csv_file_path, 'w', newline='')
+                self.csv_writer = csv.writer(self.csv_file)
+                self.csv_writer.writerow([
+                    'step', 'train_loss', 'val_loss', 'val_perplexity',
+                    'learning_rate', 'tokens_per_sec', 'avg_seq_len',
+                    'total_tokens', 'grad_norm', 'timestamp'
+                ])
+                self.csv_file.flush()
+                print(f"CSV metrics logging initialized: {self.csv_file_path}")
+            except IOError as e:
+                print(f"Error initializing CSV logging: {e}")
+                self.csv_file = None
+                self.csv_writer = None
+
+    def _buffer_metrics_for_csv(self, loss, grad_norm, tps, avg_seq_len, lr):
+        """Helper to buffer metrics for CSV logging."""
+        if not self.master_process or not self.csv_writer:
+            return
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        self.metrics_buffer.append([
+            self.iter_num,
+            f"{loss:.6f}",
+            f"{self.last_val_loss:.6f}" if self.last_val_loss is not None else "N/A",
+            f"{self.last_val_perplexity:.6f}" if self.last_val_perplexity is not None else "N/A",
+            f"{lr:.2e}",
+            f"{tps:.2f}",
+            f"{avg_seq_len:.2f}",
+            f"{self.total_tokens}",
+            f"{grad_norm:.4f}" if grad_norm > 0 else "N/A",
+            timestamp
+        ])
+
+    def _log_metrics_to_csv(self):
+        """Write buffered metrics to CSV file."""
+        if not self.master_process or not self.csv_writer or not self.metrics_buffer:
+            return
+
+        try:
+            num_rows = len(self.metrics_buffer)
+            self.csv_writer.writerows(self.metrics_buffer)
+            self.csv_file.flush()
+            self.metrics_buffer = []
+            print(f"Written {num_rows} rows to CSV (up to step {self.iter_num})")
+        except IOError as e:
+            print(f"Error writing to CSV file: {e}")
+
     def load_model_from_checkpoint(self, ckpt_path):
         """Charge un modèle à partir d'un checkpoint"""
         checkpoint = torch.load(ckpt_path, map_location='cpu')
@@ -768,23 +1370,12 @@ class Trainer:
         """Configure les datasets d'entraînement et de validation"""
         # Import the get_datasets function from data module
         from data.datasets import get_datasets
-        
-        # Get datasets
+
+        # Get datasets - get_datasets() returns dataloaders directly
         if hasattr(self.args, 'tokenizer') and self.args.tokenizer is not None:
             print(f"Tokenizer found: {self.args.tokenizer}")
-            self.train_dataset, self.val_dataset = get_datasets(
-                self.args.block_size, 
-                self.args.batch_size,
-                tokenizer=self.args.tokenizer,
-                num_workers=getattr(self.args, 'num_workers', 4)
-            )
-        else:
-            self.train_dataset, self.val_dataset = get_datasets(
-                self.args.block_size, 
-                self.args.batch_size,
-                tokenizer=None,
-                num_workers=getattr(self.args, 'num_workers', 4)
-            )
+
+        self.train_dataset, self.val_dataset = get_datasets(self.args)
         
         # Create iterator
         self.train_iterator = iter(self.train_dataset)
@@ -808,6 +1399,16 @@ class Trainer:
             )
             if hasattr(self.model.module, 'set_timing_stats'):
                 self.model.module.set_timing_stats(self.timing_stats)
+
+            # Print VRAM diagnostics after DDP initialization
+            if torch.cuda.is_available() and self.master_process:
+                print("\n=== Multi-GPU VRAM Diagnostics ===")
+                for i in range(torch.cuda.device_count()):
+                    allocated = torch.cuda.memory_allocated(i) / 1024**3
+                    reserved = torch.cuda.memory_reserved(i) / 1024**3
+                    total = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                    print(f"GPU {i}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, {total:.2f}GB total")
+                print("===================================\n")
         
         # Ensure model is in correct precision for stability
         self.model = ensure_model_dtype(self.model, self.ptdtype)
@@ -856,7 +1457,60 @@ class Trainer:
         print(f"Batch size: {self.args.batch_size}, Block size: {self.args.block_size}")
         print(f"Gradient accumulation steps: {self.args.gradient_accumulation_steps}")
         print_memory_stats("Initial")
-    
+
+        # Initialize CSV logging
+        self._init_csv_logging()
+
+        # Setup progressive training if enabled
+        if self.progressive_training and self.master_process:
+            print(f"Progressive training enabled:")
+            print(f"  Block sizes: {self.progressive_block_sizes}")
+            print(f"  Epochs per stage: {self.progressive_epochs_per_stage}")
+            print(f"  LR scale at transitions: {self.progressive_lr_scale}")
+            self.setup_progressive_training()
+
+    def forward(self, input_ids, targets=None, **kwargs):
+        """
+        Unified forward pass for all model types.
+        Returns a standardized dictionary with logits, loss, and optional router_loss.
+        """
+        model_type = self.args.model_type.lower()
+
+        # Call model forward
+        outputs = self.model(input_ids, targets=targets, **kwargs)
+
+        # Standardize output format
+        result = {'logits': None, 'loss': None, 'router_loss': None}
+
+        # Handle different output formats from various models
+        if isinstance(outputs, dict):
+            # Dictionary output (most new models: MLA, MoE, etc.)
+            result['logits'] = outputs.get('logits', None)
+            result['loss'] = outputs.get('loss', None)
+            result['router_loss'] = outputs.get('router_loss', None)
+
+            # Handle HRM ponder loss
+            if 'ponder_loss' in outputs:
+                result['ponder_loss'] = outputs['ponder_loss']
+
+            # Handle MTP loss for DeepSeek
+            if 'mtp_loss' in outputs:
+                result['mtp_loss'] = outputs['mtp_loss']
+
+        elif isinstance(outputs, tuple):
+            # Tuple output (older models, LLaDA, etc.)
+            if len(outputs) == 2:
+                result['logits'], result['loss'] = outputs
+            elif len(outputs) == 3:
+                result['logits'], result['loss'], result['router_loss'] = outputs
+            elif len(outputs) == 1:
+                result['logits'] = outputs[0]
+        else:
+            # Single tensor output (just logits, no loss computed)
+            result['logits'] = outputs
+
+        return result
+
     def train(self):
         """Exécute la boucle d'entraînement principale avec optimisations GPU avancées"""
         model_type = self.args.model_type.lower()
@@ -891,9 +1545,9 @@ class Trainer:
                     param_group['lr'] = lr
             
             # Generate text periodically
-            if self.iter_num % 500 == 0 and self.master_process or self.iter_num == 50:
-            # if self.iter_num 100:
-                self.generate_sample_text()
+            # if self.iter_num % 500 == 0 and self.master_process or self.iter_num == 50:
+            # # if self.iter_num 100:
+            #     self.generate_sample_text()
             
             # Evaluate model periodically
             if self.iter_num % self.args.eval_interval == 0 and self.master_process and self.iter_num > 0:
@@ -1122,43 +1776,46 @@ class Trainer:
                     if skip_optimizer_step:
                         print("Skipping optimizer step due to NaN detected in loss")
                         continue
-                        
+
+                    # Calculate gradient norm before clipping (for logging)
+                    grad_norm = 0.0
+                    if self.args.grad_clip != 0.0:
+                        try:
+                            # Calculate norm before clipping
+                            params_to_clip = self.model.parameters() if not self.ddp else self.model.module.parameters()
+                            grad_norm = torch.nn.utils.clip_grad_norm_(params_to_clip, self.args.grad_clip)
+                            grad_norm = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+                        except Exception as e:
+                            print(f"Error calculating gradient norm: {e}")
+                            grad_norm = 0.0
+
                     if self.scaler.is_enabled():
                         # Avec GradScaler (pour float16 ou FP8)
                         if self.args.grad_clip != 0.0:
                             self.scaler.unscale_(self.optimizer)
-                            # Apply more aggressive gradient clipping to prevent NaN
-                            torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters() if not self.ddp else self.model.module.parameters(),
-                                self.args.grad_clip
-                            )
-                        
+                            # Gradient norm already calculated and clipped above
+
                         # Étape d'optimisation avec synchronisation
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                     else:
                         # Sans GradScaler (pour bfloat16 ou float32)
-                        if self.args.grad_clip != 0.0:
-                            # Apply gradient clipping to prevent NaN
-                            torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters() if not self.ddp else self.model.module.parameters(),
-                                self.args.grad_clip
-                            )
-                        
+                        # Gradient norm already calculated and clipped above
+
                         # Check for NaN in gradients before optimizer step
                         has_nan_grad = False
                         for param in (self.model.parameters() if not self.ddp else self.model.module.parameters()):
                             if param.grad is not None and torch.isnan(param.grad).any():
                                 has_nan_grad = True
                                 break
-                        
+
                         if has_nan_grad:
                             print(f"WARNING: NaN detected in gradients at iteration {self.iter_num}, skipping optimizer step")
                             continue
-                        
+
                         # Étape d'optimisation standard
                         self.optimizer.step()
-                    
+
                     # Synchroniser après l'étape d'optimisation pour maximiser l'utilisation du GPU
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
@@ -1169,16 +1826,45 @@ class Trainer:
             self.t0 = t1
             
             if self.iter_num % self.args.log_interval == 0:
+                # Calculate tokens/s for CSV logging
+                if len(self.tokens_window) > 1:
+                    window_time = self.tokens_window[-1][0] - self.tokens_window[0][0]
+                    window_tokens = sum(tokens for _, tokens in self.tokens_window)
+                    current_tokens_per_sec = window_tokens / window_time if window_time > 0 else 0
+                else:
+                    current_tokens_per_sec = 0
+
+                # Calculate average sequence length (excluding padding if possible)
+                avg_seq_len = self.args.block_size  # Default to block size
+
+                # Buffer metrics for CSV logging
+                self._buffer_metrics_for_csv(total_loss, grad_norm if 'grad_norm' in locals() else 0.0,
+                                             current_tokens_per_sec, avg_seq_len, lr)
+
+                # Write CSV periodically (every 10 log intervals)
+                if self.iter_num % (self.args.log_interval * 10) == 0:
+                    self._log_metrics_to_csv()
+
                 # Choose appropriate auxiliary loss to log based on model type
                 if model_type == 'deepseek' and getattr(self.args, 'use_mtp', True):
                     self.log_training_stats(total_loss, total_mtp_loss, dt, lr, loss_type="mtp_loss")
                 else:
                     self.log_training_stats(total_loss, total_router_loss, dt, lr, loss_type="router_loss")
-                
+
                 # Save checkpoint periodically
                 if self.iter_num % 1000 == 0 and self.master_process:
                     self.save_training_checkpoint()
-            
+
+            # Check for progressive training stage transition
+            if self.progressive_training and self.should_progress_to_next_stage():
+                if self.master_process:
+                    print(f"\nProgressive training: transitioning to next stage at iteration {self.iter_num}")
+                self.progress_to_next_stage()
+
+                # Need to recreate data loaders with new block size
+                print(f"Recreating data loaders with new block_size={self.args.block_size}")
+                self.setup_datasets()
+
             self.iter_num += 1
             self.local_iter_num += 1
             
@@ -1193,14 +1879,36 @@ class Trainer:
         # Cleanup
         if self.ddp:
             destroy_process_group()
-        
+
+        # Flush CSV metrics before exiting
+        if self.master_process:
+            if self.csv_writer and self.metrics_buffer:
+                print("Flushing remaining CSV metrics...")
+                self._log_metrics_to_csv()
+
+            # Close CSV file
+            if self.csv_file:
+                try:
+                    self.csv_file.close()
+                    print(f"CSV logging closed: {self.csv_file_path}")
+                except Exception as e:
+                    print(f"Error closing CSV file: {e}")
+
+            # Finish wandb
+            if self.use_wandb:
+                try:
+                    wandb.finish()
+                    print("Wandb logging finished")
+                except Exception as e:
+                    print(f"Error finishing wandb: {e}")
+
         # Nettoyage final
         cleanup_memory()
-        
+
         # Arrêter le profiler CUDA si activé
         if torch.cuda.is_available() and hasattr(torch.cuda, 'cudart'):
             torch.cuda.cudart().cudaProfilerStop()
-        
+
         if self.master_process:
             print("Training finished!")
             
@@ -1262,23 +1970,41 @@ class Trainer:
                 # Check if model has a generate method
                 if hasattr(raw_model, 'generate'):
                     # Use the model's generate method
-                    output_ids = raw_model.generate(
+                    output = raw_model.generate(
                         input_tokens,
                         max_new_tokens=min(100, self.args.block_size - 10),
                         temperature=0.7,
                         top_k=40
                     )
-                    
+
+                    # Handle both tuple and tensor returns
+                    if isinstance(output, tuple):
+                        output_ids = output[0]  # First element is usually the generated ids
+                    else:
+                        output_ids = output
+
                     # Decode the generated text if we have a tokenizer
                     if tokenizer is not None:
+                        # Handle batch dimension
+                        if isinstance(output_ids, torch.Tensor):
+                            if output_ids.dim() > 1:
+                                tokens_to_decode = output_ids[0]
+                            else:
+                                tokens_to_decode = output_ids
+                        else:
+                            tokens_to_decode = output_ids
+
                         generated_text = tokenizer.decode(
-                            output_ids[0] if output_ids.dim() > 1 else output_ids,
+                            tokens_to_decode,
                             skip_special_tokens=True,
                             clean_up_tokenization_spaces=True
                         )
                         print(f"Generated text: {generated_text}\n")
                     else:
-                        print(f"Generated tokens: {output_ids.tolist()}\n")
+                        if isinstance(output_ids, torch.Tensor):
+                            print(f"Generated tokens: {output_ids.tolist()}\n")
+                        else:
+                            print(f"Generated output: {output_ids}\n")
                     
                 else:
                     # Fallback: use the generic generate_text function
@@ -1302,22 +2028,38 @@ class Trainer:
     def evaluate_model(self):
         """Évalue le modèle sur les ensembles d'entraînement et de validation"""
         from train.train_utils import estimate_loss
-        
+
         print("Validation")
         # Use utility function for loss estimation
         losses = estimate_loss(
-            self.model, 
-            self.train_dataset, 
-            self.val_dataset, 
-            self.args.eval_iters, 
-            self.device, 
-            self.ddp, 
+            self.model,
+            self.train_dataset,
+            self.val_dataset,
+            self.args.eval_iters,
+            self.device,
+            self.ddp,
             self.ddp_world_size
         )
-        
+
         print(f"step {self.iter_num}: train loss {losses['train']:.4f}, train ppl {losses['train_ppl']:.2f}, "
               f"val loss {losses['val']:.4f}, val ppl {losses['val_ppl']:.2f}")
-        
+
+        # Store validation metrics for CSV logging
+        self.last_val_loss = losses['val']
+        self.last_val_perplexity = losses['val_ppl']
+
+        # Log to wandb if enabled
+        if self.use_wandb and self.master_process:
+            try:
+                wandb.log({
+                    'val/loss': losses['val'],
+                    'val/perplexity': losses['val_ppl'],
+                    'train/loss': losses['train'],
+                    'train/perplexity': losses['train_ppl']
+                }, step=self.iter_num)
+            except Exception as e:
+                print(f"Warning: Failed to log validation metrics to wandb: {e}")
+
         # Save checkpoint if best validation loss
         if losses['val'] < self.best_val_loss or self.args.always_save_checkpoint:
             self.best_val_loss = losses['val']

@@ -73,6 +73,7 @@ python run_train.py \
     --mla_qk_nope_head_dim 128 \
     --mla_qk_rope_head_dim 64 \
     --mla_v_head_dim 128 \
+    --compile \
     --strategy $STRATEGY \
     "${RESUME_ARGS[@]}"
 
