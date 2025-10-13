@@ -1611,91 +1611,37 @@ class Trainer:
                             if torch.cuda.is_available():
                                 torch.cuda.synchronize()
                             
-                            # Handle different model types with unified approach
-                            if model_type == 'deepseek':
-                                # First try the DeepSeek MTP model return format
-                                outputs = self.model(input_ids, targets=targets)
-                                
-                            elif model_type == 'mla':
-                                # MLA model
-                                try:
-                                    # MLA model returns logits, loss directly
-                                    logits, loss = self.model(input_ids, targets=targets)
-                                    
-                                    # Extract router loss from model if available, but ensure it doesn't have gradients
-                                    router_loss = None
-                                    if hasattr(self.model, 'last_router_loss') and self.model.last_router_loss is not None:
-                                        # last_router_loss should already be a detached tensor with requires_grad=False
-                                        router_loss = self.model.last_router_loss
-                                        # Create a completely new tensor to ensure no gradient connections
-                                        if router_loss is not None:
-                                            with torch.no_grad():
-                                                router_loss = router_loss.clone()
-                                        # Clear the model's router loss after extracting it
-                                        self.model.last_router_loss = None
-                                    
-                                    # Implement additional checks for router_loss
-                                    if router_loss is not None:
-                                        # Check if router_loss contains NaN values
-                                        if torch.isnan(router_loss).any():
-                                            print(f"WARNING: NaN detected in router_loss at iteration {self.iter_num}")
-                                            # Replace NaN values with a small constant to prevent propagation
-                                            router_loss = torch.where(torch.isnan(router_loss), torch.tensor(0.1, device=router_loss.device), router_loss)
-                                        
-                                        # Cap extremely large router loss values to prevent explosion
-                                        router_loss = torch.clamp(router_loss, max=10.0)
-                                        balance_loss = router_loss
-                                    else:
-                                        balance_loss = 0
-                                except Exception as e:
-                                    print(f"Error during MLA forward pass: {e}")
-                                    # Fallback to a simpler pass
-                                    logits, loss = self.model(input_ids, targets)
-                                    balance_loss = 0
-                                    print("Used simplified forward path for MLA model")
-                            elif model_type == 'llada':
-                                # LLaDA model
-                                # Add gradient and loss stabilization for LLaDA models
-                                try:
-                                    # Apply stabilization techniques specifically to prevent NaN in router mechanism
-                                    forward_args = {'input_ids': input_ids, 'targets': targets}
-                                    # Add BD3 flag if applicable
-                                    # Assumes args object has 'use_bd3_training' attribute (added in run_train.py)
-                                    if getattr(self.args, 'use_bd3_training', False):
-                                        forward_args['use_bd3_training'] = True
-                                    
-                                    logits, loss, router_loss = self.model(**forward_args)
-                                    
-                                    # Implement additional checks for router_loss
-                                    if router_loss is not None:
-                                        # Check if router_loss contains NaN values
-                                        if torch.isnan(router_loss).any():
-                                            print(f"WARNING: NaN detected in router_loss at iteration {self.iter_num}")
-                                            # Replace NaN values with a small constant to prevent propagation
-                                            router_loss = torch.where(torch.isnan(router_loss), torch.tensor(0.1, device=router_loss.device), router_loss)
-                                        
-                                        # Cap extremely large router loss values to prevent explosion
-                                        router_loss = torch.clamp(router_loss, max=10.0)
-                                        balance_loss = router_loss
-                                    else:
-                                        balance_loss = 0
-                                except Exception as e:
-                                    print(f"Error during LLaDA forward pass: {e}")
-                                    # Fallback to a simpler forward pass if there's an error
-                                    if hasattr(self.model, 'forward_simple') and callable(getattr(self.model, 'forward_simple')):
-                                        logits, loss = self.model.forward_simple(input_ids, targets)
-                                        balance_loss = 0
-                                        print("Used simplified forward pass to avoid NaN")
-                                    else:
-                                        raise
-                            else:
-                                # Standard GPT model
-                                logits, loss = self.model(input_ids, targets=targets)
-                                balance_loss = 0
+                            # Use unified forward pass for all models (same as Lightning)
+                            forward_kwargs = {}
+                            if model_type == 'llada' and getattr(self.args, 'use_bd3_training', False):
+                                forward_kwargs['use_bd3_training'] = True
 
-                                
-                            batch_tokens = input_ids.numel()
-                            
+                            # Call the unified forward method - THIS IS CRITICAL FOR MATCHING LIGHTNING BEHAVIOR
+                            outputs = self.forward(input_ids, targets=targets, **forward_kwargs)
+
+                            # Extract outputs from standardized dictionary format
+                            logits = outputs.get('logits')
+                            loss = outputs.get('loss')
+                            router_loss = outputs.get('router_loss')
+                            mtp_loss = outputs.get('mtp_loss')
+                            ponder_loss = outputs.get('ponder_loss')
+
+                            # Determine balance_loss based on model type
+                            balance_loss = 0
+                            if model_type == 'deepseek' and mtp_loss is not None:
+                                balance_loss = mtp_loss
+                            elif router_loss is not None:
+                                # Handle router loss with NaN checks
+                                if torch.isnan(router_loss).any():
+                                    print(f"WARNING: NaN detected in router_loss at iteration {self.iter_num}")
+                                    router_loss = torch.where(torch.isnan(router_loss), torch.tensor(0.1, device=router_loss.device), router_loss)
+                                router_loss = torch.clamp(router_loss, max=10.0)
+                                balance_loss = router_loss
+
+                            # Count non-padding tokens for accuracy (same as Lightning)
+                            non_pad_tokens_mask = (targets != -100)
+                            batch_tokens = non_pad_tokens_mask.sum().item()
+
                             # Update token counts
                             self.total_tokens += batch_tokens
                             self.tokens_window.append((time.time(), batch_tokens))

@@ -430,14 +430,34 @@ def main():
             print("PyTorch Lightning is not available. Falling back to standard training.")
         else:
             print("Using standard training (non-Lightning)...")
-        
+
+        # Configure multi-GPU for standard training
+        if args.devices > 1:
+            print(f"\nConfiguring multi-GPU training for {args.devices} GPUs...")
+            print(f"Strategy: {args.strategy}")
+
+            # Apply the same optimizations as Lightning
+            if 'ddp' in args.strategy.lower():
+                print("Multi-GPU optimizations:")
+                print("  - Force model to CPU before DDP (prevents VRAM imbalance)")
+                print("  - broadcast_buffers=False")
+                print("  - gradient_as_bucket_view=True")
+                print("  - find_unused_parameters=False")
+
+            # Note: FSDP is not yet supported in standard training
+            if 'fsdp' in args.strategy.lower():
+                print("WARNING: FSDP is not supported in standard training yet.")
+                print("         Use --use_lightning for FSDP support.")
+                print("         Falling back to DDP.")
+                args.strategy = 'ddp_find_unused_parameters_false'
+
         # Import Trainer from train.py
         from train.train import Trainer
-        
+
         # Set evaluation interval for standard training
         args.eval_interval = args.eval_interval_steps  # Rename to match standard training parameter name
         args.log_interval = args.log_interval_steps    # Rename to match standard training parameter name
-        
+
         # Create and run trainer
         trainer = Trainer(args)
         
