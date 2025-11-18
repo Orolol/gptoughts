@@ -10,16 +10,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
-from models.blocks.normalization import RMSNorm, DynamicTanh
-from models.blocks.attention import CausalSelfAttention
-from models.blocks.mlp import MLP
-from models.blocks.mla_block import MLABlock
-from models.blocks.mla_selective_fast import MLASelectiveFast as MLASelective
-from models.models.mla_model import (
+from normalization import RMSNorm, DynamicTanh
+from attention import CausalSelfAttention
+from mlp import MLP
+from mla_block import MLABlock
+# from mla_selective_fast import MLASelectiveFast as MLASelective
+from positional_encoding import (
     precompute_freqs_cis,
     precompute_freqs_cis_with_linear_scaling,
 )
-from models.optimizers import configure_optimizer_for_gpt
+# from optimizers import configure_optimizer_for_gpt
 
 
 @dataclass
@@ -162,7 +162,9 @@ class MLASelectiveBlock(nn.Module):
             self.norm1 = RMSNorm(config.n_embd)
             self.norm2 = RMSNorm(config.n_embd)
 
-        self.attn = MLASelective(config)
+        # MLASelective not included in this standalone version - use standard MLA instead
+        from mla import MLA
+        self.attn = MLA(config)
         self.mlp = MLP(config)
         self.use_checkpoint = config.use_gradient_checkpointing
 
@@ -403,19 +405,11 @@ class SWAMLAModel(nn.Module):
         """
         Configure optimizer for the SWA-MLA model.
 
-        Automatically uses FP8 optimizer (FP8AdamW or FP8Lion) when use_fp8=True in config.
-        The FP8 detection is handled by configure_optimizer_for_gpt().
+        This is handled by the training script - optimizer configuration
+        moved to train.py for standalone operation.
         """
-        optimizer = configure_optimizer_for_gpt(
-            model=self,
-            weight_decay=weight_decay,
-            learning_rate=learning_rate,
-            betas=betas,
-            device_type=device_type,
-            optimizer_type=optimizer_type or "adamw",
-            **kwargs,
-        )
-        return optimizer
+        # Optimizer configuration is now in train.py
+        raise NotImplementedError("Use the training script's optimizer configuration")
 
 
 def _create_mla_block_config(config: SWAMLAConfig):
@@ -460,10 +454,10 @@ def create_swa_mla_model(
 ) -> SWAMLAModel:
     size = size.lower()
     presets = {
-        "small": dict(n_layer=12, n_embd=1024, n_head=12),
-        "base": dict(n_layer=24, n_embd=1536, n_head=16),
-        "large": dict(n_layer=28, n_embd=2048, n_head=24),
-        "xl": dict(n_layer=32, n_embd=4096, n_head=32),
+        "small": dict(n_layer=12, n_embd=1024, n_head=16),    # 768/12=64 head_dim
+        "base": dict(n_layer=24, n_embd=1536, n_head=16),    # 1536/16=96 head_dim
+        "large": dict(n_layer=28, n_embd=2048, n_head=16),   # 2048/16=128 head_dim
+        "xl": dict(n_layer=32, n_embd=4096, n_head=32),      # 4096/32=128 head_dim
     }
     if size not in presets:
         raise ValueError(f"Unknown SWAMLA model size: {size}")

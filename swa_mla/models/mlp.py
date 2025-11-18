@@ -5,8 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 
-from .normalization import RMSNorm
-from .attention import CausalSelfAttention
+from normalization import RMSNorm
+from attention import CausalSelfAttention
 
 # Import FP8 utilities for mixed precision support
 try:

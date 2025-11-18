@@ -12,6 +12,7 @@ from ..mdm.model import MDMModel
 from .hse_model import HSEModel, HSEConfig, create_hse_model
 from .swan_model import SWANModel, SWANConfig, create_swan_model
 from .swa_mla_model import SWAMLAModel, SWAMLAConfig, create_swa_mla_model
+from .adaptive_moe_model import AdaptiveMoELLM, AdaptiveMoEConfig
 
 __all__ = [
     'GPT',
@@ -43,4 +44,6 @@ __all__ = [
     'SWAMLAModel',
     'SWAMLAConfig',
     'create_swa_mla_model',
+    'AdaptiveMoELLM',
+    'AdaptiveMoEConfig',
 ]

@@ -382,6 +382,12 @@ class Trainer:
             config = create_hrm_config(self.args)
             self.model = create_hrm_model(config)
 
+        elif model_type == 'adaptive_moe':
+            # Adaptive MoE model (MoE on Attention)
+            from train.model_configs.adaptive_moe_config import create_adaptive_moe_config, create_adaptive_moe_model
+            config = create_adaptive_moe_config(self.args)
+            self.model = create_adaptive_moe_model(config)
+
         else:
             from models.models.model import GPT, GPTConfig
             # Create config based on model size
@@ -416,7 +422,24 @@ class Trainer:
             print(f"Using specified optimizer: {self.args.optimizer_type}")
         
         self.optimizer = self.model.configure_optimizers(**optimizer_args)
-        
+
+        # Debug: Print optimizer configuration
+        print("=" * 60)
+        print("OPTIMIZER CONFIGURATION")
+        print(f"  Optimizer type: {type(self.optimizer).__name__}")
+        print(f"  Optimizer class module: {type(self.optimizer).__module__}")
+        if hasattr(self.args, 'use_fp8'):
+            print(f"  FP8 enabled (args): {self.args.use_fp8}")
+        if hasattr(self.model, 'config') and hasattr(self.model.config, 'use_fp8'):
+            print(f"  FP8 enabled (model.config): {self.model.config.use_fp8}")
+        print(f"  Learning rate: {optimizer_args['learning_rate']}")
+        print(f"  Weight decay: {optimizer_args['weight_decay']}")
+        print(f"  Device type: {optimizer_args['device_type']}")
+        # Check if optimizer has low-precision moments (FP8 optimizers)
+        if hasattr(self.optimizer, 'use_low_precision_moments'):
+            print(f"  Low-precision moments: {self.optimizer.use_low_precision_moments}")
+        print("=" * 60)
+
         # Initialize gradient scaler for mixed precision
         # Note: BFloat16 has sufficient dynamic range and doesn't need gradient scaling
         if self.dtype == 'fp8':
@@ -1258,7 +1281,9 @@ class Trainer:
 
     def load_model_from_checkpoint(self, ckpt_path):
         """Charge un modèle à partir d'un checkpoint"""
-        checkpoint = torch.load(ckpt_path, map_location='cpu')
+        # PyTorch 2.6+ compatibility: use weights_only=False for backward compatibility
+        # This is safe as we only load our own checkpoints
+        checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
         
         # Determine model type
         model_type = self.args.model_type.lower()
@@ -1410,6 +1435,25 @@ class Trainer:
                     total = torch.cuda.get_device_properties(i).total_memory / 1024**3
                     print(f"GPU {i}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, {total:.2f}GB total")
                 print("===================================\n")
+
+        # Debug: Print model parameter dtypes to verify FP8 configuration
+        if self.master_process:
+            print("=" * 60)
+            print("MODEL PARAMETER DTYPES")
+            model_to_check = self.model.module if self.ddp else self.model
+            dtype_counts = {}
+            total_params = 0
+            for name, param in model_to_check.named_parameters():
+                dtype = str(param.dtype)
+                dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
+                total_params += 1
+            print(f"  Total parameters: {total_params}")
+            for dtype, count in sorted(dtype_counts.items()):
+                print(f"  {dtype}: {count} parameters ({count/total_params*100:.1f}%)")
+            if hasattr(self.args, 'use_fp8') and self.args.use_fp8:
+                print(f"  FP8 mode requested: True")
+                print(f"  NOTE: Parameters stored as BF16, but computations will use FP8 via autocast")
+            print("=" * 60)
         
         # Ensure model is in correct precision for stability
         self.model = ensure_model_dtype(self.model, self.ptdtype)
@@ -1433,15 +1477,23 @@ class Trainer:
                 print("Gradient checkpointing automatically enabled for large model")
             
         # Compile model if requested
+        # NOTE: torch.compile() IS compatible with FP8 when using:
+        #   - PyTorch native FP8 (torch.float8_e4m3fn, torch.float8_e5m2)
+        #   - TorchAO FP8 implementation
+        #   - Transformer Engine FP8 (may have issues in some cases)
         if hasattr(self.args, 'compile') and self.args.compile:
             print("Compiling model...")
             try:
                 self.model = torch.compile(self.model, mode="max-autotune")
+                print("Compilation finished successfully")
+                if hasattr(self.args, 'use_fp8') and self.args.use_fp8:
+                    print("NOTE: Using torch.compile() with FP8 training")
+                    print("      Ensure you're using PyTorch native FP8 or TorchAO for best compatibility")
             except Exception as e:
                 print(f"Compilation failed: {e}")
                 print(traceback.format_exc())
                 self.args.compile = False
-            print("Compilation finished")
+                print("Continuing without compilation")
         
         # Initialize timing variables
         self.t0 = time.time()
@@ -1607,11 +1659,37 @@ class Trainer:
                                 targets = batch.to(self.device, non_blocking=True)
                         
                         # Forward pass avec optimisations
-                        with self.timing_stats.track("forward"), torch.amp.autocast(enabled=True, device_type=self.device_type, dtype=self.ptdtype):
+                        # Use appropriate autocast context based on dtype
+                        if self.dtype == 'fp8':
+                            # FP8 requires transformer_engine's fp8_autocast
+                            try:
+                                import transformer_engine.pytorch as te
+                                from transformer_engine.common import recipe
+
+                                # Configure FP8 recipe following DeepSeek-V3's approach
+                                fp8_recipe = recipe.DelayedScaling(
+                                    margin=0,
+                                    interval=1,
+                                    fp8_format=recipe.Format.E4M3,  # E4M3 format for better precision
+                                    amax_history_len=1,  # Online quantization
+                                    amax_compute_algo='most_recent'  # No delayed scaling
+                                )
+                                autocast_context = te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe)
+                            except (ImportError, ModuleNotFoundError, RuntimeError, AttributeError) as e:
+                                # Fallback to BF16 if transformer_engine is not available
+                                if self.iter_num == 1:
+                                    print(f"WARNING: FP8 requested but transformer_engine not available: {e}")
+                                    print("         Falling back to BF16 for this forward pass")
+                                autocast_context = torch.amp.autocast(enabled=True, device_type=self.device_type, dtype=torch.bfloat16)
+                        else:
+                            # Standard autocast for BF16/FP16/FP32
+                            autocast_context = torch.amp.autocast(enabled=True, device_type=self.device_type, dtype=self.ptdtype)
+
+                        with self.timing_stats.track("forward"), autocast_context:
                             # Synchroniser avant le forward pass pour s'assurer que les données sont sur le GPU
                             if torch.cuda.is_available():
                                 torch.cuda.synchronize()
-                            
+
                             # Use unified forward pass for all models (same as Lightning)
                             forward_kwargs = {}
                             if model_type == 'llada' and getattr(self.args, 'use_bd3_training', False):
@@ -1643,7 +1721,14 @@ class Trainer:
                             non_pad_tokens_mask = (targets != -100)
                             batch_tokens = non_pad_tokens_mask.sum().item()
 
-                            # Update token counts
+                            # In DDP, synchronize token count across all ranks to get global total
+                            if self.ddp:
+                                import torch.distributed as dist
+                                batch_tokens_tensor = torch.tensor(batch_tokens, device=self.device, dtype=torch.long)
+                                dist.all_reduce(batch_tokens_tensor, op=dist.ReduceOp.SUM)
+                                batch_tokens = batch_tokens_tensor.item()
+
+                            # Update token counts (now global in DDP)
                             self.total_tokens += batch_tokens
                             self.tokens_window.append((time.time(), batch_tokens))
                             if len(self.tokens_window) > self.window_size:
@@ -1795,11 +1880,13 @@ class Trainer:
                 if self.iter_num % (self.args.log_interval * 10) == 0:
                     self._log_metrics_to_csv()
 
-                # Choose appropriate auxiliary loss to log based on model type
-                if model_type == 'deepseek' and getattr(self.args, 'use_mtp', True):
-                    self.log_training_stats(total_loss, total_mtp_loss, dt, lr, loss_type="mtp_loss")
-                else:
-                    self.log_training_stats(total_loss, total_router_loss, dt, lr, loss_type="router_loss")
+                # Log training stats only from master process to avoid mixed logs in multi-GPU
+                if self.master_process:
+                    # Choose appropriate auxiliary loss to log based on model type
+                    if model_type == 'deepseek' and getattr(self.args, 'use_mtp', True):
+                        self.log_training_stats(total_loss, total_mtp_loss, dt, lr, loss_type="mtp_loss")
+                    else:
+                        self.log_training_stats(total_loss, total_router_loss, dt, lr, loss_type="router_loss")
 
                 # Save checkpoint periodically
                 if self.iter_num % 1000 == 0 and self.master_process:
@@ -1812,7 +1899,8 @@ class Trainer:
                 self.progress_to_next_stage()
 
                 # Need to recreate data loaders with new block size
-                print(f"Recreating data loaders with new block_size={self.args.block_size}")
+                if self.master_process:
+                    print(f"Recreating data loaders with new block_size={self.args.block_size}")
                 self.setup_datasets()
 
             self.iter_num += 1
@@ -2021,6 +2109,11 @@ class Trainer:
         """Affiche les statistiques d'entraînement"""
         lossf = total_loss
         aux_lossf = aux_loss
+
+        # Add GPU info for multi-GPU setups
+        gpu_info = ""
+        if self.ddp:
+            gpu_info = f" [GPU {self.ddp_rank}/{self.ddp_world_size}]"
         
         # Calculate tokens/s on the sliding window
         if len(self.tokens_window) > 1:
@@ -2044,12 +2137,12 @@ class Trainer:
         
         # Print stats
         if aux_lossf > 0:
-            print(f"iter {self.iter_num}: loss {lossf:.4f}, {loss_type} {aux_lossf:.4f}, "
+            print(f"iter {self.iter_num}{gpu_info}: loss {lossf:.4f}, {loss_type} {aux_lossf:.4f}, "
                   f"time {dt*1000:.2f}ms, lr {lr:.2e}, "
                   f"tt {self.total_tokens:,}, t/s {current_tokens_per_sec:.2f}, "
                   f"avgt/s {avg_tokens_per_sec:.2f}{mfu_str}")
         else:
-            print(f"iter {self.iter_num}: loss {lossf:.4f}, "
+            print(f"iter {self.iter_num}{gpu_info}: loss {lossf:.4f}, "
                   f"time {dt*1000:.2f}ms, lr {lr:.2e}, "
                   f"tt {self.total_tokens:,}, t/s {current_tokens_per_sec:.2f}, "
                   f"avgt/s {avg_tokens_per_sec:.2f}{mfu_str}")

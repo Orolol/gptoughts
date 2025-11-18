@@ -300,6 +300,10 @@ class LLMLightningModule(pl.LightningModule):
         elif model_type == 'hrm':
             config = create_hrm_config(self.args)
             model = create_hrm_model(config)
+        elif model_type == 'adaptive_moe':
+            from train.model_configs.adaptive_moe_config import create_adaptive_moe_config, create_adaptive_moe_model
+            config = create_adaptive_moe_config(self.args)
+            model = create_adaptive_moe_model(config)
         else: # gpt
             config = create_gpt_config(self.args)
             model = GPT(config)
@@ -322,7 +326,7 @@ class LLMLightningModule(pl.LightningModule):
         
         if model_type in ['gpt', 'mdm']:
             self._adapt_fixed_position_embeddings(model, old_block_size, new_block_size)
-        elif model_type in ['mla', 'mla_selective', 'parscale_mla', 'moe_mla', 'slm', 'nsa']:
+        elif model_type in ['mla', 'mla_selective', 'parscale_mla', 'moe_mla', 'slm', 'nsa', 'adaptive_moe']:
             self._adapt_rope_position_encoding(model, old_block_size, new_block_size)
         elif model_type == 'llada':
             self._adapt_llada_position_encoding(model, old_block_size, new_block_size)
@@ -997,7 +1001,7 @@ class LLMLightningModule(pl.LightningModule):
                         print(f"    {size_gb:.2f}GB: shape={shape}, dtype={dtype}")
 
         # Periodic tasks
-        if self.global_step > 0 and self.global_step % 1000 == 0:
+        if self.global_step > 0 and self.global_step % 200 == 0:
             if self.global_rank == 0:
                 self.generate_sample_text()
                 self._log_metrics_to_csv()

@@ -4,11 +4,11 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 
-from .normalization import RMSNorm, DynamicTanh
-from .mla import MLA
-from .mla_fp8 import MLA_FP8
-from .mlp import MLP
-from .tensor_utils import isolate_tensor, prevent_backward_reuse
+from normalization import RMSNorm, DynamicTanh
+from mla import MLA
+# from mla_fp8 import MLA_FP8
+from mlp import MLP
+# from tensor_utils import isolate_tensor, prevent_backward_reuse
 
 class MLABlock(nn.Module):
     """
@@ -38,12 +38,8 @@ class MLABlock(nn.Module):
             self.attn_norm = RMSNorm(config.n_embd)
             self.ffn_norm = RMSNorm(config.n_embd)
 
-        # MLA attention - use FP8 version if enabled
-        if getattr(config, 'use_fp8', False):
-            print("Using FP8 MLA attention")
-            self.attn = MLA_FP8(config)
-        else:
-            self.attn = MLA(config)
+        # MLA attention - FP8 version not included in standalone build
+        self.attn = MLA(config)
         
         # Always use standard MLP (no MoE)
         self.ffn = MLP(config)

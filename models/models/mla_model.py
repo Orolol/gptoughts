@@ -469,7 +469,12 @@ class MLAModel(nn.Module):
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, optimizer_type=None, **kwargs):
         """
         Configure optimizer with specialized parameter groups.
-        
+
+        Automatically uses FP8 optimizer (FP8AdamW or FP8Lion) when use_fp8=True in config.
+        The FP8 detection is handled by configure_optimizer_for_gpt().
+
+        Supports standard optimizers (AdamW, Lion, GaLore, APOLLO) as well as FP8 variants.
+
         Args:
             weight_decay: Weight decay coefficient
             learning_rate: Learning rate
@@ -480,12 +485,12 @@ class MLAModel(nn.Module):
         """
         # Import optimizer configuration utilities
         from models.optimizers import configure_optimizer_for_gpt
-        
+
         # Default to AdamW if no optimizer type specified
         if optimizer_type is None:
             optimizer_type = "adamw"
             print("No optimizer type specified, defaulting to AdamW")
-        
+
         # Extract GaLore configuration from kwargs if present
         galore_config = None
         galore_quantize_proj = None
@@ -498,9 +503,10 @@ class MLAModel(nn.Module):
             }
             if optimizer_type == "galore2":
                 galore_quantize_proj = kwargs.get("galore_quantize_proj", None)
-        
+
         # Use the GPT optimizer configuration which supports multiple optimizers
         # MLA models work well with the same optimizer configurations as GPT models
+        # FP8 detection happens automatically inside configure_optimizer_for_gpt
         optimizer = configure_optimizer_for_gpt(
             model=self,
             weight_decay=weight_decay,
@@ -511,8 +517,7 @@ class MLAModel(nn.Module):
             galore_config=galore_config,
             galore_quantize_proj=galore_quantize_proj
         )
-        
-        print(f"Configured {optimizer_type} optimizer for MLA model")
+
         return optimizer
 
 def precompute_freqs_cis(dim, max_seq_len, theta):

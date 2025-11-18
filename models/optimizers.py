@@ -27,6 +27,18 @@ try:
 except ImportError:
     GALORE2_AVAILABLE = False
 
+try:
+    from optimization.fp8_deepseek_trainer import FP8AdamW, FP8Lion
+    FP8_AVAILABLE = True
+except ImportError:
+    FP8_AVAILABLE = False
+
+try:
+    from models.muon_optimizer import Muon, create_muon_optimizer
+    MUON_AVAILABLE = True
+except ImportError:
+    MUON_AVAILABLE = False
+
 def get_grouped_params(
     model: torch.nn.Module,
     weight_decay: float,
@@ -128,25 +140,47 @@ def configure_optimizer_for_gpt(
     apollo_config: Optional[Dict[str, Any]] = None,
     galore_config: Optional[Dict[str, Any]] = None,
     galore_quantize_proj: Optional[int] = None,
-    force_foreach_false: bool = False
+    force_foreach_false: bool = False,
+    muon_config: Optional[Dict[str, Any]] = None
 ) -> torch.optim.Optimizer:
     """
     Configure optimizer for GPT-style models.
-    
+
+    Automatically detects and uses FP8 optimizer if model.config.use_fp8 is True.
+
     Args:
         model: The model to optimize
         weight_decay: Weight decay coefficient
         learning_rate: Learning rate
         betas: Adam beta parameters
         device_type: Device type ('cuda' or 'cpu')
-        optimizer_type: Type of optimizer to use ('adamw', 'lion', 'apollo', 'apollo-mini', 'galore', 'galore-8bit', 'galore2')
+        optimizer_type: Type of optimizer to use ('adamw', 'lion', 'apollo', 'apollo-mini', 'galore', 'galore-8bit', 'galore2', 'muon')
         apollo_config: Configuration for APOLLO optimizer if used
         galore_config: Configuration for GaLore optimizer if used
         galore_quantize_proj: Quantization bits for GaLore2 projections (1, 2, or None)
-        
+        muon_config: Configuration for Muon optimizer if used
+
     Returns:
         Configured optimizer
     """
+    # Check if model has FP8 enabled and optimizer type supports FP8
+    if (hasattr(model, 'config') and
+        getattr(model.config, 'use_fp8', False) and
+        optimizer_type in ['adamw', 'lion'] and
+        FP8_AVAILABLE):
+        try:
+            return configure_optimizer_with_fp8(
+                model=model,
+                weight_decay=weight_decay,
+                learning_rate=learning_rate,
+                betas=betas,
+                device_type=device_type,
+                optimizer_type=optimizer_type,
+                use_low_precision_moments=True
+            )
+        except (ImportError, ValueError) as e:
+            print(f"Warning: FP8 optimizer requested but not available ({e}), falling back to standard optimizer")
+
     # Check if GaLore is requested but not available
     if optimizer_type in ["galore", "galore-8bit"] and not GALORE_AVAILABLE:
         print(f"Warning: {optimizer_type} requested but not available. Falling back to AdamW.")
@@ -161,7 +195,23 @@ def configure_optimizer_for_gpt(
     if optimizer_type in ["apollo", "apollo-mini"] and not APOLLO_AVAILABLE:
         print(f"Warning: {optimizer_type} requested but not available. Falling back to AdamW.")
         optimizer_type = "adamw"
-    
+
+    # Check if Muon is requested but not available
+    if optimizer_type == "muon" and not MUON_AVAILABLE:
+        print(f"Warning: Muon requested but not available. Falling back to AdamW.")
+        optimizer_type = "adamw"
+
+    # Use Muon if requested and available
+    if optimizer_type == "muon" and MUON_AVAILABLE:
+        return configure_optimizer_with_muon(
+            model=model,
+            weight_decay=weight_decay,
+            learning_rate=learning_rate,
+            betas=betas,
+            device_type=device_type,
+            muon_config=muon_config
+        )
+
     # Use GaLore if requested and available
     if optimizer_type in ["galore", "galore-8bit"] and GALORE_AVAILABLE:
         use_8bit = optimizer_type == "galore-8bit"
@@ -813,6 +863,109 @@ def configure_optimizer_with_galore(
     return optimizer
 
 
+def configure_optimizer_with_fp8(
+    model: torch.nn.Module,
+    weight_decay: float,
+    learning_rate: float,
+    betas: Tuple[float, float],
+    device_type: str,
+    optimizer_type: str = "adamw",
+    use_low_precision_moments: bool = True
+) -> torch.optim.Optimizer:
+    """
+    Configure FP8 optimizer for models using FP8 mixed precision training.
+
+    Following DeepSeek-V3's approach:
+    - FP8 (E4M3) for weights and activations during computation
+    - BF16 for optimizer moments instead of FP32 (~50% memory saving)
+    - FP32 for master weights and gradients for stability
+    - High precision for critical components (embeddings, norms, head)
+
+    Args:
+        model: The model to optimize
+        weight_decay: Weight decay coefficient
+        learning_rate: Learning rate
+        betas: Adam beta parameters
+        device_type: Device type ('cuda' or 'cpu')
+        optimizer_type: Type of FP8 optimizer ('adamw' or 'lion')
+        use_low_precision_moments: Use BF16 for moments instead of FP32
+
+    Returns:
+        Configured FP8 optimizer (FP8AdamW or FP8Lion)
+    """
+    if not FP8_AVAILABLE:
+        raise ImportError(
+            "FP8 optimizers not available. Check optimization/fp8_deepseek_trainer.py"
+        )
+
+    if device_type != 'cuda':
+        raise ValueError("FP8 training is only available on CUDA devices")
+
+    # Select FP8 optimizer class
+    if optimizer_type == 'lion':
+        optimizer_class = FP8Lion
+        optimizer_name = "FP8Lion"
+    else:
+        optimizer_class = FP8AdamW
+        optimizer_name = "FP8AdamW"
+
+    # Separate parameters by precision requirements
+    # High precision: embeddings, normalization layers, and output head
+    # Standard precision: attention and MLP layers
+    high_precision_params = []
+    standard_params = []
+
+    # Patterns for high-precision parameters
+    high_precision_patterns = [
+        'wte', 'wpe',  # Token and position embeddings
+        'embed', 'embeddings',
+        'norm', 'ln_', 'ln_f',  # Normalization layers
+        'LayerNorm', 'RMSNorm',
+        'lm_head', 'output_projection',  # Output head
+        'rope', 'rotary'  # Rotary position embeddings
+    ]
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # Check if this parameter should be in high precision
+        is_high_precision = any(pattern in name.lower() for pattern in high_precision_patterns)
+
+        if is_high_precision:
+            high_precision_params.append(param)
+        else:
+            standard_params.append(param)
+
+    # Create parameter groups
+    param_groups = [
+        {'params': high_precision_params, 'weight_decay': weight_decay},
+        {'params': standard_params, 'weight_decay': weight_decay}
+    ]
+
+    # Create FP8 optimizer
+    optimizer = optimizer_class(
+        param_groups,
+        lr=learning_rate,
+        betas=betas,
+        weight_decay=weight_decay,
+        use_low_precision_moments=use_low_precision_moments
+    )
+
+    # Print configuration summary
+    print(f"Using {optimizer_name} optimizer with {'BF16' if use_low_precision_moments else 'FP32'} moments")
+    print(f"  - {len(high_precision_params)} high-precision params (embeddings, norms, head)")
+    print(f"  - {len(standard_params)} standard params (attention, MLP)")
+
+    if optimizer_type == 'lion':
+        print(f"  - Lion uses ~50% less optimizer memory than AdamW (1 moment vs 2)")
+        print(f"  - Combined with BF16 moments: ~75% less memory than standard AdamW FP32")
+    else:
+        print(f"  - BF16 moments provide ~50% memory saving vs FP32 moments")
+
+    return optimizer
+
+
 def configure_optimizer_with_galore2(
     model: torch.nn.Module,
     weight_decay: float,
@@ -936,5 +1089,80 @@ def configure_optimizer_with_galore2(
           f"proj_type={config['proj_type']}, quantize_proj={quantize_proj}")
     print(f"GaLore2 applied to {len(galore_params)} parameters, "
           f"standard AdamW for {len(non_galore_params)} parameters")
-    
+
+    return optimizer
+
+
+def configure_optimizer_with_muon(
+    model: torch.nn.Module,
+    weight_decay: float,
+    learning_rate: float,
+    betas: Tuple[float, float],
+    device_type: str,
+    muon_config: Dict[str, Any] = None
+) -> torch.optim.Optimizer:
+    """
+    Configure optimizer using Muon (Momentum Orthogonalized by Newton-schulz).
+
+    Muon applies orthogonalization to momentum using Newton-Schulz iterations,
+    leading to improved training dynamics for LLMs.
+
+    Args:
+        model: The model to optimize
+        weight_decay: Weight decay coefficient (used for AdamW parameters)
+        learning_rate: Learning rate for Muon
+        betas: Adam beta parameters (used for AdamW parameters)
+        device_type: Device type ('cuda' or 'cpu')
+        muon_config: Configuration for Muon optimizer
+            - momentum: Momentum factor (default: 0.95)
+            - nesterov: Use Nesterov momentum (default: True)
+            - ns_steps: Number of Newton-Schulz iterations (default: 5)
+            - adamw_lr: Learning rate for AdamW parameters (default: 3e-4)
+            - adamw_wd: Weight decay for AdamW (default: 0.1)
+
+    Returns:
+        Configured Muon optimizer
+    """
+    if not MUON_AVAILABLE:
+        raise ImportError(
+            "Muon optimizer is not available. Check models/muon_optimizer.py"
+        )
+
+    if device_type != 'cuda':
+        print("Warning: Muon is optimized for CUDA. Performance may be suboptimal on CPU.")
+
+    # Set default Muon configuration
+    default_config = {
+        "momentum": 0.95,
+        "nesterov": True,
+        "ns_steps": 5,
+        "adamw_lr": 3e-4,
+        "adamw_wd": weight_decay,
+        "adamw_betas": betas,
+        "adamw_eps": 1e-8,
+    }
+
+    # Update with user-provided config
+    config = default_config.copy()
+    if muon_config:
+        config.update(muon_config)
+
+    print(f"Configuring Muon optimizer with config: {config}")
+
+    # Use the create_muon_optimizer helper which handles parameter grouping
+    optimizer = create_muon_optimizer(
+        model=model,
+        lr=learning_rate,
+        momentum=config["momentum"],
+        nesterov=config["nesterov"],
+        ns_steps=config["ns_steps"],
+        adamw_lr=config["adamw_lr"],
+        adamw_betas=config["adamw_betas"],
+        adamw_wd=config["adamw_wd"],
+        adamw_eps=config["adamw_eps"],
+    )
+
+    print(f"Using Muon optimizer with lr={learning_rate}, momentum={config['momentum']}, "
+          f"nesterov={config['nesterov']}, ns_steps={config['ns_steps']}")
+
     return optimizer

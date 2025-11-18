@@ -55,7 +55,7 @@ python run_train.py \
     --attention_backend sdpa \
     --tokenizer_name "openai-community/gpt2" \
     --grad_clip 1.0 \
-    --learning_rate 6e-5 \
+    --learning_rate 1e-4 \
     --optimizer_type $OPTIMIZER \
     --weight_decay 0.1 \
     --warmup_iters 400 \
@@ -74,12 +74,25 @@ python run_train.py \
     --mla_qk_rope_head_dim 64 \
     --mla_v_head_dim 128 \
     --compile \
+    --use_fp8 \
     --strategy $STRATEGY \
     "${RESUME_ARGS[@]}"
 
-# Note: --compile removed for better DDP compatibility
-# torch.compile can cause issues with DDP synchronization
-# Add back --compile if you experience good performance without it
+# IMPORTANT NOTES ON FP8 + torch.compile:
+# 1. torch.compile() IS compatible with FP8 training when using:
+#    - PyTorch native FP8 (torch.float8_e4m3fn, torch.float8_e5m2) - PyTorch 2.2+
+#    - TorchAO FP8 implementation (recommended): pip install torchao
+#    - Transformer Engine FP8 (NVIDIA): pip install git+https://github.com/NVIDIA/TransformerEngine.git
+#    Combined FP8 + compile can give up to 38% speedup (TorchTitan benchmarks)
+#
+# 2. FP8 provides ~25-30% VRAM reduction compared to BF16 on H100/H200 GPUs.
+#    Current implementation uses Transformer Engine with fallback to BF16.
+#
+# 3. Different optimizers have different VRAM footprints:
+#    - Lion: ~50% less optimizer memory than AdamW (1 moment vs 2)
+#    - Muon: Similar to AdamW but better convergence
+#    - AdamW: Standard, most tested
+#    FP8 optimizers (FP8AdamW, FP8Lion) store moments in BF16 for additional savings
 
 # To use MLA Selective instead of standard MLA, add these flags:
 # --use_mla_selective \

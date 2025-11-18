@@ -18,6 +18,7 @@ from .specialized_configs import (
     create_hse_config, create_hse_model,
     create_hrm_config, create_hrm_model
 )
+from .adaptive_moe_config import create_adaptive_moe_config, create_adaptive_moe_model
 
 __all__ = [
     # DeepSeek
@@ -55,4 +56,7 @@ __all__ = [
     'create_hse_model',
     'create_hrm_config',
     'create_hrm_model',
+    # Adaptive MoE
+    'create_adaptive_moe_config',
+    'create_adaptive_moe_model',
 ]

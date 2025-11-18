@@ -41,9 +41,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train LLM models with PyTorch Lightning')
 
     # Model Parameters
-    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'sedd', 'gpt', 'mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'mdm', 'moe_mla', 'slm', 'nsa', 'hrm', 'hse', 'swan', 'swa_mla', 'swa_mla_moe'], default='gpt', help='Type of model to train')
+    parser.add_argument('--model_type', type=str, choices=['deepseek', 'llada', 'sedd', 'gpt', 'mla', 'mla_selective', 'parscale_mla', 'mla_llada', 'mdm', 'moe_mla', 'slm', 'nsa', 'hrm', 'hse', 'swan', 'swa_mla', 'swa_mla_moe', 'adaptive_moe'], default='gpt', help='Type of model to train')
     parser.add_argument('--size', type=str, choices=['small', 'medium', 'large', 'xl'], default='small', help='Size of the model')
-    parser.add_argument('--use_lightning', action='store_true', default=False, help='Use PyTorch Lightning for training')
+    parser.add_argument('--use_lightning', action='store_true', default=True, help='Use PyTorch Lightning for training')
 
     # IO Parameters
     parser.add_argument('--output_dir', type=str, default='ouputs/out_lightning', help='Output directory for checkpoints and logs')
@@ -64,7 +64,7 @@ def parse_args():
     parser.add_argument('--attention_backend', type=str, default=None, help='Attention backend (e.g., flash)')
 
     # Optimizer Parameters (passed to LightningModule)
-    parser.add_argument('--optimizer_type', type=str, default=None, choices=['adamw', 'lion', 'apollo', 'apollo-mini', 'galore', 'galore-8bit', 'galore2'], help='Optimizer type')
+    parser.add_argument('--optimizer_type', type=str, default=None, choices=['adamw', 'lion', 'apollo', 'apollo-mini', 'galore', 'galore-8bit', 'galore2', 'muon'], help='Optimizer type')
     parser.add_argument('--learning_rate', type=float, default=5e-5, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=0.1, help='Weight decay')
     parser.add_argument('--beta1', type=float, default=0.9, help='Adam beta1')
@@ -192,7 +192,14 @@ def parse_args():
     parser.add_argument('--galore_scale', type=float, default=0.25, help='GaLore scaling factor')
     parser.add_argument('--galore_proj_type', type=str, default='std', help='GaLore projection type')
     parser.add_argument('--galore_quantize_proj', type=int, default=None, help='GaLore2 projection quantization (1 or 2 bits)')
-    
+
+    # Muon Parameters
+    parser.add_argument('--muon_momentum', type=float, default=0.95, help='Muon momentum factor')
+    parser.add_argument('--muon_nesterov', action='store_true', default=True, help='Use Nesterov momentum in Muon')
+    parser.add_argument('--muon_ns_steps', type=int, default=5, help='Number of Newton-Schulz iterations for Muon')
+    parser.add_argument('--muon_adamw_lr', type=float, default=3e-4, help='Learning rate for AdamW parameters in Muon')
+    parser.add_argument('--muon_adamw_wd', type=float, default=0.1, help='Weight decay for AdamW parameters in Muon')
+
     # Selective Attention Parameters (for MLA-Selective model)
     parser.add_argument('--selection_ratio', type=float, default=0.5, help='Ratio of tokens to select (0.0 to 1.0)')
     parser.add_argument('--selection_method', type=str, default='top_k', choices=['top_k', 'threshold', 'gumbel'], help='Method for token selection')
@@ -203,6 +210,12 @@ def parse_args():
     parser.add_argument('--num_diffusion_steps', type=int, default=None, help='Number of diffusion steps for generation (None for adaptive)')
     parser.add_argument('--mask_ratio_min', type=float, default=0.15, help='Minimum masking ratio for training')
     parser.add_argument('--mask_ratio_max', type=float, default=0.85, help='Maximum masking ratio for training')
+
+    # Adaptive MoE Parameters
+    parser.add_argument('--k_peripheral', type=int, default=32, help='Number of top-k tokens for peripheral expert')
+    parser.add_argument('--k_focal', type=int, default=64, help='Number of top-k tokens for focal expert')
+    parser.add_argument('--k_reflective', type=int, default=128, help='Number of top-k tokens for reflective expert')
+    parser.add_argument('--router_temperature', type=float, default=1.0, help='Temperature for adaptive router softmax')
 
     args = parser.parse_args()
     return args

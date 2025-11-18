@@ -1,2 +1,0 @@
-step,train_loss,val_loss,val_perplexity,learning_rate,tokens_per_sec,total_tokens,grad_norm,timestamp
-0,10.000000,N/A,N/A,2.50e-07,0.00,16384,N/A,2025-07-26 12:04:12
